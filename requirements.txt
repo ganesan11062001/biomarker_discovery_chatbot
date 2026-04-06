@@ -1,0 +1,30 @@
+# ── API backend ───────────────────────────────────────────────────────────────
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9          # multipart file uploads
+
+# ── Settings & validation ─────────────────────────────────────────────────────
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+
+# ── AI / Orchestration ────────────────────────────────────────────────────────
+openai>=1.12.0
+langgraph>=0.1.0
+langchain-core>=0.1.0
+
+# ── Data processing ───────────────────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.2                  # Excel .xlsx
+xlrd>=2.0.1                      # Excel .xls (legacy)
+scipy>=1.11.0
+
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
+streamlit>=1.32.0
+plotly>=5.20.0
+requests>=2.31.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+httpx>=0.26.0
+tenacity>=8.2.0                  # retry logic

@@ -1,0 +1,28 @@
+# Environment secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# Data and outputs (too large for git)
+data/raw/
+data/processed/
+outputs/
+logs/
+
+# R
+.Rhistory
+.RData
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
