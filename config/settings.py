@@ -5,16 +5,16 @@ from functools import lru_cache
 
 class Settings(BaseSettings):
     # ── Azure OpenAI ──────────────────────────────────────────────────────────
-    azure_openai_endpoint: str
-    azure_openai_api_key: str
+    azure_openai_endpoint: str = ""
+    azure_openai_api_key: str = ""
     azure_openai_api_version: str = "2024-08-01-preview"
 
     # ── Model deployments ─────────────────────────────────────────────────────
-    azure_deployment_chat: str
-    azure_deployment_ingestion: str
-    azure_deployment_biomarker: str
-    azure_deployment_enrichment: str
-    azure_deployment_visualization: str
+    azure_deployment_chat: str = "gpt-4o"
+    azure_deployment_ingestion: str = "gpt-4o"
+    azure_deployment_biomarker: str = "gpt-4o"
+    azure_deployment_enrichment: str = "gpt-4o"
+    azure_deployment_visualization: str = "gpt-4o"
 
     # ── Directories ───────────────────────────────────────────────────────────
     data_raw_dir: str = "data/raw"
@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
     max_file_size_mb: int = 200
+
+    # ── Analysis defaults ─────────────────────────────────────────────────────
+    top_n_biomarkers: int = 50
+    adj_pval_cutoff: float = 0.05
+    log2fc_cutoff: float = 1.0
+    missing_value_threshold: float = 0.5   # max fraction of NaN per protein
 
     class Config:
         env_file = ".env"

@@ -1,55 +1,71 @@
 # ── Biomarker Discovery Platform ─────────────────────────────────────────────
+# Works on macOS, Linux, and Windows (Git Bash / WSL).
+#
 # Usage:
-#   make install        install Python dependencies
-#   make install-r      install R packages
-#   make api            start FastAPI backend
-#   make ui             start Streamlit UI
-#   make dev            start both (requires two terminals or a process manager)
-#   make test           run tests
-#   make clean          remove generated outputs
+#   make install    install Python dependencies
+#   make api        start FastAPI backend  (port 8000)
+#   make ui         start Streamlit UI     (port 8501)
+#   make dev        print instructions for running both
+#   make test       run tests
+#   make dirs       create required directories
+#   make clean      remove generated outputs
 
-PYTHON  = python
-RSCRIPT = Rscript
-UVICORN = uvicorn
-STREAMLIT = streamlit
+# ── OS detection ──────────────────────────────────────────────────────────────
+# On Windows (native cmd/PowerShell) the OS variable is "Windows_NT".
+# Git Bash and WSL report as non-Windows, so standard commands work there.
+ifeq ($(OS),Windows_NT)
+    PYTHON := python
+else
+    PYTHON := python3
+endif
 
-.PHONY: install install-r api ui dev test clean dirs
+.PHONY: install api ui dev test clean dirs
 
 # ── Install ───────────────────────────────────────────────────────────────────
 
 install:
-	pip install -r requirements.txt
-
-install-r:
-	$(RSCRIPT) r_scripts/install_packages.R
+	$(PYTHON) -m pip install -r requirements.txt
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 api:
-	$(UVICORN) api.main:app --reload --reload-dir api --reload-dir core --reload-dir agents --reload-dir skills --reload-dir config --host 0.0.0.0 --port 8000
+	$(PYTHON) -m uvicorn api.main:app --reload \
+		--reload-dir api \
+		--reload-dir core \
+		--reload-dir agents \
+		--reload-dir skills \
+		--reload-dir config \
+		--host 0.0.0.0 --port 8000
 
 ui:
-	API_BASE_URL=http://localhost:8000 $(STREAMLIT) run ui/app.py --server.port 8501
+	$(PYTHON) -m streamlit run ui/app.py --server.port 8501
 
-# Tip: open two terminals and run `make api` in one, `make ui` in the other.
+# Open two terminals: `make api` in one, `make ui` in the other.
 dev:
-	@echo "Open two terminals:"
+	@echo "Start the platform in two terminals:"
+	@echo ""
 	@echo "  Terminal 1:  make api"
 	@echo "  Terminal 2:  make ui"
+	@echo ""
+	@echo "Then open http://localhost:8501"
 
-# ── Directories ───────────────────────────────────────────────────────────────
+# ── Directories (Python-based for cross-platform) ─────────────────────────────
 
 dirs:
-	mkdir -p data/raw data/processed outputs logs
+	$(PYTHON) -c "import pathlib; [pathlib.Path(p).mkdir(parents=True, exist_ok=True) for p in ['data/raw','data/processed','outputs','logs']]"
 
 # ── Test ─────────────────────────────────────────────────────────────────────
 
 test:
-	pytest tests/ -v
+	$(PYTHON) -m pytest tests/ -v
 
-# ── Clean ────────────────────────────────────────────────────────────────────
+# ── Clean (Python-based for cross-platform) ───────────────────────────────────
 
 clean:
-	rm -rf outputs/* data/processed/* data/raw/* logs/*
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	find . -name "*.pyc" -delete 2>/dev/null || true
+	$(PYTHON) -c "\
+import shutil, pathlib; \
+[shutil.rmtree(p, ignore_errors=True) or pathlib.Path(p).mkdir(parents=True, exist_ok=True) \
+ for p in ['outputs','data/raw','data/processed','logs']]; \
+[p.unlink() for p in pathlib.Path('.').rglob('*.pyc')]; \
+[shutil.rmtree(p) for p in pathlib.Path('.').rglob('__pycache__') if p.is_dir()] \
+"

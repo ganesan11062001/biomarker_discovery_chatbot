@@ -1,11 +1,11 @@
 """
 ui/app.py
-Main Streamlit application for the Proteomics Biomarker Discovery Platform.
+Standalone Streamlit application for the Proteomics Biomarker Discovery Platform.
 
-Run:
+Run (API mode):
     streamlit run ui/app.py
 
-Requires the FastAPI backend to be running:
+Requires the FastAPI backend:
     uvicorn api.main:app --reload --port 8000
 """
 from __future__ import annotations
@@ -13,23 +13,15 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import requests
 import streamlit as st
 
-# ── Path setup (run from biomarker-platform/ or project root) ─────────────────
+# ── Path setup ────────────────────────────────────────────────────────────────
 _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
-
-from ui.components.chat import (
-    render_chat_input,
-    render_messages,
-    render_suggested_prompts,
-    render_welcome,
-)
-from ui.components.results_panel import render_results_panel
-from ui.components.uploader import render_upload_success, render_uploader
 
 # ── Config ────────────────────────────────────────────────────────────────────
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
@@ -42,18 +34,19 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
+# ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown(
     """
     <style>
-    /* Tighten chat area */
     .stChatMessage { padding: 0.5rem 0.75rem; }
-    /* Reduce sidebar top padding */
     section[data-testid="stSidebar"] > div:first-child { padding-top: 1rem; }
-    /* Highlight pipeline status items */
-    .status-complete  { color: #27ae60; font-weight: 600; }
-    .status-pending   { color: #95a5a6; }
-    .status-error     { color: #e74c3c; font-weight: 600; }
+    .metric-label { font-size: 0.8rem; color: #666; }
+    .group-box {
+        background: #f0f2f6;
+        border-radius: 8px;
+        padding: 0.75rem 1rem;
+        margin-bottom: 0.5rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -61,78 +54,123 @@ st.markdown(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Session management helpers
+# API helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _create_api_session(disease_program: str, organism: str) -> str | None:
+def _api_create_session(disease_program: str, organism: str) -> str | None:
     try:
-        resp = requests.post(
+        r = requests.post(
             f"{API_BASE}/chat/session",
             params={"disease_program": disease_program, "organism": organism},
             timeout=10,
         )
-        if resp.status_code == 201:
-            return resp.json()["session_id"]
+        if r.status_code == 201:
+            return r.json()["session_id"]
     except requests.exceptions.ConnectionError:
         pass
     return None
 
 
-def _init_session_state() -> None:
-    """Initialise all st.session_state keys on first load."""
-    defaults = {
-        "session_id": None,
-        "messages": [],          # list of {role, content}
-        "analysis_state": {},    # last /results/{session_id} response
-        "upload_result": None,   # last upload metadata
-        "disease_program": "FA",
-        "organism": "human",
-        "sample_group_col": "",
-        "contrast_group_1": "",
-        "contrast_group_2": "",
-        "api_error": None,
-    }
-    for key, val in defaults.items():
-        st.session_state.setdefault(key, val)
-
-
-def _fetch_analysis_state(session_id: str) -> dict:
+def _api_fetch_state(session_id: str) -> dict:
     try:
-        resp = requests.get(f"{API_BASE}/results/{session_id}", timeout=10)
-        if resp.status_code == 200:
-            return resp.json()
+        r = requests.get(f"{API_BASE}/results/{session_id}", timeout=10)
+        if r.status_code == 200:
+            return r.json()
     except Exception:
         pass
     return {}
 
 
-def _send_message(session_id: str, message: str) -> dict | None:
-    payload: dict = {"session_id": session_id, "message": message}
+def _api_send_message(session_id: str, message: str) -> dict | None:
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "message": message,
+        "disease_program": st.session_state.get("disease_program", "FA"),
+        "organism": st.session_state.get("organism", "human"),
+    }
 
-    # Attach analysis config if the user has filled it in
-    grp_col = st.session_state.get("sample_group_col", "").strip()
-    g1 = st.session_state.get("contrast_group_1", "").strip()
-    g2 = st.session_state.get("contrast_group_2", "").strip()
-    if grp_col:
-        payload["sample_group_col"] = grp_col
-    if g1 and g2:
-        payload["contrast_groups"] = [g1, g2]
-    payload["disease_program"] = st.session_state.get("disease_program", "FA")
-    payload["organism"] = st.session_state.get("organism", "human")
+    g1 = st.session_state.get("group1_samples") or []
+    g2 = st.session_state.get("group2_samples") or []
+    g1_label = st.session_state.get("group1_label", "Group1").strip() or "Group1"
+    g2_label = st.session_state.get("group2_label", "Group2").strip() or "Group2"
+
+    if g1:
+        payload["group1_samples"] = g1
+        payload["group1_label"]   = g1_label
+    if g2:
+        payload["group2_samples"] = g2
+        payload["group2_label"]   = g2_label
 
     try:
-        resp = requests.post(f"{API_BASE}/chat/", json=payload, timeout=300)
-        if resp.status_code == 200:
-            return resp.json()
-        st.session_state["api_error"] = f"API {resp.status_code}: {resp.text[:200]}"
+        r = requests.post(f"{API_BASE}/chat/", json=payload, timeout=300)
+        if r.status_code == 200:
+            return r.json()
+        st.session_state["api_error"] = f"API {r.status_code}: {r.text[:200]}"
     except requests.exceptions.ConnectionError:
         st.session_state["api_error"] = (
             "Cannot reach the API server. "
             "Run: `uvicorn api.main:app --reload --port 8000`"
         )
     except requests.exceptions.Timeout:
-        st.session_state["api_error"] = "Request timed out. Analysis is still running."
+        st.session_state["api_error"] = "Request timed out — analysis still running."
     return None
+
+
+def _api_upload_file(
+    file_bytes: bytes,
+    filename: str,
+    file_type: str,
+    session_id: str,
+    disease_program: str,
+    organism: str,
+) -> dict | None:
+    try:
+        r = requests.post(
+            f"{API_BASE}/upload/",
+            files={"file": (filename, file_bytes, file_type)},
+            data={
+                "session_id": session_id,
+                "disease_program": disease_program,
+                "organism": organism,
+            },
+            timeout=120,
+        )
+    except requests.exceptions.ConnectionError:
+        st.error("Cannot reach the API server. Is it running on `localhost:8000`?")
+        return None
+
+    if r.status_code in (200, 201):
+        return r.json()
+
+    try:
+        detail = r.json().get("detail", r.text)
+    except Exception:
+        detail = r.text
+    st.error(f"Upload failed ({r.status_code}): {detail}")
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Session init
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _init_session() -> None:
+    defaults: dict[str, Any] = {
+        "session_id":      None,
+        "messages":        [],
+        "analysis_state":  {},
+        "upload_result":   None,
+        "disease_program": "FA",
+        "organism":        "human",
+        # group assignment
+        "group1_samples":  [],
+        "group2_samples":  [],
+        "group1_label":    "Disease",
+        "group2_label":    "Control",
+        "api_error":       None,
+    }
+    for k, v in defaults.items():
+        st.session_state.setdefault(k, v)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -142,92 +180,181 @@ def _send_message(session_id: str, message: str) -> dict | None:
 def _render_sidebar() -> None:
     with st.sidebar:
         st.markdown("## 🧬 Biomarker Discovery")
-        st.caption("Proteomics · FA & DMD · Multi-Agent AI")
+        st.caption("Proteomics · Multi-Agent AI Platform")
         st.divider()
 
         # ── Session config ────────────────────────────────────────────────────
         st.subheader("Session")
         disease = st.selectbox(
             "Disease program",
-            ["FA", "DMD", "Other"],
-            index=["FA", "DMD", "Other"].index(st.session_state["disease_program"]),
-            key="sidebar_disease",
+            ["FA", "DMD", "SMA", "Other"],
+            index=["FA", "DMD", "SMA", "Other"].index(
+                st.session_state["disease_program"]
+                if st.session_state["disease_program"] in ["FA", "DMD", "SMA", "Other"]
+                else "Other"
+            ),
         )
         organism = st.selectbox(
             "Organism",
             ["human", "mouse", "rat"],
             index=["human", "mouse", "rat"].index(st.session_state["organism"]),
-            key="sidebar_organism",
         )
 
-        # Update session state and re-create API session if config changed
-        if (
-            disease != st.session_state["disease_program"]
+        config_changed = (
+            disease   != st.session_state["disease_program"]
             or organism != st.session_state["organism"]
-        ):
+        )
+        if config_changed:
             st.session_state["disease_program"] = disease
-            st.session_state["organism"] = organism
-            st.session_state["session_id"] = None  # force new session
+            st.session_state["organism"]        = organism
+            st.session_state["session_id"]      = None
 
-        # Create API session if not yet created
+        # Ensure a session exists
         if st.session_state["session_id"] is None:
-            sid = _create_api_session(disease, organism)
+            sid = _api_create_session(disease, organism)
             if sid:
                 st.session_state["session_id"] = sid
             else:
-                st.error("⚠️ API server not reachable. Start the FastAPI backend.")
+                st.error("API server not reachable.")
                 st.code("uvicorn api.main:app --reload --port 8000")
                 return
 
         st.caption(f"Session: `{st.session_state['session_id'][:8]}…`")
-
         st.divider()
 
         # ── File upload ───────────────────────────────────────────────────────
         st.subheader("Upload Data")
-        upload_result = render_uploader(
-            api_base=API_BASE,
-            session_id=st.session_state["session_id"],
-            disease_program=st.session_state["disease_program"],
-            organism=st.session_state["organism"],
+        uploaded = st.file_uploader(
+            "Proteomics matrix (CSV / Excel)",
+            type=["csv", "xlsx", "xls"],
+            help=(
+                "Rows = proteins, Columns = samples.\n"
+                "Supported: Olink NPX, LFQ, TMT, generic intensity matrix."
+            ),
+            key="sidebar_uploader",
         )
-        if upload_result:
-            st.session_state["upload_result"] = upload_result
-            render_upload_success(upload_result)
-            # Refresh analysis state after upload
-            st.session_state["analysis_state"] = _fetch_analysis_state(
-                st.session_state["session_id"]
+
+        if uploaded is not None:
+            last = st.session_state.get("_last_upload_name")
+            if last != uploaded.name:
+                with st.spinner(f"Uploading {uploaded.name}…"):
+                    result = _api_upload_file(
+                        uploaded.getvalue(),
+                        uploaded.name,
+                        uploaded.type or "application/octet-stream",
+                        st.session_state["session_id"],
+                        disease,
+                        organism,
+                    )
+                if result:
+                    st.session_state["_last_upload_name"] = uploaded.name
+                    st.session_state["upload_result"]     = result
+                    st.session_state["analysis_state"]    = _api_fetch_state(
+                        st.session_state["session_id"]
+                    )
+                    # Reset group assignments when new file is loaded
+                    st.session_state["group1_samples"] = []
+                    st.session_state["group2_samples"] = []
+                    st.rerun()
+
+        ur = st.session_state.get("upload_result")
+        if ur:
+            st.success(f"Loaded: **{ur.get('filename', '')}**")
+            c1, c2 = st.columns(2)
+            c1.metric("Proteins", ur.get("n_proteins", "–"))
+            c2.metric("Samples",  ur.get("n_samples",  "–"))
+            st.caption(
+                f"Type: **{ur.get('data_type', '?')}** · "
+                f"Format: **{(ur.get('data_format') or '').upper()}**"
             )
 
         st.divider()
 
-        # ── Analysis config ───────────────────────────────────────────────────
-        st.subheader("Analysis Config")
-        st.caption(
-            "Specify your sample group column and contrast groups. "
-            "Required for differential expression."
-        )
-        st.text_input(
-            "Sample group column",
-            placeholder="e.g.  Group  or  Condition",
-            key="sample_group_col",
-            help="The column name in your data that contains group labels.",
-        )
-        col1, col2 = st.columns(2)
-        col1.text_input("Group 1 (case)", placeholder="Disease", key="contrast_group_1")
-        col2.text_input("Group 2 (control)", placeholder="Control", key="contrast_group_2")
+        # ── Group assignment ──────────────────────────────────────────────────
+        sample_cols: list[str] = (ur or {}).get("sample_columns") or []
+
+        if sample_cols:
+            st.subheader("Group Assignment")
+            st.caption("Assign sample columns to each comparison group.")
+
+            col_label1, col_label2 = st.columns(2)
+            with col_label1:
+                st.session_state["group1_label"] = st.text_input(
+                    "Group 1 label",
+                    value=st.session_state.get("group1_label", "Disease"),
+                    key="g1_label_input",
+                )
+            with col_label2:
+                st.session_state["group2_label"] = st.text_input(
+                    "Group 2 label",
+                    value=st.session_state.get("group2_label", "Control"),
+                    key="g2_label_input",
+                )
+
+            # Determine already-assigned columns for exclusion
+            g2_assigned = set(st.session_state.get("group2_samples") or [])
+            g1_assigned = set(st.session_state.get("group1_samples") or [])
+
+            g1_options = [c for c in sample_cols if c not in g2_assigned]
+            g2_options = [c for c in sample_cols if c not in g1_assigned]
+
+            g1_default = [c for c in (st.session_state.get("group1_samples") or [])
+                          if c in g1_options]
+            g2_default = [c for c in (st.session_state.get("group2_samples") or [])
+                          if c in g2_options]
+
+            st.session_state["group1_samples"] = st.multiselect(
+                f"Group 1 — {st.session_state['group1_label']}",
+                options=g1_options,
+                default=g1_default,
+                key="g1_multiselect",
+            )
+            st.session_state["group2_samples"] = st.multiselect(
+                f"Group 2 — {st.session_state['group2_label']}",
+                options=g2_options,
+                default=g2_default,
+                key="g2_multiselect",
+            )
+
+            g1_n = len(st.session_state["group1_samples"])
+            g2_n = len(st.session_state["group2_samples"])
+            if g1_n and g2_n:
+                st.success(f"{g1_n} vs {g2_n} samples assigned")
+
+                if st.button("▶ Run Analysis", type="primary", use_container_width=True):
+                    g1_lbl = st.session_state["group1_label"]
+                    g2_lbl = st.session_state["group2_label"]
+                    msg = (
+                        f"Run differential expression analysis comparing "
+                        f"{g1_lbl} ({g1_n} samples) vs {g2_lbl} ({g2_n} samples)"
+                    )
+                    st.session_state["messages"].append({"role": "user", "content": msg})
+                    with st.spinner("Running analysis…"):
+                        resp = _api_send_message(st.session_state["session_id"], msg)
+                    if resp:
+                        st.session_state["messages"].append(
+                            {"role": "assistant", "content": resp["response"]}
+                        )
+                        st.session_state["analysis_state"] = _api_fetch_state(
+                            st.session_state["session_id"]
+                        )
+                    st.rerun()
+            elif g1_n or g2_n:
+                st.warning("Assign samples to both groups to run analysis.")
+
+        elif ur:
+            st.info("No numeric sample columns detected. Check your file format.")
 
         st.divider()
 
         # ── Pipeline status ───────────────────────────────────────────────────
         st.subheader("Pipeline Status")
-        astate = st.session_state.get("analysis_state", {})
+        astate = st.session_state.get("analysis_state") or {}
         steps = [
-            ("Data loaded",    bool(astate.get("data_type"))),
-            ("QC passed",      bool(astate.get("qc_passed"))),
-            ("DEA complete",   bool(astate.get("dea_result_path"))),
-            ("Pathways done",  bool(astate.get("enrichment_result_path"))),
-            ("Report ready",   bool(astate.get("report_path"))),
+            ("Data loaded",        bool(astate.get("data_type"))),
+            ("QC passed",          bool(astate.get("qc_passed"))),
+            ("Analysis complete",  bool(astate.get("n_significant") is not None)),
+            ("Excel report ready", bool(astate.get("excel_path"))),
         ]
         for label, done in steps:
             icon = "✅" if done else "⭕"
@@ -235,7 +362,28 @@ def _render_sidebar() -> None:
 
         st.divider()
 
-        # ── New session button ────────────────────────────────────────────────
+        # Excel download
+        astate = st.session_state.get("analysis_state") or {}
+        if astate.get("excel_path"):
+            sid = st.session_state["session_id"]
+            try:
+                r = requests.get(
+                    f"{API_BASE}/results/{sid}/excel",
+                    timeout=30,
+                )
+                if r.status_code == 200:
+                    st.download_button(
+                        label="⬇ Download Excel Report",
+                        data=r.content,
+                        file_name=f"biomarkers_{sid[:8]}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        type="primary",
+                    )
+            except Exception:
+                pass
+
+        # New session
         if st.button("🔄 New Session", use_container_width=True, type="secondary"):
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
@@ -252,78 +400,302 @@ def _render_main() -> None:
         st.info("Initialising session — please wait…")
         return
 
-    # Display any API errors
     if st.session_state.get("api_error"):
         st.error(st.session_state.pop("api_error"))
 
-    # Two-column layout: chat (left) | results (right)
     chat_col, results_col = st.columns([5, 6], gap="large")
 
     # ── Chat column ───────────────────────────────────────────────────────────
     with chat_col:
         st.subheader("Chat")
 
-        # ── Inline file uploader (shown until data is loaded) ────────────────
-        astate = st.session_state.get("analysis_state", {})
-        if not astate.get("data_type"):
-            st.info("📎 Upload your proteomics data to get started", icon="📂")
-            inline_upload = render_uploader(
-                api_base=API_BASE,
-                session_id=st.session_state["session_id"],
-                disease_program=st.session_state["disease_program"],
-                organism=st.session_state["organism"],
-                widget_key="proteomics_file_uploader_inline",
-            )
-            if inline_upload:
-                st.session_state["upload_result"] = inline_upload
-                render_upload_success(inline_upload)
-                st.session_state["analysis_state"] = _fetch_analysis_state(
-                    st.session_state["session_id"]
-                )
-                st.rerun()
+        # Inline upload prompt if no data yet
+        astate = st.session_state.get("analysis_state") or {}
+        if not astate.get("data_type") and not st.session_state.get("upload_result"):
+            st.info("Upload your proteomics data in the sidebar to get started.", icon="📂")
 
         # Message history
-        chat_container = st.container(height=400, border=False)
-        with chat_container:
-            if not st.session_state["messages"]:
-                render_welcome()
+        with st.container(height=420, border=False):
+            messages = st.session_state.get("messages") or []
+            if not messages:
+                st.markdown("#### Welcome to Biomarker Discovery")
+                st.markdown(
+                    "Upload a proteomics matrix, assign sample groups in the sidebar, "
+                    "then click **Run Analysis** — or ask me anything below."
+                )
             else:
-                render_messages(st.session_state["messages"])
+                for m in messages:
+                    with st.chat_message(m["role"]):
+                        st.markdown(m["content"])
 
-        # Suggested prompts
-        astate = st.session_state.get("analysis_state", {})
-        suggested = render_suggested_prompts(
-            data_loaded=bool(astate.get("data_type")),
-            qc_done=bool(astate.get("qc_passed")),
-            dea_done=bool(astate.get("dea_result_path")),
-        )
+        # Suggested quick-action buttons
+        astate = st.session_state.get("analysis_state") or {}
+        data_loaded   = bool(astate.get("data_type"))
+        analysis_done = bool(astate.get("excel_path"))
 
-        # Chat input (returns value only when submitted)
-        user_input = render_chat_input() or suggested
+        if data_loaded and not analysis_done:
+            g1 = st.session_state.get("group1_samples") or []
+            g2 = st.session_state.get("group2_samples") or []
+            if not g1 or not g2:
+                st.caption("Tip: assign sample groups in the sidebar, then click Run Analysis.")
+            else:
+                cols = st.columns(2)
+                if cols[0].button("What proteins are in my data?", use_container_width=True):
+                    st.session_state["_quick_prompt"] = "What proteins are in my data?"
+                if cols[1].button("Describe the dataset", use_container_width=True):
+                    st.session_state["_quick_prompt"] = "Describe the uploaded dataset"
+
+        if analysis_done:
+            cols = st.columns(3)
+            if cols[0].button("Summarise results", use_container_width=True):
+                st.session_state["_quick_prompt"] = "Summarise the biomarker discovery results"
+            if cols[1].button("Top 10 biomarkers", use_container_width=True):
+                st.session_state["_quick_prompt"] = "Show me the top 10 biomarkers"
+            if cols[2].button("Run pathway enrichment", use_container_width=True):
+                st.session_state["_quick_prompt"] = "Run pathway enrichment analysis"
+
+        # Chat input
+        user_input = st.chat_input("Ask anything about your proteomics data…")
+        quick = st.session_state.pop("_quick_prompt", None)
+        user_input = user_input or quick
 
         if user_input:
-            # Append user message immediately
             st.session_state["messages"].append({"role": "user", "content": user_input})
-
-            with st.spinner("Analysing …"):
-                response = _send_message(session_id, user_input)
-
-            if response:
+            with st.spinner("Thinking…"):
+                resp = _api_send_message(session_id, user_input)
+            if resp:
                 st.session_state["messages"].append(
-                    {"role": "assistant", "content": response["response"]}
+                    {"role": "assistant", "content": resp["response"]}
                 )
-                # Refresh analysis state from API
-                st.session_state["analysis_state"] = _fetch_analysis_state(session_id)
-
+                st.session_state["analysis_state"] = _api_fetch_state(session_id)
             st.rerun()
 
     # ── Results column ────────────────────────────────────────────────────────
     with results_col:
         st.subheader("Results")
-        render_results_panel(
-            state=st.session_state.get("analysis_state", {}),
-            api_base=API_BASE,
+        _render_results(st.session_state.get("analysis_state") or {}, session_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Results panel
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _render_results(state: dict[str, Any], session_id: str) -> None:
+    if not state or not state.get("status") or state.get("status") == "ready":
+        st.info("No results yet. Upload data and run the analysis.")
+        return
+
+    tab_overview, tab_biomarkers, tab_qc = st.tabs(
+        ["📊 Overview", "🏆 Top Biomarkers", "🔬 QC Summary"]
+    )
+
+    with tab_overview:
+        _render_overview(state, session_id)
+
+    with tab_biomarkers:
+        _render_biomarkers(state)
+
+    with tab_qc:
+        _render_qc(state)
+
+
+def _render_overview(state: dict[str, Any], session_id: str) -> None:
+    st.markdown("### Analysis Overview")
+
+    # Key metrics
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Proteins", state.get("n_proteins", "–"))
+    c2.metric("Samples",  state.get("n_samples",  "–"))
+    c3.metric("Significant", state.get("n_significant", "–"))
+    c4.metric("Mode", (state.get("analysis_mode") or "–").title())
+
+    # Contrast label
+    g1 = state.get("group1_label")
+    g2 = state.get("group2_label")
+    if g1 and g2:
+        st.caption(f"Comparison: **{g1}** vs **{g2}**")
+
+    st.divider()
+
+    # LLM summary
+    summary = state.get("analysis_summary")
+    if summary:
+        st.markdown("#### AI Summary")
+        st.markdown(summary)
+        st.divider()
+
+    # Excel download
+    if state.get("excel_path"):
+        try:
+            r = requests.get(f"{API_BASE}/results/{session_id}/excel", timeout=30)
+            if r.status_code == 200:
+                st.download_button(
+                    label="⬇ Download Full Excel Report",
+                    data=r.content,
+                    file_name=f"biomarkers_{session_id[:8]}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                )
+        except Exception:
+            st.caption("Excel file available — use the sidebar download button.")
+
+    # Quick stats
+    if state.get("qc_summary"):
+        with st.expander("QC snapshot"):
+            qc = state["qc_summary"]
+            cols = st.columns(3)
+            cols[0].metric("Proteins in", qc.get("proteins_input",    "–"))
+            cols[1].metric("After QC",    qc.get("proteins_after_qc", "–"))
+            cols[2].metric("Removed",     qc.get("proteins_removed",  "–"))
+
+
+def _render_biomarkers(state: dict[str, Any]) -> None:
+    top = state.get("top_biomarkers")
+    analysis_mode = state.get("analysis_mode", "supervised")
+
+    if not top:
+        if state.get("status") in ("data_loaded", "routed", "ready"):
+            st.info("Run the analysis to see biomarkers.")
+        else:
+            st.info("No biomarkers found yet.")
+        return
+
+    import pandas as pd
+
+    df = pd.DataFrame(top)
+
+    # Rename columns for display
+    rename = {
+        "protein":          "Protein",
+        "rank":             "Rank",
+        "log2_fold_change": "log2 FC",
+        "p_value":          "p-value",
+        "adj_p_value":      "adj. p-value",
+        "significance":     "Significance",
+        "cv_percent":       "CV %",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    # Display columns present in df
+    desired_cols = ["Rank", "Protein", "log2 FC", "p-value", "adj. p-value",
+                    "Significance", "CV %"]
+    show_cols = [c for c in desired_cols if c in df.columns]
+    df_show = df[show_cols].copy()
+
+    # Format numerics
+    for col in ("p-value", "adj. p-value"):
+        if col in df_show.columns:
+            df_show[col] = df_show[col].apply(
+                lambda x: f"{x:.3e}" if isinstance(x, float) else x
+            )
+    for col in ("log2 FC", "CV %"):
+        if col in df_show.columns:
+            df_show[col] = df_show[col].apply(
+                lambda x: f"{x:.3f}" if isinstance(x, float) else x
+            )
+
+    if "Rank" in df_show.columns:
+        df_show = df_show.set_index("Rank")
+
+    # Color rows by significance
+    def _row_color(row):
+        sig = str(row.get("Significance", "")).lower()
+        if "highly" in sig:
+            return ["background-color: #C6EFCE"] * len(row)
+        if "significant" in sig and "highly" not in sig:
+            return ["background-color: #E2EFDA"] * len(row)
+        if "trend" in sig:
+            return ["background-color: #FFEB9C"] * len(row)
+        return [""] * len(row)
+
+    styled = df_show.style
+    if "Significance" in df_show.columns:
+        styled = styled.apply(_row_color, axis=1)
+
+    st.dataframe(styled, use_container_width=True, height=min(600, 38 * len(df_show) + 40))
+
+    # Simple inline volcano plot if we have the needed columns
+    if "log2 FC" in df.columns and "adj. p-value" in df.columns:
+        _render_inline_volcano(top, state)
+
+
+def _render_inline_volcano(top_biomarkers: list, state: dict[str, Any]) -> None:
+    try:
+        import numpy as np
+        import pandas as pd
+        import plotly.express as px
+
+        df = pd.DataFrame(top_biomarkers)
+        if "log2_fold_change" not in df.columns or "adj_p_value" not in df.columns:
+            return
+
+        df = df.dropna(subset=["log2_fold_change", "adj_p_value"])
+        df["adj_p_clipped"] = df["adj_p_value"].clip(lower=1e-300)
+        df["-log10p"] = -np.log10(df["adj_p_clipped"])
+
+        def _sig_class(row):
+            if row.get("adj_p_value", 1) < 0.05 and abs(row.get("log2_fold_change", 0)) >= 1.0:
+                return "Significant"
+            return "NS"
+
+        df["class"] = df.apply(_sig_class, axis=1)
+
+        g1 = state.get("group1_label", "Group1")
+        g2 = state.get("group2_label", "Group2")
+
+        fig = px.scatter(
+            df,
+            x="log2_fold_change",
+            y="-log10p",
+            color="class",
+            color_discrete_map={"Significant": "#C0392B", "NS": "#AAAAAA"},
+            hover_name="protein",
+            hover_data={"log2_fold_change": ":.3f", "adj_p_value": ":.3e",
+                        "class": False, "-log10p": False, "adj_p_clipped": False},
+            labels={"log2_fold_change": "log₂FC", "-log10p": "−log₁₀(adj. p-value)"},
+            title=f"Volcano: {g1} vs {g2}",
         )
+        fig.add_hline(y=-np.log10(0.05), line_dash="dash", line_color="grey", line_width=1)
+        fig.add_vline(x=1.0,  line_dash="dash", line_color="grey", line_width=1)
+        fig.add_vline(x=-1.0, line_dash="dash", line_color="grey", line_width=1)
+        fig.update_layout(legend_title_text="", height=380, showlegend=True)
+
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.caption(f"Volcano plot unavailable: {e}")
+
+
+def _render_qc(state: dict[str, Any]) -> None:
+    st.markdown("### QC Summary")
+
+    qc_passed = state.get("qc_passed")
+    if qc_passed is None:
+        st.info("QC has not been run yet.")
+        return
+
+    if qc_passed:
+        st.success("Data passed quality control")
+    else:
+        st.warning("Quality issues detected — results may be affected")
+
+    qc = state.get("qc_summary") or {}
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Proteins in",    qc.get("proteins_input",    state.get("n_proteins", "–")))
+    c2.metric("After QC",       qc.get("proteins_after_qc", "–"))
+    c3.metric("Removed",        qc.get("proteins_removed",  "–"))
+
+    c4, c5, c6 = st.columns(3)
+    c4.metric("Samples in",    qc.get("samples_input",    state.get("n_samples", "–")))
+    c5.metric("After QC",      qc.get("samples_after_qc", "–"))
+
+    log2 = qc.get("log2_transformed")
+    if log2 is not None:
+        c6.metric("log2 transform", "Yes" if log2 else "No")
+
+    missing_thr = qc.get("missing_threshold")
+    if missing_thr is not None:
+        st.caption(f"Missing value threshold: **{missing_thr * 100:.0f}%**")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -331,13 +703,9 @@ def _render_main() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    _init_session_state()
+    _init_session()
     _render_sidebar()
     _render_main()
 
 
-if __name__ == "__main__":
-    main()
-else:
-    # Streamlit discovers this file and runs it as a module
-    main()
+main()

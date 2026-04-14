@@ -1,127 +1,241 @@
-from core.state import BiomarkerState
+"""
+agents/biomarker_agent.py
+Analysis Layer — multi-omic biomarker discovery agent.
+
+Architecture
+------------
+BiomarkerAgent uses an OmicsSkillRegistry to decouple itself from any
+specific omic type.  On every run it:
+  1. Reads ``state["omic_type"]`` (defaults to "proteomics")
+  2. Looks up the registered skill for that omic type
+  3. Executes the skill → standardised OmicsAnalysisResult
+  4. Generates a plain-language LLM summary of the findings
+
+Adding a new omic type
+----------------------
+1. Create a subclass of BaseOmicsSkill (e.g. TranscriptomicsSkill)
+2. Set its ``omic_type`` property (e.g. "transcriptomics")
+3. Register it in ``__init__``:
+       self._registry.register(TranscriptomicsSkill())
+No other changes are needed.
+"""
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any, Dict
+
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
-from skills.run_qc import QCSkill
-from skills.run_limma import ProteomicsSkill
+from core.state import BiomarkerState
+from skills.omics_registry import OmicsSkillRegistry
+from skills.proteomics_analysis import ProteomicsAnalysisSkill
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
+
+# Default omic type when none is set in state
+_DEFAULT_OMIC_TYPE = "proteomics"
 
 
 class BiomarkerAgent(BaseAgent):
     """
-    Analysis Layer – orchestrates the proteomics pipeline:
-      1. QC Skill          (Data Layer)     – missing value filter, CV cutoff, outlier detection
-      2. Proteomics Skill  (Analysis Layer) – limma / DEP / MSstats differential expression
+    Orchestrates omic-type analysis and summarises results with an LLM.
+
+    The agent is intentionally omic-agnostic: all analysis logic lives in
+    the registered skills.  BiomarkerAgent only handles routing, state
+    management, and LLM-based interpretation.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(
             deployment_name=settings.azure_deployment_biomarker,
             system_prompt_path="prompts/biomarker_agent.txt",
         )
-        self.qc_skill = QCSkill()
-        self.proteomics_skill = ProteomicsSkill()
+        # ── Register all available omic skills ────────────────────────────────
+        # Add new omic types here as they are implemented.
+        self._registry = OmicsSkillRegistry()
+        self._registry.register(ProteomicsAnalysisSkill())
+        # Future registrations (uncomment when implemented):
+        # self._registry.register(TranscriptomicsSkill())
+        # self._registry.register(MetabolomicsSkill())
+        # self._registry.register(LipidomicsSkill())
+        logger.info("BiomarkerAgent ready. Available omic types: %s", self._registry.available())
+
+    # ── Main entry point ──────────────────────────────────────────────────────
 
     def run(self, state: BiomarkerState) -> BiomarkerState:
         if not state.get("data_path"):
-            state["status"] = "error"
-            state["error_message"] = "No data loaded. Please upload a CSV or Excel file first."
-            state["messages"].append({
-                "role": "assistant",
-                "content": "No proteomics data found. Please upload your data file first."
-            })
-            return state
+            return self._error(
+                state,
+                "No data loaded. Please upload a file first.",
+                "No data found. Please upload your file before running analysis.",
+            )
 
-        # Step 1: QC (if not already done)
-        if not state.get("qc_passed"):
-            state = self._run_qc(state)
-            if state["status"] == "error":
-                return state
+        omic_type = state.get("omic_type") or _DEFAULT_OMIC_TYPE
 
-        # Step 2: Differential Expression (if group config is available)
-        if state.get("sample_group_col") and state.get("contrast_groups"):
-            if not state.get("dea_result_path"):
-                state = self._run_dea(state)
+        # Validate omic type before doing any work
+        if omic_type not in self._registry:
+            available = self._registry.available()
+            return self._error(
+                state,
+                f"Unsupported omic type: '{omic_type}'. Available: {available}",
+                f"Omic type '{omic_type}' is not supported. Currently available: {available}.",
+            )
+
+        # Determine supervised vs unsupervised mode
+        g1 = state.get("group1_samples") or []
+        g2 = state.get("group2_samples") or []
+        mode = "supervised" if (g1 and g2) else "unsupervised"
+        state["analysis_mode"] = mode
+        state["status"] = "analyzing"
+
+        mode_label = "differential expression" if mode == "supervised" else "unsupervised CV"
+        state["messages"].append({
+            "role": "assistant",
+            "content": f"Running {mode_label} analysis ({omic_type}) — please wait…",
+        })
+
+        # Dispatch to the registered skill
+        skill = self._registry.get(omic_type)
+        file_name = Path(state.get("data_path", "analysis")).stem
+
+        result = skill.execute(
+            data_path=state["data_path"],
+            sample_columns=state.get("sample_columns") or [],
+            group1_samples=g1,
+            group2_samples=g2,
+            group1_label=state.get("group1_label") or "Group1",
+            group2_label=state.get("group2_label") or "Group2",
+            analysis_mode=mode,
+            data_type=state.get("data_type") or "generic",
+            adj_pval_cutoff=settings.adj_pval_cutoff,
+            log2fc_cutoff=settings.log2fc_cutoff,
+            missing_threshold=settings.missing_value_threshold,
+            top_n=settings.top_n_biomarkers,
+            output_dir=settings.output_dir,
+            file_name=file_name,
+        )
+
+        if result.get("error"):
+            return self._error(
+                state,
+                result["error"],
+                f"Analysis failed: {str(result['error'])[:500]}",
+            )
+
+        # Persist results
+        state["omic_type"]      = omic_type
+        state["top_biomarkers"] = result["top_biomarkers"]
+        state["top_proteins"]   = result["top_biomarkers"]  # legacy field
+        state["n_significant"]  = result["n_significant"]
+        state["excel_path"]     = result["excel_path"]
+        state["qc_summary"]     = result["qc_summary"]
+        state["status"]         = "analysis_complete"
+
+        summary = self._build_summary(result, state)
+        state["analysis_summary"] = summary
+        state["messages"].append({"role": "assistant", "content": summary})
+
+        logger.info(
+            "Analysis complete | session=%s omic=%s significant=%d",
+            state.get("session_id"), omic_type, result["n_significant"],
+        )
+        return state
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _error(
+        self, state: BiomarkerState, log_msg: str, user_msg: str
+    ) -> BiomarkerState:
+        logger.warning("BiomarkerAgent error: %s", log_msg)
+        state["status"] = "error"
+        state["error_message"] = log_msg
+        state["messages"].append({"role": "assistant", "content": user_msg})
+        return state
+
+    # ── LLM summary generation ────────────────────────────────────────────────
+
+    def _build_summary(self, result: Dict[str, Any], state: BiomarkerState) -> str:
+        """Ask the LLM to write a plain-language summary of the analysis."""
+        mode      = state.get("analysis_mode", "supervised")
+        omic_type = state.get("omic_type", "proteomics")
+        g1        = state.get("group1_label", "Group 1")
+        g2        = state.get("group2_label", "Group 2")
+        qc        = result.get("qc_summary") or {}
+
+        top5 = (result.get("top_biomarkers") or [])[:5]
+        if mode == "supervised":
+            top5_lines = "\n".join(
+                f"  {b.get('rank','?')}. {b.get('protein','?')}  "
+                f"log2FC={b.get('log2_fold_change','?')},  "
+                f"adj_p={b.get('adj_p_value','?')},  "
+                f"sig={b.get('significance','?')}"
+                for b in top5
+            )
         else:
-            state["messages"].append({
-                "role": "assistant",
-                "content": (
-                    "QC passed. To run differential expression analysis, please specify:\n"
-                    "- **Sample group column**: the column in your data that defines groups "
-                    "(e.g. 'Group', 'Condition')\n"
-                    "- **Contrast groups**: the two groups to compare "
-                    "(e.g. ['Disease', 'Control'])"
+            top5_lines = "\n".join(
+                f"  {b.get('rank','?')}. {b.get('protein','?')}  CV={b.get('cv_percent','?')}%"
+                for b in top5
+            )
+
+        prompt = (
+            f"{omic_type.capitalize()} biomarker analysis complete.\n\n"
+            f"Mode: {mode}\n"
+            + (f"Comparison: {g1} vs {g2}\n" if mode == "supervised" else "")
+            + f"Features after QC: {qc.get('proteins_after_qc', 'N/A')}\n"
+            f"Log2 transformed: {qc.get('log2_transformed', False)}\n"
+            f"Significant biomarkers: {result.get('n_significant', 0)}\n\n"
+            f"Top 5:\n{top5_lines}\n\n"
+            "Write a concise (≤150 words) plain-language summary for a researcher:\n"
+            "1. Key findings\n"
+            "2. Most interesting biomarker(s)\n"
+            "3. Any QC notes\n"
+            "4. What the downloaded Excel file contains\n"
+            "Use markdown formatting."
+        )
+
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user",   "content": prompt},
+        ]
+        try:
+            return self._call_llm(messages, max_tokens=400)
+        except Exception as exc:
+            logger.warning("LLM summary failed: %s — using fallback.", exc)
+            return self._fallback_summary(result, state)
+
+    def _fallback_summary(self, result: Dict[str, Any], state: BiomarkerState) -> str:
+        mode      = state.get("analysis_mode", "supervised")
+        omic_type = state.get("omic_type", "proteomics").capitalize()
+        qc        = result.get("qc_summary") or {}
+        top5      = (result.get("top_biomarkers") or [])[:5]
+
+        lines = []
+        for b in top5:
+            if "log2_fold_change" in b:
+                lines.append(
+                    f"  {b.get('rank','?')}. **{b.get('protein','?')}** — "
+                    f"log2FC={b.get('log2_fold_change','?')}, "
+                    f"adj_p={b.get('adj_p_value','?')}, "
+                    f"{b.get('significance','NS')}"
                 )
-            })
-            state["status"] = "awaiting_config"
-
-        return state
-
-    def _run_qc(self, state: BiomarkerState) -> BiomarkerState:
-        try:
-            result = self.qc_skill.execute(
-                data_path=state["data_path"],
-                data_type=state.get("data_type", "generic"),
-            )
-            state["qc_report_path"] = result["qc_report_path"]
-            state["qc_passed"] = result["qc_passed"]
-            state["data_path"] = result.get("filtered_data_path", state["data_path"])
-            state["status"] = "qc_complete"
-
-            msg = (
-                f"QC complete.\n"
-                f"- Proteins passing filter: {result['proteins_retained']} / {result['proteins_total']}\n"
-                f"- Samples retained: {result['samples_retained']}\n"
-                f"- Missing value threshold: {result['missing_threshold']*100:.0f}%\n"
-                f"- CV cutoff applied: {result.get('cv_cutoff', 'N/A')}\n"
-                f"- Outlier samples removed: {result.get('outliers_removed', 0)}\n"
-            )
-            if result["qc_passed"]:
-                msg += "\nData passed QC. Ready for differential expression analysis."
             else:
-                msg += "\nWarning: data quality issues detected. Review QC report before proceeding."
+                lines.append(
+                    f"  {b.get('rank','?')}. **{b.get('protein','?')}** — "
+                    f"CV={b.get('cv_percent','?')}%"
+                )
 
-            state["messages"].append({"role": "assistant", "content": msg})
+        g_note = (
+            f" ({state.get('group1_label','G1')} vs {state.get('group2_label','G2')})"
+            if mode == "supervised" else ""
+        )
 
-        except Exception as e:
-            state["status"] = "error"
-            state["error_message"] = f"QC failed: {str(e)}"
-            state["messages"].append({"role": "assistant", "content": f"QC failed: {str(e)}"})
-
-        return state
-
-    def _run_dea(self, state: BiomarkerState) -> BiomarkerState:
-        try:
-            result = self.proteomics_skill.execute(
-                data_path=state["data_path"],
-                sample_group_col=state["sample_group_col"],
-                contrast_groups=state["contrast_groups"],
-                data_type=state.get("data_type", "generic"),
-            )
-            state["dea_result_path"] = result["dea_result_path"]
-            state["top_proteins"] = result["top_proteins"]
-            state["status"] = "dea_complete"
-
-            top_list = "\n".join(
-                f"  {i+1}. {p['protein']} (logFC={p['logFC']:.2f}, adj.P={p['adj_pval']:.3e})"
-                for i, p in enumerate(result["top_proteins"][:10])
-            )
-            msg = (
-                f"Differential expression analysis complete.\n"
-                f"- Method: {result['method']}\n"
-                f"- Significant proteins (adj.P < 0.05): {result['n_significant']}\n"
-                f"- Up-regulated: {result['n_up']}  |  Down-regulated: {result['n_down']}\n\n"
-                f"Top 10 proteins:\n{top_list}\n\n"
-                "Would you like to run pathway enrichment analysis?"
-            )
-            state["messages"].append({"role": "assistant", "content": msg})
-
-        except Exception as e:
-            state["status"] = "error"
-            state["error_message"] = f"DEA failed: {str(e)}"
-            state["messages"].append({
-                "role": "assistant",
-                "content": f"Differential expression analysis failed: {str(e)}"
-            })
-
-        return state
+        return (
+            f"### {omic_type} Analysis Complete{g_note}\n\n"
+            f"- Features analysed: **{qc.get('proteins_after_qc', 'N/A')}**\n"
+            f"- Significant biomarkers: **{result.get('n_significant', 0)}**\n"
+            f"- Mode: {mode.capitalize()}\n\n"
+            f"**Top 5 biomarkers:**\n" + "\n".join(lines) + "\n\n"
+            "Download the Excel file for the full ranked list, QC metrics, and parameters."
+        )

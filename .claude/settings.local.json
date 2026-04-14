@@ -4,7 +4,17 @@
       "Bash(wc -l \"/c/Users/GanesanMurugan/OneDrive - Solid Biosciences/Documents/Projects/biomarker_discovery_chatbot/biomarker-platform/skills\"/*.py)",
       "Bash(find \"/c/Users/GanesanMurugan/OneDrive - Solid Biosciences/Documents/Projects/biomarker_discovery_chatbot\" -type f -name \"*.py\" ! -path \"*/__pycache__/*\" -exec wc -l {} +)",
       "Read(//c/Users/GanesanMurugan/OneDrive - Solid Biosciences/Documents/Projects/biomarker_discovery_chatbot/**)",
-      "Bash(grep -r \"def\\\\|class\" \"/c/Users/GanesanMurugan/OneDrive - Solid Biosciences/Documents/Projects/biomarker_discovery_chatbot/biomarker-platform/agents\"/*.py)"
+      "Bash(grep -r \"def\\\\|class\" \"/c/Users/GanesanMurugan/OneDrive - Solid Biosciences/Documents/Projects/biomarker_discovery_chatbot/biomarker-platform/agents\"/*.py)",
+      "Skill(claude-api)",
+      "Skill(claude-api:*)",
+      "Bash(find ./tests -type f -name \"*.py\" -exec wc -l {} \\\\;)",
+      "Bash(awk '{print $1, $2}')",
+      "Bash(rm -f skills/run_limma.py skills/run_qc.py skills/skill_utils.py)",
+      "Bash(rm -f core/registry.py core/context_builder.py)",
+      "Bash(rm -f config/azure_keyvault.py config/logging_config.py)",
+      "Bash(rm -rf api/middleware)",
+      "Bash(rm -rf api/schemas)",
+      "Bash(python3 -c ':*)"
     ]
   }
 }

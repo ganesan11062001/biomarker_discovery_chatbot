@@ -1,22 +1,20 @@
 """
 core/langgraph_workflow.py
-LangGraph StateGraph that wires together all pipeline agents.
+LangGraph StateGraph wiring all pipeline agents.
 
-Flow per user message
-─────────────────────
+Flow
+────
   START
     │
     ▼
-  chat_agent  ──── intent detection ────►  END (general chat)
-    │
-    ├─► ingestion_agent    ──► END
-    ├─► biomarker_agent    ──► END
-    ├─► enrichment_agent   ──► END
-    └─► visualization_agent──► END
+  chat_agent  ──── intent ────►  ingestion_agent  ──► END
+                            ├──► biomarker_agent   ──► END
+                            ├──► enrichment_agent  ──► END
+                            ├──► visualization_agent► END
+                            └──► END  (general chat)
 
-The workflow is compiled once at import time and shared across all requests.
+Compiled once at startup; shared across all requests.
 """
-
 import logging
 from functools import lru_cache
 from typing import Literal
@@ -25,19 +23,29 @@ from langgraph.graph import END, StateGraph
 
 from agents.biomarker_agent import BiomarkerAgent
 from agents.chat_agent import ChatAgent
-from agents.enrichment_agent import EnrichmentAgent
 from agents.ingestion_agent import IngestionAgent
-from agents.visualization_agent import VisualizationAgent
 from core.state import BiomarkerState
 
 logger = logging.getLogger(__name__)
 
-# ── Agent singletons (created once, reused for all requests) ──────────────────
-_chat_agent = ChatAgent()
+# ── Agent singletons ──────────────────────────────────────────────────────────
+_chat_agent      = ChatAgent()
 _ingestion_agent = IngestionAgent()
 _biomarker_agent = BiomarkerAgent()
-_enrichment_agent = EnrichmentAgent()
-_visualization_agent = VisualizationAgent()
+
+# Optional agents — imported lazily so the platform starts even if their
+# dependencies aren't installed yet
+try:
+    from agents.enrichment_agent import EnrichmentAgent
+    _enrichment_agent = EnrichmentAgent()
+except Exception:
+    _enrichment_agent = None  # type: ignore
+
+try:
+    from agents.visualization_agent import VisualizationAgent
+    _visualization_agent = VisualizationAgent()
+except Exception:
+    _visualization_agent = None  # type: ignore
 
 
 # ── Node wrappers ─────────────────────────────────────────────────────────────
@@ -59,17 +67,29 @@ def _run_biomarker(state: BiomarkerState) -> BiomarkerState:
 
 def _run_enrichment(state: BiomarkerState) -> BiomarkerState:
     logger.info("Node: enrichment_agent | session=%s", state.get("session_id"))
-    return _enrichment_agent.run(state)
+    if _enrichment_agent is not None:
+        return _enrichment_agent.run(state)
+    state["messages"].append({
+        "role": "assistant",
+        "content": "Pathway enrichment is not available in this deployment.",
+    })
+    return state
 
 
 def _run_visualization(state: BiomarkerState) -> BiomarkerState:
     logger.info("Node: visualization_agent | session=%s", state.get("session_id"))
-    return _visualization_agent.run(state)
+    if _visualization_agent is not None:
+        return _visualization_agent.run(state)
+    state["messages"].append({
+        "role": "assistant",
+        "content": "Visualization agent is not available in this deployment.",
+    })
+    return state
 
 
-# ── Routing logic ─────────────────────────────────────────────────────────────
+# ── Routing ───────────────────────────────────────────────────────────────────
 
-_AGENT_NODES = {
+_SPECIALIST_NODES = {
     "ingestion_agent",
     "biomarker_agent",
     "enrichment_agent",
@@ -87,29 +107,25 @@ def _route_from_chat(
     "__end__",
 ]:
     intent = state.get("intent", "chat_agent")
-    if intent in _AGENT_NODES:
+    if intent in _SPECIALIST_NODES:
         logger.debug("Routing to: %s", intent)
         return intent  # type: ignore[return-value]
-    # General chat — no specialist needed
     return END
 
 
-# ── Graph construction ────────────────────────────────────────────────────────
+# ── Graph ─────────────────────────────────────────────────────────────────────
 
 def _build_graph() -> StateGraph:
     builder = StateGraph(BiomarkerState)
 
-    # Register nodes
-    builder.add_node("chat_agent",          _run_chat)
-    builder.add_node("ingestion_agent",     _run_ingestion)
-    builder.add_node("biomarker_agent",     _run_biomarker)
-    builder.add_node("enrichment_agent",    _run_enrichment)
-    builder.add_node("visualization_agent", _run_visualization)
+    builder.add_node("chat_agent",           _run_chat)
+    builder.add_node("ingestion_agent",      _run_ingestion)
+    builder.add_node("biomarker_agent",      _run_biomarker)
+    builder.add_node("enrichment_agent",     _run_enrichment)
+    builder.add_node("visualization_agent",  _run_visualization)
 
-    # Entry point
     builder.set_entry_point("chat_agent")
 
-    # Conditional fan-out from chat_agent
     builder.add_conditional_edges(
         "chat_agent",
         _route_from_chat,
@@ -122,8 +138,7 @@ def _build_graph() -> StateGraph:
         },
     )
 
-    # All specialist agents terminate
-    for node in _AGENT_NODES:
+    for node in _SPECIALIST_NODES:
         builder.add_edge(node, END)
 
     return builder.compile()
