@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l \"/c/Users/GanesanMurugan/OneDrive - Solid Biosciences/Documents/Projects/biomarker_discovery_chatbot/biomarker-platform/skills\"/*.py)",
+      "Bash(find \"/c/Users/GanesanMurugan/OneDrive - Solid Biosciences/Documents/Projects/biomarker_discovery_chatbot\" -type f -name \"*.py\" ! -path \"*/__pycache__/*\" -exec wc -l {} +)",
+      "Read(//c/Users/GanesanMurugan/OneDrive - Solid Biosciences/Documents/Projects/biomarker_discovery_chatbot/**)",
+      "Bash(grep -r \"def\\\\|class\" \"/c/Users/GanesanMurugan/OneDrive - Solid Biosciences/Documents/Projects/biomarker_discovery_chatbot/biomarker-platform/agents\"/*.py)"
+    ]
+  }
+}
