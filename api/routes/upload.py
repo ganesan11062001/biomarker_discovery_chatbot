@@ -32,12 +32,14 @@ class UploadResponse(BaseModel):
     session_id:       str
     file_id:          str
     filename:         str
-    data_type:        Optional[str]        = None
-    data_format:      Optional[str]        = None
-    n_proteins:       Optional[int]        = None
-    n_samples:        Optional[int]        = None
-    sample_columns:   Optional[List[str]]  = None
-    metadata_columns: Optional[List[str]]  = None
+    data_type:        Optional[str]             = None
+    data_format:      Optional[str]             = None
+    n_proteins:       Optional[int]             = None
+    n_samples:        Optional[int]             = None
+    sample_columns:   Optional[List[str]]       = None
+    metadata_columns: Optional[List[str]]       = None
+    is_pooled_design: bool                      = False
+    label_map:        Optional[dict]            = None
     status:           str
 
 
@@ -106,5 +108,7 @@ async def upload_proteomics_file(
         n_samples        = updated.get("n_samples"),
         sample_columns   = updated.get("sample_columns"),
         metadata_columns = updated.get("metadata_columns"),
+        is_pooled_design = bool(updated.get("is_pooled_design", False)),
+        label_map        = updated.get("label_map"),
         status           = updated.get("status", "data_loaded"),
     )

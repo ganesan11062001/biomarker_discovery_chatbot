@@ -29,6 +29,7 @@ from agents.base_agent import BaseAgent
 from config.settings import get_settings
 from core.state import BiomarkerState
 from skills.omics_registry import OmicsSkillRegistry
+from skills.pooled_fold_change import PooledFoldChangeSkill
 from skills.proteomics_analysis import ProteomicsAnalysisSkill
 
 settings = get_settings()
@@ -56,6 +57,7 @@ class BiomarkerAgent(BaseAgent):
         # Add new omic types here as they are implemented.
         self._registry = OmicsSkillRegistry()
         self._registry.register(ProteomicsAnalysisSkill())
+        self._registry.register(PooledFoldChangeSkill())
         # Future registrations (uncomment when implemented):
         # self._registry.register(TranscriptomicsSkill())
         # self._registry.register(MetabolomicsSkill())
@@ -71,6 +73,12 @@ class BiomarkerAgent(BaseAgent):
                 "No data loaded. Please upload a file first.",
                 "No data found. Please upload your file before running analysis.",
             )
+
+        # Auto-detect pooled design: ingestion agent sets omic_type to
+        # "proteomics_pooled" when it finds a label map in the Excel file.
+        # Also honour an explicit is_pooled_design flag as a fallback.
+        if state.get("is_pooled_design") and not state.get("omic_type"):
+            state["omic_type"] = "proteomics_pooled"
 
         omic_type = state.get("omic_type") or _DEFAULT_OMIC_TYPE
 
@@ -90,7 +98,12 @@ class BiomarkerAgent(BaseAgent):
         state["analysis_mode"] = mode
         state["status"] = "analyzing"
 
-        mode_label = "differential expression" if mode == "supervised" else "unsupervised CV"
+        if omic_type == "proteomics_pooled":
+            mode_label = "pooled fold-change"
+        elif mode == "supervised":
+            mode_label = "differential expression"
+        else:
+            mode_label = "unsupervised CV"
         state["messages"].append({
             "role": "assistant",
             "content": f"Running {mode_label} analysis ({omic_type}) — please wait…",
@@ -98,10 +111,14 @@ class BiomarkerAgent(BaseAgent):
 
         # Dispatch to the registered skill
         skill = self._registry.get(omic_type)
-        file_name = Path(state.get("data_path", "analysis")).stem
+        # For pooled designs use the original raw file name; for processed CSV
+        # use its stem so output files are named sensibly.
+        raw_path = state.get("raw_data_path") or state.get("data_path", "analysis")
+        file_name = Path(raw_path).stem
 
         result = skill.execute(
-            data_path=state["data_path"],
+            # Standard parameters (used by ProteomicsAnalysisSkill)
+            data_path=state.get("data_path", ""),
             sample_columns=state.get("sample_columns") or [],
             group1_samples=g1,
             group2_samples=g2,
@@ -115,13 +132,16 @@ class BiomarkerAgent(BaseAgent):
             top_n=settings.top_n_biomarkers,
             output_dir=settings.output_dir,
             file_name=file_name,
+            # Pooled-design parameters (used by PooledFoldChangeSkill)
+            raw_data_path=state.get("raw_data_path", ""),
+            label_map=state.get("label_map"),
         )
 
         if result.get("error"):
             return self._error(
                 state,
                 result["error"],
-                f"Analysis failed: {str(result['error'])[:500]}",
+                f"Analysis failed: {result['error']}",
             )
 
         # Persist results
@@ -131,6 +151,7 @@ class BiomarkerAgent(BaseAgent):
         state["n_significant"]  = result["n_significant"]
         state["excel_path"]     = result["excel_path"]
         state["qc_summary"]     = result["qc_summary"]
+        state["qc_passed"]      = True   # analysis succeeded → data passed QC
         state["status"]         = "analysis_complete"
 
         summary = self._build_summary(result, state)
@@ -165,7 +186,21 @@ class BiomarkerAgent(BaseAgent):
         qc        = result.get("qc_summary") or {}
 
         top5 = (result.get("top_biomarkers") or [])[:5]
-        if mode == "supervised":
+        if omic_type == "proteomics_pooled":
+            # Pooled: show per-contrast fold changes
+            def _fc_str(b: Dict[str, Any]) -> str:
+                parts = [
+                    f"{k}={v}" for k, v in b.items()
+                    if k not in ("rank", "protein", "rescue_score") and isinstance(v, float)
+                ]
+                return ", ".join(parts[:3]) or "n/a"
+
+            top5_lines = "\n".join(
+                f"  {b.get('rank','?')}. {b.get('protein','?')}  "
+                f"{_fc_str(b)}  rescue={b.get('rescue_score','?')}"
+                for b in top5
+            )
+        elif mode == "supervised":
             top5_lines = "\n".join(
                 f"  {b.get('rank','?')}. {b.get('protein','?')}  "
                 f"log2FC={b.get('log2_fold_change','?')},  "
@@ -219,6 +254,15 @@ class BiomarkerAgent(BaseAgent):
                     f"log2FC={b.get('log2_fold_change','?')}, "
                     f"adj_p={b.get('adj_p_value','?')}, "
                     f"{b.get('significance','NS')}"
+                )
+            elif "rescue_score" in b:
+                fc_parts = ", ".join(
+                    f"{k}={v}" for k, v in b.items()
+                    if k not in ("rank", "protein", "rescue_score") and isinstance(v, float)
+                )
+                lines.append(
+                    f"  {b.get('rank','?')}. **{b.get('protein','?')}** — "
+                    f"{fc_parts}  rescue={b.get('rescue_score','?')}"
                 )
             else:
                 lines.append(

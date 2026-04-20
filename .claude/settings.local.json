@@ -14,7 +14,9 @@
       "Bash(rm -f config/azure_keyvault.py config/logging_config.py)",
       "Bash(rm -rf api/middleware)",
       "Bash(rm -rf api/schemas)",
-      "Bash(python3 -c ':*)"
+      "Bash(python3 -c ':*)",
+      "Bash(python3 -c \"import fastapi, streamlit, openai, langgraph, pandas\")",
+      "Bash(python3 -m pip install \"statsmodels>=0.14.0\" \"scipy>=1.11.0\" \"scikit-learn>=1.3.0\")"
     ]
   }
 }

@@ -52,9 +52,29 @@ def chat(request: ChatRequest):
     try:
         state = SessionManager.get_session(request.session_id)
     except KeyError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session '{request.session_id}' not found. POST /chat/session to create one.",
+        # Session lost (e.g. server restart) — create a fresh one so the UI
+        # gets a proper error message rather than a 404 crash.
+        logger.warning("Session '%s' not found — creating replacement.", request.session_id)
+        new_sid = SessionManager.create_session(
+            disease_program=request.disease_program or "FA",
+            organism=request.organism or "human",
+        )
+        state = SessionManager.get_session(new_sid)
+        state["session_id"] = new_sid  # adopt the new id so response routes back correctly
+        # Tell the UI to re-upload — the old session's data was in memory only.
+        state["messages"].append({
+            "role": "assistant",
+            "content": (
+                "⚠️ **Session expired** — the server was restarted and in-memory session data was lost. "
+                "Please re-upload your data file to continue."
+            ),
+        })
+        SessionManager.update_session(new_sid, state)
+        return ChatResponse(
+            session_id=new_sid,
+            response=state["messages"][-1]["content"],
+            intent=None,
+            status="session_expired",
         )
 
     # Apply inline overrides

@@ -14,8 +14,11 @@ BaseOmicsSkill and register it in agents/biomarker_agent.py.
 """
 from __future__ import annotations
 
+import logging
 import traceback
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -105,13 +108,15 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             result["omic_type"] = self.omic_type
             return result
         except Exception as exc:
+            # Log full traceback for debugging; return only the clean message to the user.
+            logger.error("ProteomicsAnalysisSkill failed:\n%s", traceback.format_exc())
             return OmicsAnalysisResult(
                 omic_type=self.omic_type,
                 top_biomarkers=[],
                 n_significant=0,
                 excel_path=None,
                 qc_summary={},
-                error=f"{exc}\n{traceback.format_exc()}",
+                error=str(exc),
             )
 
     # ── Internal pipeline ─────────────────────────────────────────────────────
@@ -207,12 +212,15 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         data = data.loc[:, miss_samp <= 0.80]
 
         # Half-minimum imputation (per protein)
-        for idx in data.index:
-            row = data.loc[idx]
-            if row.isna().any():
-                min_val = row.min()
-                fill = (min_val / 2) if pd.notna(min_val) else 0.0
-                data.loc[idx] = row.fillna(fill)
+        # Uses numpy to avoid ambiguous Series/DataFrame from duplicate index labels.
+        arr = data.to_numpy(dtype=float, copy=True)
+        nan_mask = np.isnan(arr)
+        if nan_mask.any():
+            with np.errstate(all="ignore"):
+                row_half_min = np.nanmin(arr, axis=1, keepdims=True) / 2.0
+            row_half_min = np.where(np.isnan(row_half_min), 0.0, row_half_min)
+            arr[nan_mask] = np.broadcast_to(row_half_min, arr.shape)[nan_mask]
+            data = pd.DataFrame(arr, index=data.index, columns=data.columns)
 
         qc_summary = {
             "proteins_input":   orig_proteins,
@@ -246,6 +254,13 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
                 f"Group1 requested: {g1_cols}\n"
                 f"Group2 requested: {g2_cols}\n"
                 f"Available columns: {list(data.columns)}"
+            )
+
+        if len(g1) < 2 or len(g2) < 2:
+            raise ValueError(
+                f"Differential analysis requires at least 2 samples per group. "
+                f"Got: {g1_label}={len(g1)} sample(s), {g2_label}={len(g2)} sample(s). "
+                f"Please assign more samples to each group."
             )
 
         rows = []

@@ -13,10 +13,11 @@ metabolomics, and any future omic layer.
 
 Supported omic types
 --------------------
-  "proteomics"      — ProteomicsAnalysisSkill  (implemented)
-  "transcriptomics" — TranscriptomicsSkill      (planned)
-  "metabolomics"    — MetabolomicsSkill         (planned)
-  "lipidomics"      — LipidomicsSkill           (planned)
+  "proteomics"         — ProteomicsAnalysisSkill    (implemented)
+  "proteomics_pooled"  — PooledFoldChangeSkill      (implemented)
+  "transcriptomics"    — TranscriptomicsSkill        (planned)
+  "metabolomics"       — MetabolomicsSkill           (planned)
+  "lipidomics"         — LipidomicsSkill             (planned)
 """
 from __future__ import annotations
 
@@ -41,16 +42,23 @@ class BiomarkerState(TypedDict, total=False):
     omic_type: Optional[str]   # "proteomics" | "transcriptomics" | "metabolomics" …
 
     # ── Data ingestion ────────────────────────────────────────────────────────
-    file_id:      Optional[str]
-    data_path:    Optional[str]           # path to normalised CSV
-    data_type:    Optional[str]           # "olink_npx" | "ms_lfq" | "generic"
-    data_format:  Optional[str]           # "csv" | "excel"
-    n_proteins:   Optional[int]           # generic alias for n_features
-    n_samples:    Optional[int]
+    file_id:       Optional[str]
+    raw_data_path: Optional[str]          # original uploaded file (before processing)
+    data_path:     Optional[str]          # path to normalised CSV
+    data_type:     Optional[str]          # "olink_npx" | "ms_lfq" | "generic"
+    data_format:   Optional[str]          # "csv" | "excel"
+    n_proteins:    Optional[int]          # generic alias for n_features
+    n_samples:     Optional[int]
 
     # Detected column sets
     sample_columns:   Optional[List[str]] # numeric/intensity columns
     metadata_columns: Optional[List[str]] # non-numeric (group labels, IDs, etc.)
+
+    # Pooled design support (multi-sheet MaxQuant / Olink Excel)
+    label_map:        Optional[Dict[str, str]]  # e.g. {"A": "WT", "B": "mdx", …}
+    is_pooled_design: Optional[bool]            # True when n=1 per group
+    identifier_info:  Optional[Any]             # full parsed Identifier Info DataFrame (all mice)
+    all_sheets:       Optional[Dict[str, Any]]  # every sheet parsed from the workbook
 
     # ── Analysis configuration ────────────────────────────────────────────────
     disease_program: Optional[str]        # e.g. "FA", "DMD"

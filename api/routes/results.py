@@ -50,6 +50,7 @@ class AnalysisStateResponse(BaseModel):
     data_format:  Optional[str] = None
     n_proteins:   Optional[int] = None
     n_samples:    Optional[int] = None
+    omic_type:    Optional[str] = None
     sample_columns:   Optional[List[str]] = None
     metadata_columns: Optional[List[str]] = None
 
@@ -70,6 +71,13 @@ class AnalysisStateResponse(BaseModel):
     excel_path:      Optional[str]  = None
     analysis_summary: Optional[str] = None
 
+    # Plots — collected from both BiomarkerAgent (qc_summary) and VisualizationAgent
+    plot_paths:   Optional[List[str]] = None
+
+    # Enrichment
+    pathways:               Optional[List[Dict[str, Any]]] = None
+    enrichment_result_path: Optional[str] = None
+
     status:         Optional[str] = None
     error_message:  Optional[str] = None
 
@@ -87,6 +95,13 @@ def get_analysis_state(session_id: str):
             detail=f"Session '{session_id}' not found.",
         )
 
+    # Collect plot paths from BiomarkerAgent (inside qc_summary) + VisualizationAgent
+    qc = state.get("qc_summary") or {}
+    all_plots = list(state.get("plot_paths") or [])
+    for p in (qc.get("plot_paths") or []):
+        if p and p not in all_plots:
+            all_plots.append(p)
+
     return AnalysisStateResponse(
         session_id=session_id,
         disease_program=state.get("disease_program"),
@@ -94,6 +109,7 @@ def get_analysis_state(session_id: str):
         data_format=state.get("data_format"),
         n_proteins=state.get("n_proteins"),
         n_samples=state.get("n_samples"),
+        omic_type=state.get("omic_type"),
         sample_columns=state.get("sample_columns"),
         metadata_columns=state.get("metadata_columns"),
         group1_label=state.get("group1_label"),
@@ -102,11 +118,14 @@ def get_analysis_state(session_id: str):
         group2_samples=state.get("group2_samples"),
         analysis_mode=state.get("analysis_mode"),
         qc_passed=state.get("qc_passed"),
-        qc_summary=state.get("qc_summary"),
+        qc_summary=qc,
         n_significant=state.get("n_significant"),
         top_biomarkers=state.get("top_biomarkers"),
         excel_path=state.get("excel_path"),
         analysis_summary=state.get("analysis_summary"),
+        plot_paths=all_plots or None,
+        pathways=state.get("pathways"),
+        enrichment_result_path=state.get("enrichment_result_path"),
         status=state.get("status"),
         error_message=state.get("error_message"),
     )
@@ -143,12 +162,22 @@ def download_output_file(
     path: str = Query(..., description="Relative path inside outputs/"),
 ):
     """Serve any generated output file (plots, CSVs, etc.)."""
-    file_path = Path(path) if Path(path).is_absolute() else Path("outputs") / path
+    # Accept:  absolute path, "outputs/file.png" (as stored in state), or bare "file.png"
+    candidate = Path(path)
+    if candidate.is_absolute():
+        pass  # use as-is
+    elif candidate.parts and candidate.parts[0] == "outputs":
+        pass  # already has outputs/ prefix
+    else:
+        candidate = Path("outputs") / candidate
 
+    # Security: must resolve inside outputs/
     try:
-        file_path.resolve().relative_to(Path("outputs").resolve())
+        candidate.resolve().relative_to(Path("outputs").resolve())
     except ValueError:
         raise HTTPException(status_code=403, detail="Access denied.")
+
+    file_path = candidate
 
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {path}")
