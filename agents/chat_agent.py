@@ -18,11 +18,18 @@ class ChatAgent(BaseAgent):
 
     # ── Intent detection ──────────────────────────────────────────────────────
 
+    # Action verbs that signal the user wants to TRIGGER a pipeline step,
+    # not just ask a question about it.
+    _RUN_VERBS = (
+        "run ", "do ", "start ", "perform ", "execute ",
+        "trigger ", "begin ", "launch ", "go ahead",
+        "analyz",   # catches analyze / analyzing / analyzed
+    )
+
     def detect_intent(self, query: str) -> str:
         q = query.lower()
 
-        # Ingestion: user explicitly wants to load a NEW file.
-        # Use specific phrases so "uploaded dataset" doesn't trigger this.
+        # ── Ingestion: user explicitly wants to load a NEW file ───────────────
         if any(w in q for w in [
             "upload a", "upload my", "upload new",
             "load a file", "load my file", "load new",
@@ -32,29 +39,37 @@ class ChatAgent(BaseAgent):
         ]):
             return "ingestion_agent"
 
-        # Analysis: user wants to run or trigger analysis.
-        # Note: "analyz" catches "analyze/analyzing" but NOT "analysis" (ends in -sis).
-        # Add "analysis" and "proteomic" explicitly.
-        if any(w in q for w in [
-            "run analysis", "run fold", "run differential",
-            "do the analysis", "do analysis", "start analysis",
-            "perform analysis", "perform the",
+        # ── Analysis: action verb + analysis/omic keyword ─────────────────────
+        # Pure topic words like "proteomic", "biomarker", "analysis" alone go to
+        # the LLM so it can answer informational questions without running the
+        # pipeline again.
+        has_action = any(v in q for v in self._RUN_VERBS)
+
+        # Phrases that always imply a run request (no verb needed)
+        always_run = any(w in q for w in [
             "fold-change", "fold change",
-            "analyz", "analysis",
-            "proteomic", "proteomics",
-            "biomarker", "differential expression",
-            "dea", "compare groups", "find significant",
+            "differential expression", "dea",
+            "compare groups", "find significant",
             "identify biomarker", "discover biomarker",
-            "top protein", "significant protein",
-        ]):
+        ])
+
+        # Topic words only trigger when paired with an action verb
+        topic_match = has_action and any(w in q for w in [
+            "analysis", "proteomics", "proteomic",
+            "biomarker", "significant protein", "top protein",
+        ])
+
+        if always_run or topic_match:
             return "biomarker_agent"
 
+        # ── Enrichment ────────────────────────────────────────────────────────
         if any(w in q for w in [
             "pathway", "enrich", "kegg", "go term", "gsea",
             "cluster", "ontology",
         ]):
             return "enrichment_agent"
 
+        # ── Visualisation ─────────────────────────────────────────────────────
         if any(w in q for w in [
             "plot", "visualize", "visualise", "chart",
             "volcano", "heatmap", "report",
