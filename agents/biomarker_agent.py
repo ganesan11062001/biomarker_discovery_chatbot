@@ -160,19 +160,12 @@ class BiomarkerAgent(BaseAgent):
         summary = self._build_summary(result, state)
         state["analysis_summary"] = summary
 
-        # Append summary + reproducible code block
-        code = result.get("analysis_code", "")
-        full_message = summary
-        if code:
-            full_message += (
-                "\n\n---\n"
-                "**Reproducible Analysis Code** — copy and run to re-execute:\n\n"
-                "```python\n"
-                + code +
-                "\n```\n\n"
-                "_Type **'modify the code to…'** to customise parameters or add steps._"
-            )
-        state["messages"].append({"role": "assistant", "content": full_message})
+        # Code is stored in state but NOT shown unless user asks ("show me the code")
+        state["messages"].append({
+            "role":      "assistant",
+            "content":   summary,
+            "has_plots": bool(result.get("plot_paths")),
+        })
 
         logger.info(
             "Analysis complete | session=%s omic=%s significant=%d",

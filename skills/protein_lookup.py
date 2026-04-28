@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _UNIPROT_BASE = "https://rest.uniprot.org/uniprotkb"
 _UNIPROT_ID_MAP = "https://rest.uniprot.org/idmapping"
 _BATCH_SIZE = 100          # UniProt supports up to 100 IDs per request
+_MAX_API_PROTEINS = 500    # cap API calls; skip to regex-only above this threshold
 _REQUEST_TIMEOUT = 15      # seconds per HTTP call
 _RETRY_WAIT = 2            # seconds between retries
 
@@ -108,6 +109,13 @@ class ProteinLookupSkill:
         gene_symbols: List[str] = []
 
         if accessions:
+            if len(accessions) > _MAX_API_PROTEINS:
+                logger.warning(
+                    "%d accessions found — truncating to %d for UniProt API to avoid timeout. "
+                    "Remaining proteins will use regex gene-symbol extraction.",
+                    len(accessions), _MAX_API_PROTEINS,
+                )
+                accessions = accessions[:_MAX_API_PROTEINS]
             annotations = self._batch_lookup(accessions)
             gene_symbols = [
                 a["gene"] for a in annotations if a.get("gene")

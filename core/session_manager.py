@@ -161,11 +161,13 @@ class SessionManager:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _to_plain_dict(msg) -> Optional[dict]:
-    """Normalise a LangChain message object or plain dict to {role, content}."""
+    """Normalise a LangChain message object or plain dict to {role, content, ...extras}."""
     if isinstance(msg, dict):
         role    = msg.get("role") or msg.get("type", "assistant")
         content = msg.get("content", "")
-        return {"role": role, "content": str(content)}
+        # Preserve any extra metadata keys (e.g. has_plots)
+        extras  = {k: v for k, v in msg.items() if k not in ("role", "type", "content")}
+        return {"role": role, "content": str(content), **extras}
     # LangChain BaseMessage duck-type
     if hasattr(msg, "content"):
         msg_type = getattr(msg, "type", "") or type(msg).__name__.lower()

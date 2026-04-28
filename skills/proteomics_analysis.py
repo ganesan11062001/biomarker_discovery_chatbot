@@ -418,11 +418,11 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
                 continue
 
             # log2 FC: data is already log2-transformed by QC if needed,
-            # so difference = log2(G1/G2)
+            # so difference = log2(G1/G2). Cap at ±20 to keep Excel/stats valid.
             if m2 == 0:
-                log2fc = np.inf if m1 > 0 else 0.0
+                log2fc = 20.0 if m1 > 0 else 0.0
             else:
-                log2fc = float(m1 - m2)
+                log2fc = max(-20.0, min(20.0, float(m1 - m2)))
 
             rows.append({
                 "protein":            protein,

@@ -234,14 +234,20 @@ def _top_n_by_variance(log2_mat: pd.DataFrame, n: int = 50) -> pd.DataFrame:
 
 def _rescue_score(fc_df: pd.DataFrame) -> pd.Series:
     """
-    Heuristic 'rescue' score: proteins strongly up in treatment vs mdx
-    (uDys5_vs_mdx OR H2_vs_mdx) and at least partially restored toward WT.
+    Generic activity score: sum of positive fold-changes across all contrasts.
+    Works for any label_map — highlights proteins upregulated in treatment groups.
+    Falls back to DMD-specific columns when present for backwards compatibility.
     """
     score = pd.Series(0.0, index=fc_df.index)
-    if "uDys5_vs_mdx" in fc_df.columns:
-        score += fc_df["uDys5_vs_mdx"].clip(lower=0)
-    if "H2_vs_mdx" in fc_df.columns:
-        score += fc_df["H2_vs_mdx"].clip(lower=0)
+    dmd_cols = {"uDys5_vs_mdx", "H2_vs_mdx"}
+    treatment_cols = [c for c in fc_df.columns if c in dmd_cols]
+    if treatment_cols:
+        for col in treatment_cols:
+            score += fc_df[col].clip(lower=0)
+    else:
+        # Generic: sum all positive FCs across every contrast
+        for col in fc_df.columns:
+            score += fc_df[col].clip(lower=0)
     return score
 
 

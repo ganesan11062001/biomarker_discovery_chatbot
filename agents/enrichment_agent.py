@@ -90,7 +90,7 @@ class EnrichmentAgent(BaseAgent):
         top5 = result.get("top_pathways", [])[:5]
         pathway_lines = "\n".join(
             f"  {i+1}. {p['pathway']} | lib={p.get('library','')} | "
-            f"adj_p={p.get('p_adjust',1):.3e} | genes={p.get('gene_count','?')} | "
+            f"adj_p={float(p.get('p_adjust') or 1.0):.3e} | genes={p.get('gene_count','?')} | "
             f"overlap={p.get('overlap','')}"
             for i, p in enumerate(top5)
         )
@@ -157,6 +157,6 @@ class EnrichmentAgent(BaseAgent):
         for i, p in enumerate(top5):
             lines.append(
                 f"  {i+1}. {p['pathway']} "
-                f"(adj.p={p.get('p_adjust', '?'):.3e}, genes={p.get('gene_count','?')})"
+                f"(adj.p={float(p.get('p_adjust') or 1.0):.3e}, genes={p.get('gene_count','?')})"
             )
         return "\n".join(lines)

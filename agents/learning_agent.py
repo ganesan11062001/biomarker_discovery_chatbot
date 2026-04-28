@@ -472,8 +472,9 @@ class LearningAgent(BaseAgent):
         ]
         try:
             modified = self._call_llm(messages, max_tokens=2000, temperature=0.0).strip()
-            # Strip markdown fences if the LLM added them
-            modified = modified.removeprefix("```python").removeprefix("```").removesuffix("```").strip()
+            # Strip markdown fences if the LLM added them (Python 3.8-compatible)
+            modified = re.sub(r"^```(?:python)?\s*", "", modified, flags=re.MULTILINE)
+            modified = re.sub(r"\s*```$", "", modified, flags=re.MULTILINE).strip()
             state["analysis_code"] = modified
             state["messages"].append({
                 "role": "assistant",

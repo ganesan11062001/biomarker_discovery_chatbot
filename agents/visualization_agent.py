@@ -136,7 +136,11 @@ class VisualizationAgent(BaseAgent):
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
             plots = json.loads(raw)
             if isinstance(plots, list):
-                return [p for p in plots if p in PLOT_REGISTRY]
+                valid   = [p for p in plots if p in PLOT_REGISTRY]
+                unknown = [p for p in plots if p not in PLOT_REGISTRY]
+                if unknown:
+                    logger.warning("Unknown plot names ignored: %s. Valid: %s", unknown, list(PLOT_REGISTRY))
+                return valid
         except Exception as exc:
             logger.warning("Plot detection LLM failed: %s — generating standard suite.", exc)
         return []
@@ -154,7 +158,7 @@ class VisualizationAgent(BaseAgent):
 
         protein_lines = self._format_protein_lines(top10)
         pathway_lines = "\n".join(
-            f"  {i+1}. {p.get('pathway','')} (adj_p={p.get('p_adjust',1):.3e})"
+            f"  {i+1}. {p.get('pathway','')} (adj_p={float(p.get('p_adjust') or 1.0):.3e})"
             for i, p in enumerate(pathways)
         ) if pathways else "  No pathway data."
 

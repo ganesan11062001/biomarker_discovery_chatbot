@@ -124,7 +124,13 @@ class PathwaySkill:
                 "gseapy is not installed. Run: python3 -m pip install gseapy"
             )
 
-        libraries   = _LIBRARIES.get(organism.lower(), _LIBRARIES["human"])
+        organism_key = organism.lower()
+        if organism_key == "rat":
+            logger.warning(
+                "Rat-specific gene-set libraries are unavailable in Enrichr. "
+                "Using mouse KEGG/GO libraries as a proxy — results may differ from rat biology."
+            )
+        libraries   = _LIBRARIES.get(organism_key, _LIBRARIES["human"])
         all_frames: list[pd.DataFrame] = []
         n_kegg = n_go = 0
 
@@ -173,7 +179,7 @@ class PathwaySkill:
                 "library":    row.get("library", ""),
                 "p_value":    float(row.get("P-value", 1.0)),
                 "p_adjust":   float(row.get("Adjusted P-value", 1.0)),
-                "gene_count": len(str(row.get("Genes", "")).split(";")),
+                "gene_count": len([g for g in re.split(r"[;,]", str(row.get("Genes", ""))) if g.strip()]),
                 "genes":      str(row.get("Genes", "")),
                 "overlap":    str(row.get("Overlap", "")),
             }

@@ -59,7 +59,15 @@ async def upload_proteomics_file(
     """
     suffix = Path(file.filename or "data.csv").suffix.lower()
     if suffix not in _ALLOWED_EXT:
-        raise HTTPException(400, f"Unsupported type '{suffix}'. Use .csv / .xlsx / .xls.")
+        hint = ""
+        if suffix in (".txt", ".tsv"):
+            hint = " Rename to .csv if your file is tab/comma-separated."
+        elif suffix in (".ods", ".xlsm", ".xlsb"):
+            hint = " Please export as .xlsx from Excel/LibreOffice."
+        raise HTTPException(
+            400,
+            f"Unsupported file type '{suffix}'.{hint} Accepted formats: .csv, .xlsx, .xls.",
+        )
 
     content = await file.read()
     if len(content) > _MAX_BYTES:

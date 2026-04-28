@@ -790,22 +790,17 @@ def _render_main() -> None:
 
         # ── Message history ────────────────────────────────────────────────────
         plot_paths = astate.get("plot_paths") or []
-        shown_plots = False
 
-        for idx, m in enumerate(messages):
+        for m in messages:
             role    = m.get("role", "assistant")
             content = m.get("content", "")
 
             with st.chat_message(role, avatar="🧬" if role == "assistant" else None):
                 st.markdown(content)
 
-                # After the last assistant message, show plots inline
-                if (role == "assistant"
-                        and idx == len(messages) - 1
-                        and plot_paths
-                        and not shown_plots):
+                # Show plots anchored to the message that produced them
+                if role == "assistant" and m.get("has_plots") and plot_paths:
                     _render_inline_plots(session_id, plot_paths)
-                    shown_plots = True
 
         # ── Quick action pills ─────────────────────────────────────────────────
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
