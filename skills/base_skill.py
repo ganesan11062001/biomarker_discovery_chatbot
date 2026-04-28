@@ -42,6 +42,7 @@ class OmicsAnalysisResult(TypedDict, total=False):
     excel_path:     Optional[str]           # absolute path to Excel report
     qc_summary:     Dict[str, Any]          # QC metrics (proteins removed, etc.)
     error:          Optional[str]           # non-None on failure
+    analysis_code:  Optional[str]           # self-contained reproducible Python script
 
 
 # ── Abstract base ─────────────────────────────────────────────────────────────

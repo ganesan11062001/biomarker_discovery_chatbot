@@ -198,6 +198,34 @@ def _compute_fold_changes(
     return pd.DataFrame(records, index=log2_mat.index) if records else pd.DataFrame(index=log2_mat.index)
 
 
+def _build_contrasts(
+    label_map: Dict[str, str],
+    available_groups: set,
+) -> List[Tuple[str, str, str]]:
+    """
+    Build a contrast list for any label_map.
+
+    Strategy:
+    1. Try the preset DMD-specific contrasts if the matching groups exist.
+    2. Otherwise, generate all pairwise contrasts from the available groups.
+    """
+    # Try to use the preset contrasts first
+    active = [
+        (num, den, name) for num, den, name in _CONTRASTS
+        if num in available_groups and den in available_groups
+    ]
+    if active:
+        return active
+
+    # Fallback: all pairwise contrasts from whatever groups are present
+    groups = sorted(available_groups)
+    pairwise: List[Tuple[str, str, str]] = []
+    for i, g1 in enumerate(groups):
+        for g2 in groups[i + 1:]:
+            pairwise.append((g1, g2, f"{g1}_vs_{g2}"))
+    return pairwise
+
+
 def _top_n_by_variance(log2_mat: pd.DataFrame, n: int = 50) -> pd.DataFrame:
     var = log2_mat.var(axis=1)
     top_idx = var.nlargest(n).index
@@ -468,14 +496,21 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
         # 3. Log2 transform
         log2_mat = _log2_transform(primary)
 
-        # 4. Fold changes
-        fc_df = _compute_fold_changes(log2_mat, _CONTRASTS)
+        # 4. Build contrasts from whatever groups are present
+        active_contrasts = _build_contrasts(label_map, set(log2_mat.columns))
+        logger.info("Active contrasts: %s", [c[2] for c in active_contrasts])
 
-        # 5. Top 50 by variance
+        # 5. Fold changes
+        fc_df = _compute_fold_changes(log2_mat, active_contrasts)
+
+        # 6. Top 50 by variance
         top50_mat = _top_n_by_variance(log2_mat, n=min(top_n, len(log2_mat)))
 
-        # 6. Rescue score → top biomarkers list
+        # 7. Rank proteins: rescue score when DMD contrasts present, else max abs FC
         score = _rescue_score(fc_df)
+        if score.sum() == 0 and not fc_df.empty:
+            # No DMD-specific rescue columns — rank by total absolute fold change
+            score = fc_df.abs().sum(axis=1)
         top_ranked = score.nlargest(top_n).index
         top_biomarkers: List[Dict[str, Any]] = []
         for rank, protein in enumerate(top_ranked, 1):
@@ -505,15 +540,17 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
         if p:
             plot_paths.append(p)
 
-        for _, _, contrast_name in _CONTRASTS:
+        for _, _, contrast_name in active_contrasts:
             if contrast_name in fc_df.columns:
                 bar_path = str(Path(output_dir) / f"{file_name}_barchart_{contrast_name}.png")
                 p = _plot_barchart(fc_df[contrast_name], contrast_name, bar_path)
                 if p:
                     plot_paths.append(p)
 
-        wt_col  = label_map.get("A", "WT")
-        mdx_col = label_map.get("B", "mdx")
+        # Scatter: first two groups alphabetically
+        groups_present = sorted(primary.columns.tolist())
+        wt_col  = groups_present[0] if groups_present else label_map.get("A", "WT")
+        mdx_col = groups_present[1] if len(groups_present) > 1 else label_map.get("B", "mdx")
         if wt_col in primary.columns and mdx_col in primary.columns:
             scatter_path = str(Path(output_dir) / f"{file_name}_scatter_wt_vs_mdx.png")
             p = _plot_scatter(primary, wt_col, mdx_col, scatter_path)
@@ -529,10 +566,10 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
         excel_path = str(Path(output_dir) / f"{file_name}_biomarker_report.xlsx")
         _write_excel_report(log2_mat, fc_df, top50_mat, top_biomarkers, excel_path)
 
-        # 10. Count "significant" = |log2FC| >= threshold in mdx_vs_WT
+        # 10. Count "significant" = |log2FC| >= threshold across any contrast
         n_sig = 0
-        if "mdx_vs_WT" in fc_df.columns:
-            n_sig = int((fc_df["mdx_vs_WT"].abs() >= _LOG2FC_THRESHOLD).sum())
+        if not fc_df.empty:
+            n_sig = int((fc_df.abs() >= _LOG2FC_THRESHOLD).any(axis=1).sum())
 
         qc_summary = {
             "proteins_before_filter": proteins_before,
@@ -553,6 +590,8 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
             "qc_type": "pooled_prefilter",
         }
 
+        code = self._generate_code(raw_path, label_map, output_dir, top_n, file_name)
+
         logger.info(
             "PooledFoldChangeSkill done: %d proteins, %d contrasts, %d plots",
             proteins_after, len(fc_df.columns), len(plot_paths),
@@ -563,6 +602,99 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
             top_biomarkers=top_biomarkers,
             n_significant=n_sig,
             excel_path=excel_path,
-            qc_summary=qc_summary,
+            qc_summary={**qc_summary, "analysis_code": code},
             error=None,
+            analysis_code=code,
         )
+
+    # ── Code generation ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _generate_code(
+        raw_path: str,
+        label_map: Dict[str, str],
+        output_dir: str,
+        top_n: int,
+        file_name: str,
+    ) -> str:
+        """Return a self-contained, re-executable Python script for this analysis."""
+        L: List[str] = []
+        a = L.append
+
+        contrasts_repr = repr(_CONTRASTS)
+
+        a('#!/usr/bin/env python3')
+        a('"""')
+        a('Reproducible pooled fold-change proteomics analysis')
+        a('Auto-generated — edit parameters and re-run to reproduce results.')
+        a('"""')
+        a('')
+        a('import numpy as np')
+        a('import pandas as pd')
+        a('import matplotlib; matplotlib.use("Agg")')
+        a('import matplotlib.pyplot as plt')
+        a('from pathlib import Path')
+        a('from itertools import combinations')
+        a('')
+        a('# ── Parameters (edit to customise) ──────────────────────────────────')
+        a('RAW_PATH   = ' + repr(raw_path))
+        a('LABEL_MAP  = ' + repr(label_map))
+        a('OUTPUT_DIR = ' + repr(output_dir))
+        a('TOP_N      = ' + str(top_n))
+        a('FILE_NAME  = ' + repr(file_name))
+        a('PSEUDOCOUNT = 1.0')
+        a('LOG2FC_THRESHOLD = 1.0')
+        a('')
+        a('# Contrasts: (numerator_label, denominator_label, contrast_name)')
+        a('CONTRASTS = ' + contrasts_repr)
+        a('')
+        a('# ── 1. Parse Proteins sheet ──────────────────────────────────────────')
+        a('xl = pd.ExcelFile(RAW_PATH, engine="openpyxl")')
+        a('sheet = "Proteins" if "Proteins" in xl.sheet_names else xl.sheet_names[0]')
+        a('df = xl.parse(sheet)')
+        a('id_col = next((c for c in df.columns if "majority protein" in str(c).lower()')
+        a('               or "accession" in str(c).lower()), df.columns[0])')
+        a('df = df.set_index(id_col)')
+        a('df.index = df.index.astype(str).str.strip()')
+        a('')
+        a('# Remove contaminants')
+        a('mask = ~(df.index.str.startswith("REV__") | df.index.str.startswith("CON__"))')
+        a('df = df[mask]')
+        a('')
+        a('# Build SpC matrix')
+        a('spc_cols = {}')
+        a('for col in df.columns:')
+        a('    cl = str(col).lower()')
+        a('    for code, grp in LABEL_MAP.items():')
+        a('        if cl.startswith(code.lower()) and ("spectral" in cl or "spc" in cl or "ms/ms" in cl):')
+        a('            spc_cols.setdefault(grp, col)')
+        a('primary = pd.DataFrame({g: pd.to_numeric(df[c], errors="coerce").fillna(0)')
+        a('                        for g, c in spc_cols.items()}, index=df.index)')
+        a('primary = primary.loc[(primary > 0).any(axis=1)]')
+        a('print(f"Proteins after filter: {len(primary)}")')
+        a('')
+        a('# ── 2. Log2 transform ────────────────────────────────────────────────')
+        a('log2_mat = np.log2(primary + PSEUDOCOUNT)')
+        a('')
+        a('# ── 3. Fold changes ──────────────────────────────────────────────────')
+        a('fc_records = {}')
+        a('for num, den, name in CONTRASTS:')
+        a('    if num in log2_mat.columns and den in log2_mat.columns:')
+        a('        fc_records[name] = log2_mat[num] - log2_mat[den]')
+        a('fc_df = pd.DataFrame(fc_records, index=log2_mat.index)')
+        a('')
+        a('# ── 4. Rescue score ──────────────────────────────────────────────────')
+        a('score = pd.Series(0.0, index=fc_df.index)')
+        a('for col in ["uDys5_vs_mdx", "H2_vs_mdx"]:')
+        a('    if col in fc_df.columns:')
+        a('        score += fc_df[col].clip(lower=0)')
+        a('top_proteins = score.nlargest(TOP_N).index')
+        a('')
+        a('# ── 5. Save ──────────────────────────────────────────────────────────')
+        a('Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)')
+        a('log2_mat.to_csv(str(Path(OUTPUT_DIR) / f"{FILE_NAME}_cleaned_expression.csv"))')
+        a('fc_df.to_csv(str(Path(OUTPUT_DIR) / f"{FILE_NAME}_fold_changes.csv"))')
+        a('print("Saved cleaned expression and fold change CSVs")')
+        a('print(fc_df.loc[top_proteins].head(10).to_string())')
+
+        return '\n'.join(L)

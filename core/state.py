@@ -84,6 +84,7 @@ class BiomarkerState(TypedDict, total=False):
     n_significant:    Optional[int]
     excel_path:       Optional[str]                  # formatted Excel report
     analysis_summary: Optional[str]                  # LLM plain-language summary
+    analysis_code:    Optional[str]                  # reproducible Python script
 
     # Legacy alias (used by enrichment & visualization agents)
     top_proteins:    Optional[List[Dict]]   # mirrors top_biomarkers

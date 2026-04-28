@@ -151,12 +151,28 @@ class BiomarkerAgent(BaseAgent):
         state["n_significant"]  = result["n_significant"]
         state["excel_path"]     = result["excel_path"]
         state["qc_summary"]     = result["qc_summary"]
-        state["qc_passed"]      = True   # analysis succeeded → data passed QC
+        state["qc_passed"]      = True
         state["status"]         = "analysis_complete"
+
+        if result.get("analysis_code"):
+            state["analysis_code"] = result["analysis_code"]
 
         summary = self._build_summary(result, state)
         state["analysis_summary"] = summary
-        state["messages"].append({"role": "assistant", "content": summary})
+
+        # Append summary + reproducible code block
+        code = result.get("analysis_code", "")
+        full_message = summary
+        if code:
+            full_message += (
+                "\n\n---\n"
+                "**Reproducible Analysis Code** — copy and run to re-execute:\n\n"
+                "```python\n"
+                + code +
+                "\n```\n\n"
+                "_Type **'modify the code to…'** to customise parameters or add steps._"
+            )
+        state["messages"].append({"role": "assistant", "content": full_message})
 
         logger.info(
             "Analysis complete | session=%s omic=%s significant=%d",
@@ -214,6 +230,26 @@ class BiomarkerAgent(BaseAgent):
                 for b in top5
             )
 
+        # Describe the exact statistical method used
+        if omic_type == "proteomics_pooled":
+            method_str = (
+                "**Method:** Log₂ fold-change (pooled n=1 design — no replicates, no p-values). "
+                "Pseudocount +1 applied before log₂ transform."
+            )
+        elif mode == "supervised":
+            method_str = (
+                f"**Method:** Welch two-sample t-test — "
+                f"{g1} vs {g2}. "
+                f"FDR correction: Benjamini-Hochberg. "
+                f"Significance thresholds: adj. p < {settings.adj_pval_cutoff}, "
+                f"|log₂FC| ≥ {settings.log2fc_cutoff}."
+            )
+        else:
+            method_str = (
+                "**Method:** Unsupervised coefficient of variation (CV) ranking. "
+                "Proteins ranked by CV% across all samples — no group labels required."
+            )
+
         prompt = (
             f"{omic_type.capitalize()} biomarker analysis complete.\n\n"
             f"Mode: {mode}\n"
@@ -222,12 +258,14 @@ class BiomarkerAgent(BaseAgent):
             f"Log2 transformed: {qc.get('log2_transformed', False)}\n"
             f"Significant biomarkers: {result.get('n_significant', 0)}\n\n"
             f"Top 5:\n{top5_lines}\n\n"
-            "Write a concise (≤150 words) plain-language summary for a researcher:\n"
-            "1. Key findings\n"
-            "2. Most interesting biomarker(s)\n"
-            "3. Any QC notes\n"
-            "4. What the downloaded Excel file contains\n"
-            "Use markdown formatting."
+            f"Statistical method: {method_str}\n\n"
+            "Write a concise (≤200 words) plain-language summary for a researcher:\n"
+            "1. Which statistical method was used and why\n"
+            "2. Key findings and comparison made\n"
+            "3. Most interesting biomarker(s) with their values\n"
+            "4. Any QC notes\n"
+            "5. What the downloaded Excel file contains\n"
+            "Always include the method name in the summary. Use markdown formatting."
         )
 
         messages = [

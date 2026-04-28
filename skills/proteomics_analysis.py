@@ -97,6 +97,7 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         top_n: int = 50,
         output_dir: str = "outputs",
         file_name: str = "analysis",
+        **_kwargs,
     ) -> Dict[str, Any]:
         try:
             result = self._run(
@@ -176,14 +177,149 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             adj_pval_cutoff, log2fc_cutoff, file_name,
         )
 
+        code = self._generate_code(
+            data_path, sample_columns, group1_samples, group2_samples,
+            group1_label, group2_label, analysis_mode, data_type,
+            adj_pval_cutoff, log2fc_cutoff, missing_threshold, top_n,
+            output_dir, file_name,
+        )
+
         return {
-            "omic_type":     self.omic_type,
+            "omic_type":      self.omic_type,
             "top_biomarkers": top_biomarkers,
-            "n_significant": n_sig,
-            "excel_path":    excel_path,
-            "qc_summary":    qc_summary,
-            "error":         None,
+            "n_significant":  n_sig,
+            "excel_path":     excel_path,
+            "qc_summary":     qc_summary,
+            "analysis_code":  code,
+            "error":          None,
         }
+
+    # ── Code generation ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _generate_code(
+        data_path, sample_columns, group1_samples, group2_samples,
+        group1_label, group2_label, analysis_mode, data_type,
+        adj_pval_cutoff, log2fc_cutoff, missing_threshold, top_n,
+        output_dir, file_name,
+    ) -> str:
+        """Return a self-contained, re-executable Python script for this analysis."""
+        L: List[str] = []
+        a = L.append
+
+        a('#!/usr/bin/env python3')
+        a('"""')
+        a('Reproducible proteomics biomarker analysis')
+        a('Auto-generated — edit parameters and re-run to reproduce results.')
+        a('"""')
+        a('')
+        a('import numpy as np')
+        a('import pandas as pd')
+        if analysis_mode == "supervised":
+            a('from scipy import stats')
+            a('from statsmodels.stats.multitest import multipletests')
+        a('from pathlib import Path')
+        a('')
+        a('# ── Parameters (edit to customise) ──────────────────────────────────')
+        a('DATA_PATH         = ' + repr(data_path))
+        a('SAMPLE_COLUMNS    = ' + repr(sample_columns))
+        if analysis_mode == "supervised":
+            a('GROUP1_SAMPLES    = ' + repr(list(group1_samples or [])))
+            a('GROUP2_SAMPLES    = ' + repr(list(group2_samples or [])))
+            a('GROUP1_LABEL      = ' + repr(group1_label))
+            a('GROUP2_LABEL      = ' + repr(group2_label))
+        a('ANALYSIS_MODE     = ' + repr(analysis_mode))
+        a('ADJ_PVAL_CUTOFF   = ' + str(adj_pval_cutoff))
+        a('LOG2FC_CUTOFF     = ' + str(log2fc_cutoff))
+        a('MISSING_THRESHOLD = ' + str(missing_threshold))
+        a('TOP_N             = ' + str(top_n))
+        a('OUTPUT_DIR        = ' + repr(output_dir))
+        a('FILE_NAME         = ' + repr(file_name))
+        a('')
+        a('# ── 1. Load ──────────────────────────────────────────────────────────')
+        a('df_raw = pd.read_csv(DATA_PATH, index_col=0)')
+        a('avail  = [c for c in SAMPLE_COLUMNS if c in df_raw.columns]')
+        a('data   = df_raw[avail].apply(pd.to_numeric, errors="coerce")')
+        a('print(f"Loaded: {len(data)} proteins x {len(data.columns)} samples")')
+        a('')
+        a('# ── 2. QC — log2 transform, missing-value filter, half-min imputation ─')
+        a('if data.max().max() > 100:')
+        a('    data = np.log2(data.replace(0, np.nan) + 1)')
+        a('    print("Log2 transform applied")')
+        a('miss_prot = data.isna().mean(axis=1)')
+        a('data = data.loc[miss_prot <= MISSING_THRESHOLD]')
+        a('miss_samp = data.isna().mean(axis=0)')
+        a('data = data.loc[:, miss_samp <= 0.80]')
+        a('arr = data.to_numpy(dtype=float, copy=True)')
+        a('nan_mask = np.isnan(arr)')
+        a('if nan_mask.any():')
+        a('    row_min = np.nanmin(arr, axis=1, keepdims=True) / 2.0')
+        a('    row_min = np.where(np.isnan(row_min), 0.0, row_min)')
+        a('    arr[nan_mask] = np.broadcast_to(row_min, arr.shape)[nan_mask]')
+        a('    data = pd.DataFrame(arr, index=data.index, columns=data.columns)')
+        a('print(f"After QC: {len(data)} proteins, {len(data.columns)} samples")')
+        a('')
+
+        if analysis_mode == "supervised":
+            a('# ── 3. Welch two-sample t-test + Benjamini-Hochberg FDR ──────────────')
+            a('g1 = [c for c in GROUP1_SAMPLES if c in data.columns]')
+            a('g2 = [c for c in GROUP2_SAMPLES if c in data.columns]')
+            a('rows = []')
+            a('for protein in data.index:')
+            a('    v1 = data.loc[protein, g1].dropna().values.astype(float)')
+            a('    v2 = data.loc[protein, g2].dropna().values.astype(float)')
+            a('    if len(v1) < 2 or len(v2) < 2:')
+            a('        continue')
+            a('    m1, m2 = v1.mean(), v2.mean()')
+            a('    _, pval = stats.ttest_ind(v1, v2, equal_var=False)')
+            a('    if np.isnan(pval):')
+            a('        continue')
+            a('    rows.append({')
+            a('        "protein":           protein,')
+            a('        f"mean_{GROUP1_LABEL}": round(float(m1), 4),')
+            a('        f"mean_{GROUP2_LABEL}": round(float(m2), 4),')
+            a('        "log2_fold_change":  round(float(m1 - m2), 4),')
+            a('        "p_value":           float(pval),')
+            a('    })')
+            a('df = pd.DataFrame(rows)')
+            a('_, adj_p, _, _ = multipletests(df["p_value"].values, method="fdr_bh")')
+            a('df["adj_p_value"] = adj_p')
+            a('df["significance"] = "NS"')
+            a('hi  = (df["adj_p_value"] < 0.01) & (df["log2_fold_change"].abs() >= 1.0)')
+            a('sig = (df["adj_p_value"] < 0.05) & (df["log2_fold_change"].abs() >= 1.0)')
+            a('trn = (df["adj_p_value"] < 0.10) & ~sig')
+            a('df.loc[trn,  "significance"] = "Trend"')
+            a('df.loc[sig,  "significance"] = "Significant"')
+            a('df.loc[hi,   "significance"] = "Highly Significant"')
+            a('df = df.sort_values("adj_p_value")')
+            a('df.insert(0, "rank", range(1, len(df) + 1))')
+            a('n_sig = ((df["adj_p_value"] < ADJ_PVAL_CUTOFF) &')
+            a('         (df["log2_fold_change"].abs() >= LOG2FC_CUTOFF)).sum()')
+            a(f'print(f"Significant (adj.p<{adj_pval_cutoff}, |log2FC|>={log2fc_cutoff}): {{n_sig}}")')
+        else:
+            a('# ── 3. Unsupervised — coefficient of variation (CV) ranking ──────────')
+            a('rows = []')
+            a('for protein in data.index:')
+            a('    vals = data.loc[protein].dropna().values.astype(float)')
+            a('    if len(vals) < 3:')
+            a('        continue')
+            a('    m = vals.mean()')
+            a('    cv = (vals.std() / abs(m) * 100) if m != 0 else 0.0')
+            a('    rows.append({"protein": protein,')
+            a('                 "mean_expression": round(float(m), 4),')
+            a('                 "cv_percent": round(cv, 2)})')
+            a('df = pd.DataFrame(rows).sort_values("cv_percent", ascending=False)')
+            a('df.insert(0, "rank", range(1, len(df) + 1))')
+
+        a('')
+        a('# ── 4. Save results ──────────────────────────────────────────────────')
+        a('Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)')
+        a('out = str(Path(OUTPUT_DIR) / f"{FILE_NAME}_reproduced_results.csv")')
+        a('df.head(TOP_N).to_csv(out, index=False)')
+        a('print(f"Saved -> {out}")')
+        a('print(df.head(10).to_string(index=False))')
+
+        return '\n'.join(L)
 
     # ── QC ────────────────────────────────────────────────────────────────────
 

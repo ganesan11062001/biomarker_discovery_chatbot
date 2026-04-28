@@ -5,8 +5,9 @@ Knowledge Layer — PathwaySkill
 Pure-Python pathway enrichment via gseapy (Enrichr API).
 No R / clusterProfiler required.
 
-Gene symbols are extracted from UniProt-style protein names (GN=Myh6 pattern)
-before querying Enrichr, so the skill works directly with raw protein strings.
+Gene symbols are extracted via the ProteinLookupSkill (UniProt REST API)
+with a regex fallback for GN= tagged strings. This gives more accurate
+gene sets than plain regex alone.
 """
 from __future__ import annotations
 
@@ -17,7 +18,11 @@ from typing import List, Optional
 
 import pandas as pd
 
+from skills.protein_lookup import ProteinLookupSkill
+
 logger = logging.getLogger(__name__)
+
+_lookup_skill = ProteinLookupSkill()
 
 # Gene-set libraries queried per organism
 _LIBRARIES: dict[str, list[str]] = {
@@ -94,10 +99,18 @@ class PathwaySkill:
     ) -> dict:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-        gene_symbols = _extract_gene_symbols(protein_list)
+        # Use UniProt REST API for reliable ID→gene conversion, then regex as fallback
+        lookup_result = _lookup_skill.execute(
+            protein_list=protein_list,
+            organism=organism,
+            output_dir=output_dir,
+        )
+        gene_symbols = lookup_result["gene_symbols"]
+        if not gene_symbols:
+            gene_symbols = _extract_gene_symbols(protein_list)
         logger.info(
-            "Enrichment input: %d proteins → %d gene symbols extracted",
-            len(protein_list), len(gene_symbols),
+            "Enrichment input: %d proteins → %d gene symbols (UniProt=%d, regex fallback)",
+            len(protein_list), len(gene_symbols), lookup_result["n_resolved"],
         )
 
         if not gene_symbols:

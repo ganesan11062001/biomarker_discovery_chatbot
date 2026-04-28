@@ -1,12 +1,40 @@
 """
 agents/chat_agent.py
-Entry point — detects user intent and routes to the right specialist.
+Entry point — uses LLM to understand user intent and routes to the right specialist.
 """
 from core.state import BiomarkerState
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
 
 settings = get_settings()
+
+_VALID_INTENTS = frozenset({
+    "ingestion_agent",
+    "biomarker_agent",
+    "enrichment_agent",
+    "visualization_agent",
+    "chat_agent",
+})
+
+_INTENT_SYSTEM_PROMPT = """\
+You are an intent classifier for a proteomics biomarker discovery chatbot.
+Classify the user message into exactly one of these intents:
+
+  ingestion_agent     — user wants to upload, load, or import a new data file
+  biomarker_agent     — user explicitly wants to RUN or START a biomarker/proteomic analysis
+  enrichment_agent    — user wants to RUN pathway / KEGG / GO enrichment analysis
+  visualization_agent — user wants to generate plots, heatmaps, charts, or a report
+  chat_agent          — everything else: questions, explanations, general conversation, off-topic
+
+Rules:
+- Questions ("what is X?", "explain X", "how does X work?", "tell me about X") → chat_agent
+- Off-topic messages ("what is random forest", general ML/statistics questions) → chat_agent
+- Asking about existing results ("show my top proteins", "what did the analysis find?") → chat_agent
+- Only route to biomarker_agent when the user explicitly says to RUN or START analysis
+- Only route to enrichment_agent / visualization_agent when user says to RUN those steps
+
+Reply with ONLY the intent name — no explanation, no punctuation, nothing else.\
+"""
 
 
 class ChatAgent(BaseAgent):
@@ -16,65 +44,35 @@ class ChatAgent(BaseAgent):
             system_prompt_path="prompts/chat_agent.txt",
         )
 
-    # ── Intent detection ──────────────────────────────────────────────────────
+    # ── Intent detection (LLM-based) ──────────────────────────────────────────
 
-    # Action verbs that signal the user wants to TRIGGER a pipeline step,
-    # not just ask a question about it.
-    _RUN_VERBS = (
-        "run ", "do ", "start ", "perform ", "execute ",
-        "trigger ", "begin ", "launch ", "go ahead",
-        "analyz",   # catches analyze / analyzing / analyzed
-    )
+    def detect_intent(self, query: str, state: BiomarkerState) -> str:
+        """Ask the LLM to classify the user's intent; fall back to chat_agent on failure."""
+        data_loaded   = bool(state.get("data_type"))
+        analysis_done = state.get("n_significant") is not None
 
-    def detect_intent(self, query: str) -> str:
-        q = query.lower()
+        context = (
+            f"Session context:\n"
+            f"  Data loaded: {data_loaded}\n"
+            f"  Analysis already complete: {analysis_done}\n"
+            f"  Current status: {state.get('status', 'ready')}\n\n"
+            f'User message: "{query}"\n\n'
+            f"Intent:"
+        )
 
-        # ── Ingestion: user explicitly wants to load a NEW file ───────────────
-        if any(w in q for w in [
-            "upload a", "upload my", "upload new",
-            "load a file", "load my file", "load new",
-            "import file", "import data",
-            "new file", "open file", "attach file",
-            ".csv", ".xlsx", ".xls",
-        ]):
-            return "ingestion_agent"
+        messages = [
+            {"role": "system", "content": _INTENT_SYSTEM_PROMPT},
+            {"role": "user",   "content": context},
+        ]
 
-        # ── Analysis: action verb + analysis/omic keyword ─────────────────────
-        # Pure topic words like "proteomic", "biomarker", "analysis" alone go to
-        # the LLM so it can answer informational questions without running the
-        # pipeline again.
-        has_action = any(v in q for v in self._RUN_VERBS)
-
-        # Phrases that always imply a run request (no verb needed)
-        always_run = any(w in q for w in [
-            "fold-change", "fold change",
-            "differential expression", "dea",
-            "compare groups", "find significant",
-            "identify biomarker", "discover biomarker",
-        ])
-
-        # Topic words only trigger when paired with an action verb
-        topic_match = has_action and any(w in q for w in [
-            "analysis", "proteomics", "proteomic",
-            "biomarker", "significant protein", "top protein",
-        ])
-
-        if always_run or topic_match:
-            return "biomarker_agent"
-
-        # ── Enrichment ────────────────────────────────────────────────────────
-        if any(w in q for w in [
-            "pathway", "enrich", "kegg", "go term", "gsea",
-            "cluster", "ontology",
-        ]):
-            return "enrichment_agent"
-
-        # ── Visualisation ─────────────────────────────────────────────────────
-        if any(w in q for w in [
-            "plot", "visualize", "visualise", "chart",
-            "volcano", "heatmap", "report",
-        ]):
-            return "visualization_agent"
+        try:
+            raw = self._call_llm(messages, max_tokens=15, temperature=0.0).strip().lower()
+            for intent in _VALID_INTENTS:
+                if intent in raw:
+                    self.logger.debug("LLM intent: %r (raw=%r)", intent, raw)
+                    return intent
+        except Exception as exc:
+            self.logger.warning("Intent LLM call failed (%s) — defaulting to chat_agent.", exc)
 
         return "chat_agent"
 
@@ -82,7 +80,7 @@ class ChatAgent(BaseAgent):
 
     def run(self, state: BiomarkerState) -> BiomarkerState:
         user_query = state.get("user_query", "")
-        intent     = self.detect_intent(user_query)
+        intent     = self.detect_intent(user_query, state)
 
         # Always record the user turn first
         state["messages"].append({"role": "user", "content": user_query})
