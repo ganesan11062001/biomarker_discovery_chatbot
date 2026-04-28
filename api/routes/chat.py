@@ -90,8 +90,16 @@ def chat(request: ChatRequest):
 
     state.update(overrides)
 
+    # Decouple the messages list from the session store.
+    # learning_agent.run() appends to state["messages"] in-place.  If we pass
+    # the live session object directly, LangGraph's add_messages reducer will see
+    # the already-mutated list as "existing" and then add the node delta on top —
+    # doubling every message on each turn.  A fresh list object breaks that cycle.
+    state["messages"] = list(state.get("messages") or [])
+
     # Run LangGraph
     workflow = get_workflow()
+    n_msgs_before = len(state.get("messages") or [])
     try:
         updated_state = workflow.invoke(state)
     except Exception as exc:
@@ -101,7 +109,12 @@ def chat(request: ChatRequest):
             detail=f"Analysis pipeline error: {exc}",
         )
 
-    SessionManager.update_session(updated_state["session_id"], updated_state)
+    # LangGraph's add_messages reducer accumulates all messages in updated_state.
+    # update_session() appends whatever messages we pass, so we must pass ONLY the
+    # new (delta) messages to prevent doubling the history on every turn.
+    delta_msgs  = (updated_state.get("messages") or [])[n_msgs_before:]
+    state_to_store = {**updated_state, "messages": delta_msgs}
+    SessionManager.update_session(updated_state["session_id"], state_to_store)
 
     # Extract last assistant message
     messages = updated_state.get("messages", [])

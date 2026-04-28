@@ -1,6 +1,7 @@
-from pathlib import Path
-from pydantic_settings import BaseSettings
 from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -26,6 +27,11 @@ class Settings(BaseSettings):
     api_port: int = 8000
     api_base_url: str = "http://localhost:8000"
 
+    # ── LangSmith observability ───────────────────────────────────────────────
+    langsmith_api_key: str = ""
+    langsmith_project: str = "biomarker-discovery"
+    langsmith_tracing: bool = True
+
     # ── Runtime ───────────────────────────────────────────────────────────────
     app_env: str = "development"
     log_level: str = "INFO"
@@ -37,9 +43,11 @@ class Settings(BaseSettings):
     log2fc_cutoff: float = 1.0
     missing_value_threshold: float = 0.5   # max fraction of NaN per protein
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     def ensure_dirs(self) -> None:
         for d in (self.data_raw_dir, self.data_processed_dir, self.output_dir):

@@ -1,151 +1,81 @@
 """
 core/langgraph_workflow.py
-LangGraph StateGraph wiring all pipeline agents.
+LangGraph StateGraph — single-node architecture.
 
 Flow
 ────
-  START
-    │
-    ▼
-  chat_agent  ──── intent ────►  ingestion_agent  ──► END
-                            ├──► biomarker_agent   ──► END
-                            ├──► enrichment_agent  ──► END
-                            ├──► visualization_agent► END
-                            └──► END  (general chat)
+  START → learning_agent → END
+
+The LearningAgent is the sole node. It uses LLM reasoning on every message
+to decide what to do and calls specialist agents internally. No keyword
+routing, no hard-coded conditional edges.
+
+LangSmith tracing
+─────────────────
+configure_langsmith() is called here at module import time (before the first
+agent run) so the LANGCHAIN_TRACING_V2 env-var is set before any LLM client
+is created.  LangGraph then automatically creates a top-level trace for every
+graph invocation, and all child LLM calls (via wrap_openai) + @traceable
+spans nest under it.
 
 Compiled once at startup; shared across all requests.
 """
 import logging
 from functools import lru_cache
-from typing import Literal
 
 from langgraph.graph import END, StateGraph
 
-from agents.biomarker_agent import BiomarkerAgent
-from agents.chat_agent import ChatAgent
-from agents.ingestion_agent import IngestionAgent
+from agents.learning_agent import LearningAgent
+from config.settings import get_settings
 from core.state import BiomarkerState
+from core.tracing import configure_langsmith
 
-logger = logging.getLogger(__name__)
+logger   = logging.getLogger(__name__)
+_settings = get_settings()
 
-# ── Agent singletons ──────────────────────────────────────────────────────────
-_chat_agent      = ChatAgent()
-_ingestion_agent = IngestionAgent()
-_biomarker_agent = BiomarkerAgent()
+# Activate LangSmith tracing before the first graph invocation
+configure_langsmith(
+    api_key = _settings.langsmith_api_key or None,
+    project = _settings.langsmith_project,
+    enabled = _settings.langsmith_tracing,
+)
 
-# Optional agents — imported lazily so the platform starts even if their
-# dependencies aren't installed yet
-try:
-    from agents.enrichment_agent import EnrichmentAgent
-    _enrichment_agent = EnrichmentAgent()
-except Exception:
-    _enrichment_agent = None  # type: ignore
-
-try:
-    from agents.visualization_agent import VisualizationAgent
-    _visualization_agent = VisualizationAgent()
-except Exception:
-    _visualization_agent = None  # type: ignore
+_learning_agent = LearningAgent()
 
 
-# ── Node wrappers ─────────────────────────────────────────────────────────────
+def _run_learning(state: BiomarkerState) -> BiomarkerState:
+    logger.info("Node: learning_agent | session=%s", state.get("session_id"))
 
-def _run_chat(state: BiomarkerState) -> BiomarkerState:
-    logger.info("Node: chat_agent | session=%s", state.get("session_id"))
-    return _chat_agent.run(state)
+    # Isolate the messages list from LangGraph's channel reference BEFORE run().
+    # learning_agent.run() appends to state["messages"] in-place.  If we pass the
+    # channel's own list reference, the add_messages reducer will see the
+    # already-mutated list as "existing" history and then append the delta on top,
+    # doubling every message on every turn.  A fresh copy breaks that cycle:
+    # the channel reference stays unchanged → reducer computes correctly.
+    msgs_snapshot = list(state.get("messages") or [])
+    n_before      = len(msgs_snapshot)
+    working_state = {**state, "messages": msgs_snapshot}
 
+    updated  = _learning_agent.run(working_state)
+    all_msgs = updated.get("messages") or []
 
-def _run_ingestion(state: BiomarkerState) -> BiomarkerState:
-    logger.info("Node: ingestion_agent | session=%s", state.get("session_id"))
-    return _ingestion_agent.run(state)
+    # Return ONLY the newly appended messages so add_messages reducer
+    # doesn't duplicate the existing history.
+    result = dict(updated)
+    result["messages"] = all_msgs[n_before:]
+    return result
 
-
-def _run_biomarker(state: BiomarkerState) -> BiomarkerState:
-    logger.info("Node: biomarker_agent | session=%s", state.get("session_id"))
-    return _biomarker_agent.run(state)
-
-
-def _run_enrichment(state: BiomarkerState) -> BiomarkerState:
-    logger.info("Node: enrichment_agent | session=%s", state.get("session_id"))
-    if _enrichment_agent is not None:
-        return _enrichment_agent.run(state)
-    state["messages"].append({
-        "role": "assistant",
-        "content": "Pathway enrichment is not available in this deployment.",
-    })
-    return state
-
-
-def _run_visualization(state: BiomarkerState) -> BiomarkerState:
-    logger.info("Node: visualization_agent | session=%s", state.get("session_id"))
-    if _visualization_agent is not None:
-        return _visualization_agent.run(state)
-    state["messages"].append({
-        "role": "assistant",
-        "content": "Visualization agent is not available in this deployment.",
-    })
-    return state
-
-
-# ── Routing ───────────────────────────────────────────────────────────────────
-
-_SPECIALIST_NODES = {
-    "ingestion_agent",
-    "biomarker_agent",
-    "enrichment_agent",
-    "visualization_agent",
-}
-
-
-def _route_from_chat(
-    state: BiomarkerState,
-) -> Literal[
-    "ingestion_agent",
-    "biomarker_agent",
-    "enrichment_agent",
-    "visualization_agent",
-    "__end__",
-]:
-    intent = state.get("intent", "chat_agent")
-    if intent in _SPECIALIST_NODES:
-        logger.debug("Routing to: %s", intent)
-        return intent  # type: ignore[return-value]
-    return END
-
-
-# ── Graph ─────────────────────────────────────────────────────────────────────
 
 def _build_graph() -> StateGraph:
     builder = StateGraph(BiomarkerState)
-
-    builder.add_node("chat_agent",           _run_chat)
-    builder.add_node("ingestion_agent",      _run_ingestion)
-    builder.add_node("biomarker_agent",      _run_biomarker)
-    builder.add_node("enrichment_agent",     _run_enrichment)
-    builder.add_node("visualization_agent",  _run_visualization)
-
-    builder.set_entry_point("chat_agent")
-
-    builder.add_conditional_edges(
-        "chat_agent",
-        _route_from_chat,
-        {
-            "ingestion_agent":     "ingestion_agent",
-            "biomarker_agent":     "biomarker_agent",
-            "enrichment_agent":    "enrichment_agent",
-            "visualization_agent": "visualization_agent",
-            END:                   END,
-        },
-    )
-
-    for node in _SPECIALIST_NODES:
-        builder.add_edge(node, END)
-
+    builder.add_node("learning_agent", _run_learning)
+    builder.set_entry_point("learning_agent")
+    builder.add_edge("learning_agent", END)
     return builder.compile()
 
 
 @lru_cache(maxsize=1)
 def get_workflow():
     """Return the compiled LangGraph workflow (singleton)."""
-    logger.info("Compiling LangGraph workflow …")
+    logger.info("Compiling LangGraph workflow (LearningAgent single-node) …")
     return _build_graph()
