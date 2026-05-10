@@ -45,6 +45,7 @@ Outputs
 from __future__ import annotations
 
 import logging
+import re
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -331,7 +332,7 @@ def _plot_scatter(
         ax.plot(lims, lims, "r--", linewidth=0.8, label="y = x")
         ax.set_xlabel(f"log₂(SpC + 1)  {wt_col}")
         ax.set_ylabel(f"log₂(SpC + 1)  {mdx_col}")
-        ax.set_title("WT vs mdx SpC (log₂)")
+        ax.set_title(f"{wt_col} vs {mdx_col}  SpC (log₂)")
         ax.legend(fontsize=9)
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -555,11 +556,13 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
 
         # Scatter: first two groups alphabetically
         groups_present = sorted(primary.columns.tolist())
-        wt_col  = groups_present[0] if groups_present else label_map.get("A", "WT")
-        mdx_col = groups_present[1] if len(groups_present) > 1 else label_map.get("B", "mdx")
-        if wt_col in primary.columns and mdx_col in primary.columns:
-            scatter_path = str(Path(output_dir) / f"{file_name}_scatter_wt_vs_mdx.png")
-            p = _plot_scatter(primary, wt_col, mdx_col, scatter_path)
+        g_first  = groups_present[0] if groups_present else label_map.get("A", "WT")
+        g_second = groups_present[1] if len(groups_present) > 1 else label_map.get("B", "mdx")
+        if g_first in primary.columns and g_second in primary.columns:
+            safe_g1 = re.sub(r"[^\w]", "_", str(g_first))
+            safe_g2 = re.sub(r"[^\w]", "_", str(g_second))
+            scatter_path = str(Path(output_dir) / f"{file_name}_scatter_{safe_g1}_vs_{safe_g2}.png")
+            p = _plot_scatter(primary, g_first, g_second, scatter_path)
             if p:
                 plot_paths.append(p)
 
@@ -689,11 +692,14 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
         a('        fc_records[name] = log2_mat[num] - log2_mat[den]')
         a('fc_df = pd.DataFrame(fc_records, index=log2_mat.index)')
         a('')
-        a('# ── 4. Rescue score ──────────────────────────────────────────────────')
+        a('# ── 4. Rescue score (generic: sum positive FCs; DMD-specific when present) ─')
         a('score = pd.Series(0.0, index=fc_df.index)')
-        a('for col in ["uDys5_vs_mdx", "H2_vs_mdx"]:')
-        a('    if col in fc_df.columns:')
-        a('        score += fc_df[col].clip(lower=0)')
+        a('dmd_cols = [c for c in fc_df.columns if c in {"uDys5_vs_mdx", "H2_vs_mdx"}]')
+        a('active_cols = dmd_cols if dmd_cols else list(fc_df.columns)')
+        a('for col in active_cols:')
+        a('    score += fc_df[col].clip(lower=0)')
+        a('if score.sum() == 0:  # all-zero fallback: rank by total abs FC')
+        a('    score = fc_df.abs().sum(axis=1)')
         a('top_proteins = score.nlargest(TOP_N).index')
         a('')
         a('# ── 5. Save ──────────────────────────────────────────────────────────')

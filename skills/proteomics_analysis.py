@@ -152,6 +152,8 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             results_df = self._supervised(
                 data_qc, group1_samples, group2_samples,
                 group1_label, group2_label,
+                log2fc_cutoff=log2fc_cutoff,
+                adj_pval_cutoff=adj_pval_cutoff,
             )
             sig_mask = (
                 (results_df["adj_p_value"] < adj_pval_cutoff)
@@ -260,6 +262,8 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         a('print(f"After QC: {len(data)} proteins, {len(data.columns)} samples")')
         a('')
 
+        hi_pval    = min(0.01, adj_pval_cutoff / 5.0)
+        trend_pval = adj_pval_cutoff * 2.0
         if analysis_mode == "supervised":
             a('# ── 3. Welch two-sample t-test + Benjamini-Hochberg FDR ──────────────')
             a('g1 = [c for c in GROUP1_SAMPLES if c in data.columns]')
@@ -274,20 +278,27 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             a('    _, pval = stats.ttest_ind(v1, v2, equal_var=False)')
             a('    if np.isnan(pval):')
             a('        continue')
+            a('    # log2FC: data already log2-transformed; cap at ±20 to prevent Excel issues')
+            a('    if m2 == 0:')
+            a('        lfc = 20.0 if m1 > 0 else 0.0')
+            a('    else:')
+            a('        lfc = max(-20.0, min(20.0, float(m1 - m2)))')
             a('    rows.append({')
-            a('        "protein":           protein,')
+            a('        "protein":              protein,')
             a('        f"mean_{GROUP1_LABEL}": round(float(m1), 4),')
             a('        f"mean_{GROUP2_LABEL}": round(float(m2), 4),')
-            a('        "log2_fold_change":  round(float(m1 - m2), 4),')
-            a('        "p_value":           float(pval),')
+            a('        "log2_fold_change":     round(lfc, 4),')
+            a('        "p_value":              float(pval),')
+            a(f'       f"n_{{GROUP1_LABEL}}":  len(v1),')
+            a(f'       f"n_{{GROUP2_LABEL}}":  len(v2),')
             a('    })')
             a('df = pd.DataFrame(rows)')
             a('_, adj_p, _, _ = multipletests(df["p_value"].values, method="fdr_bh")')
             a('df["adj_p_value"] = adj_p')
             a('df["significance"] = "NS"')
-            a('hi  = (df["adj_p_value"] < 0.01) & (df["log2_fold_change"].abs() >= 1.0)')
-            a('sig = (df["adj_p_value"] < 0.05) & (df["log2_fold_change"].abs() >= 1.0)')
-            a('trn = (df["adj_p_value"] < 0.10) & ~sig')
+            a(f'hi  = (df["adj_p_value"] < {hi_pval})    & (df["log2_fold_change"].abs() >= LOG2FC_CUTOFF)')
+            a(f'sig = (df["adj_p_value"] < ADJ_PVAL_CUTOFF) & (df["log2_fold_change"].abs() >= LOG2FC_CUTOFF)')
+            a(f'trn = (df["adj_p_value"] < {trend_pval}) & ~sig')
             a('df.loc[trn,  "significance"] = "Trend"')
             a('df.loc[sig,  "significance"] = "Significant"')
             a('df.loc[hi,   "significance"] = "Highly Significant"')
@@ -380,6 +391,8 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         g2_cols: List[str],
         g1_label: str,
         g2_label: str,
+        log2fc_cutoff: float = 1.0,
+        adj_pval_cutoff: float = 0.05,
     ) -> pd.DataFrame:
         g1 = [c for c in g1_cols if c in data.columns]
         g2 = [c for c in g2_cols if c in data.columns]
@@ -443,11 +456,16 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         _, adj_pvals, _, _ = multipletests(df["p_value"].values, method="fdr_bh")
         df["adj_p_value"] = adj_pvals
 
-        # Significance labels
+        # Significance labels — use configurable thresholds
+        # Highly Significant: adj_p < adj_pval_cutoff/5 (never exceeds 0.01 when default=0.05)
+        # Significant: adj_p < adj_pval_cutoff
+        # Trend: adj_p < adj_pval_cutoff*2 (no FC requirement)
+        hi_pval = min(0.01, adj_pval_cutoff / 5.0)
+        trend_pval = adj_pval_cutoff * 2.0
         df["significance"] = "NS"
-        hi  = (df["adj_p_value"] < 0.01)  & (df["log2_fold_change"].abs() >= 1.0)
-        sig = (df["adj_p_value"] < 0.05)  & (df["log2_fold_change"].abs() >= 1.0)
-        trn = (df["adj_p_value"] < 0.10)  & ~sig
+        hi  = (df["adj_p_value"] < hi_pval)       & (df["log2_fold_change"].abs() >= log2fc_cutoff)
+        sig = (df["adj_p_value"] < adj_pval_cutoff) & (df["log2_fold_change"].abs() >= log2fc_cutoff)
+        trn = (df["adj_p_value"] < trend_pval)    & ~sig
         df.loc[trn,  "significance"] = "Trend"
         df.loc[sig,  "significance"] = "Significant"
         df.loc[hi,   "significance"] = "Highly Significant"
