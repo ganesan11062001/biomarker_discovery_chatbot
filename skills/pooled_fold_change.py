@@ -4,32 +4,25 @@ Analysis Layer — PooledFoldChangeSkill
 
 Handles pooled proteomics designs where each group is a single pooled sample
 (n=1).  Because t-tests require replicates, this skill computes log2 fold
-changes and SpC-ratio metrics instead of p-values.
+changes across all pairwise contrasts derived from whatever groups are present
+in the uploaded data.
 
 Expected input
 --------------
 A two-sheet Excel file:
-  • "Identifier Info"  — columns include "Majority protein IDs", label codes
-                         (A, B, C, D, E), and a metadata row for group names.
+  • "Identifier Info"  — columns include "Majority protein IDs", label codes,
+                         and a metadata row for group names (parsed by the
+                         ingestion agent into a label_map dict).
   • "Proteins"         — rows = proteins, columns include:
                            "Majority protein IDs"
                            "<label> Spectral count <file>"   (SpC columns)
                            "<label> Intensity <file>"        (Intensity columns)
 
-Default label map
------------------
-  A → WT
-  B → mdx
-  C → uDys5
-  D → H2
-  E → nNOS_KO
-
 Contrasts analysed
 ------------------
-  mdx_vs_WT       (B vs A)
-  uDys5_vs_mdx    (C vs B)
-  H2_vs_mdx       (D vs B)
-  uDys5_vs_H2     (C vs D)
+  All pairwise comparisons built dynamically from whatever group labels are
+  found in the data (e.g. ControlA_vs_ControlB, Disease_vs_Control, etc.).
+  No hardcoded group names or contrast lists.
 
 Outputs
 -------
@@ -37,8 +30,8 @@ Outputs
   • outputs/<stem>_fold_changes.csv
   • outputs/<stem>_top50_rescued.csv
   • outputs/<stem>_heatmap.png
-  • outputs/<stem>_barchart_<contrast>.png   (×4)
-  • outputs/<stem>_scatter_wt_vs_mdx.png
+  • outputs/<stem>_barchart_<contrast>.png   (one per contrast)
+  • outputs/<stem>_scatter_<g1>_vs_<g2>.png
   • outputs/<stem>_venn_rescued.png
   • outputs/<stem>_biomarker_report.xlsx
 """
@@ -58,22 +51,6 @@ from skills.base_skill import BaseOmicsSkill, OmicsAnalysisResult
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-
-_DEFAULT_LABEL_MAP: Dict[str, str] = {
-    "A": "WT",
-    "B": "mdx",
-    "C": "uDys5",
-    "D": "H2",
-    "E": "nNOS_KO",
-}
-
-# Contrasts as (numerator_label, denominator_label, contrast_name)
-_CONTRASTS: List[Tuple[str, str, str]] = [
-    ("mdx",   "WT",   "mdx_vs_WT"),
-    ("uDys5", "mdx",  "uDys5_vs_mdx"),
-    ("H2",    "mdx",  "H2_vs_mdx"),
-    ("uDys5", "H2",   "uDys5_vs_H2"),
-]
 
 # Patterns that mark contaminant / reverse entries
 _CONTAMINANT_PREFIXES = ("REV__", "CON__")
@@ -204,21 +181,9 @@ def _build_contrasts(
     available_groups: set,
 ) -> List[Tuple[str, str, str]]:
     """
-    Build a contrast list for any label_map.
-
-    Strategy:
-    1. Try the preset DMD-specific contrasts if the matching groups exist.
-    2. Otherwise, generate all pairwise contrasts from the available groups.
+    Build all pairwise contrasts from whatever groups are present in the data.
+    Groups are sorted alphabetically so contrast order is deterministic.
     """
-    # Try to use the preset contrasts first
-    active = [
-        (num, den, name) for num, den, name in _CONTRASTS
-        if num in available_groups and den in available_groups
-    ]
-    if active:
-        return active
-
-    # Fallback: all pairwise contrasts from whatever groups are present
     groups = sorted(available_groups)
     pairwise: List[Tuple[str, str, str]] = []
     for i, g1 in enumerate(groups):
@@ -235,20 +200,13 @@ def _top_n_by_variance(log2_mat: pd.DataFrame, n: int = 50) -> pd.DataFrame:
 
 def _rescue_score(fc_df: pd.DataFrame) -> pd.Series:
     """
-    Generic activity score: sum of positive fold-changes across all contrasts.
-    Works for any label_map — highlights proteins upregulated in treatment groups.
-    Falls back to DMD-specific columns when present for backwards compatibility.
+    Activity score: sum of positive fold-changes across ALL contrasts.
+    Ranks proteins that are consistently upregulated across the most comparisons.
+    Fully generic — works for any label_map and any set of contrasts.
     """
     score = pd.Series(0.0, index=fc_df.index)
-    dmd_cols = {"uDys5_vs_mdx", "H2_vs_mdx"}
-    treatment_cols = [c for c in fc_df.columns if c in dmd_cols]
-    if treatment_cols:
-        for col in treatment_cols:
-            score += fc_df[col].clip(lower=0)
-    else:
-        # Generic: sum all positive FCs across every contrast
-        for col in fc_df.columns:
-            score += fc_df[col].clip(lower=0)
+    for col in fc_df.columns:
+        score += fc_df[col].clip(lower=0)
     return score
 
 
@@ -346,24 +304,23 @@ def _plot_scatter(
 def _plot_venn(
     fc_df: pd.DataFrame, output_path: str, threshold: float = _LOG2FC_THRESHOLD
 ) -> str:
-    """Venn diagram of proteins UP in uDys5_vs_mdx and H2_vs_mdx."""
+    """Venn diagram of proteins UP in the first two actual contrast columns."""
+    if len(fc_df.columns) < 2:
+        return ""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib_venn import venn2
 
-        col_a = "uDys5_vs_mdx"
-        col_b = "H2_vs_mdx"
-        if col_a not in fc_df.columns or col_b not in fc_df.columns:
-            return ""
-
+        col_a, col_b = fc_df.columns[0], fc_df.columns[1]
         set_a = set(fc_df.index[fc_df[col_a] >= threshold])
         set_b = set(fc_df.index[fc_df[col_b] >= threshold])
 
         fig, ax = plt.subplots(figsize=(7, 5))
-        venn2([set_a, set_b], set_labels=("uDys5 UP vs mdx", "H2 UP vs mdx"), ax=ax)
-        ax.set_title("Proteins up-regulated in treatment groups vs mdx")
+        venn2([set_a, set_b],
+              set_labels=(f"UP: {col_a}", f"UP: {col_b}"), ax=ax)
+        ax.set_title(f"Overlap of upregulated proteins\n{col_a}  |  {col_b}")
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         plt.close("all")
@@ -453,10 +410,17 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
 
     def execute(self, **kwargs: Any) -> OmicsAnalysisResult:  # type: ignore[override]
         raw_path  = kwargs.get("raw_data_path") or kwargs.get("data_path", "")
-        label_map = kwargs.get("label_map")     or _DEFAULT_LABEL_MAP
+        label_map = kwargs.get("label_map")
         output_dir = str(kwargs.get("output_dir", "outputs"))
         top_n     = int(kwargs.get("top_n", 50))
         file_name = kwargs.get("file_name") or Path(raw_path).stem
+
+        if not label_map:
+            raise ValueError(
+                "label_map is required for pooled fold-change analysis but was not provided. "
+                "The uploaded file must contain a metadata sheet with group code → group name "
+                "mappings (e.g. A → Control, B → Disease)."
+            )
 
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -513,10 +477,10 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
         # 6. Top 50 by variance
         top50_mat = _top_n_by_variance(log2_mat, n=min(top_n, len(log2_mat)))
 
-        # 7. Rank proteins: rescue score when DMD contrasts present, else max abs FC
+        # 7. Rank proteins by activity score (sum of positive FCs across all contrasts)
         score = _rescue_score(fc_df)
         if score.sum() == 0 and not fc_df.empty:
-            # No DMD-specific rescue columns — rank by total absolute fold change
+            # All FCs are zero or negative — fall back to total absolute FC
             score = fc_df.abs().sum(axis=1)
         top_ranked = score.nlargest(top_n).index
         top_biomarkers: List[Dict[str, Any]] = []
@@ -554,11 +518,10 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
                 if p:
                     plot_paths.append(p)
 
-        # Scatter: first two groups alphabetically
+        # Scatter: first two groups alphabetically (skip if fewer than 2 groups)
         groups_present = sorted(primary.columns.tolist())
-        g_first  = groups_present[0] if groups_present else label_map.get("A", "WT")
-        g_second = groups_present[1] if len(groups_present) > 1 else label_map.get("B", "mdx")
-        if g_first in primary.columns and g_second in primary.columns:
+        if len(groups_present) >= 2:
+            g_first, g_second = groups_present[0], groups_present[1]
             safe_g1 = re.sub(r"[^\w]", "_", str(g_first))
             safe_g2 = re.sub(r"[^\w]", "_", str(g_second))
             scatter_path = str(Path(output_dir) / f"{file_name}_scatter_{safe_g1}_vs_{safe_g2}.png")
@@ -599,7 +562,7 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
             "qc_type": "pooled_prefilter",
         }
 
-        code = self._generate_code(raw_path, label_map, output_dir, top_n, file_name)
+        code = self._generate_code(raw_path, label_map, active_contrasts, output_dir, top_n, file_name)
 
         logger.info(
             "PooledFoldChangeSkill done: %d proteins, %d contrasts, %d plots",
@@ -622,6 +585,7 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
     def _generate_code(
         raw_path: str,
         label_map: Dict[str, str],
+        active_contrasts: List[Tuple[str, str, str]],
         output_dir: str,
         top_n: int,
         file_name: str,
@@ -630,7 +594,7 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
         L: List[str] = []
         a = L.append
 
-        contrasts_repr = repr(_CONTRASTS)
+        contrasts_repr = repr(active_contrasts)
 
         a('#!/usr/bin/env python3')
         a('"""')
@@ -643,7 +607,6 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
         a('import matplotlib; matplotlib.use("Agg")')
         a('import matplotlib.pyplot as plt')
         a('from pathlib import Path')
-        a('from itertools import combinations')
         a('')
         a('# ── Parameters (edit to customise) ──────────────────────────────────')
         a('RAW_PATH   = ' + repr(raw_path))
@@ -655,14 +618,18 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
         a('LOG2FC_THRESHOLD = 1.0')
         a('')
         a('# Contrasts: (numerator_label, denominator_label, contrast_name)')
+        a('# These are the exact contrasts computed from the uploaded data.')
         a('CONTRASTS = ' + contrasts_repr)
         a('')
         a('# ── 1. Parse Proteins sheet ──────────────────────────────────────────')
         a('xl = pd.ExcelFile(RAW_PATH, engine="openpyxl")')
         a('sheet = "Proteins" if "Proteins" in xl.sheet_names else xl.sheet_names[0]')
         a('df = xl.parse(sheet)')
-        a('id_col = next((c for c in df.columns if "majority protein" in str(c).lower()')
-        a('               or "accession" in str(c).lower()), df.columns[0])')
+        a('_ID_KEYWORDS = ("majority protein", "identified protein", "accession",')
+        a('                "uniprot", "gene name", "protein id", "protein name")')
+        a('id_col = next((c for c in df.columns')
+        a('               if any(kw in str(c).lower() for kw in _ID_KEYWORDS)),')
+        a('              df.columns[0])')
         a('df = df.set_index(id_col)')
         a('df.index = df.index.astype(str).str.strip()')
         a('')
@@ -670,12 +637,15 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
         a('mask = ~(df.index.str.startswith("REV__") | df.index.str.startswith("CON__"))')
         a('df = df[mask]')
         a('')
-        a('# Build SpC matrix')
+        a('# Build SpC matrix from label map')
         a('spc_cols = {}')
         a('for col in df.columns:')
         a('    cl = str(col).lower()')
         a('    for code, grp in LABEL_MAP.items():')
-        a('        if cl.startswith(code.lower()) and ("spectral" in cl or "spc" in cl or "ms/ms" in cl):')
+        a('        prefix = code.lower()')
+        a('        is_match = (cl.startswith(f"{prefix} ") or cl.startswith(f"{prefix}_")')
+        a('                    or f" {prefix} " in cl)')
+        a('        if is_match and ("spectral" in cl or "spc" in cl or "ms/ms" in cl):')
         a('            spc_cols.setdefault(grp, col)')
         a('primary = pd.DataFrame({g: pd.to_numeric(df[c], errors="coerce").fillna(0)')
         a('                        for g, c in spc_cols.items()}, index=df.index)')
@@ -692,21 +662,21 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
         a('        fc_records[name] = log2_mat[num] - log2_mat[den]')
         a('fc_df = pd.DataFrame(fc_records, index=log2_mat.index)')
         a('')
-        a('# ── 4. Rescue score (generic: sum positive FCs; DMD-specific when present) ─')
+        a('# ── 4. Activity score: sum of positive FCs across all contrasts ──────')
         a('score = pd.Series(0.0, index=fc_df.index)')
-        a('dmd_cols = [c for c in fc_df.columns if c in {"uDys5_vs_mdx", "H2_vs_mdx"}]')
-        a('active_cols = dmd_cols if dmd_cols else list(fc_df.columns)')
-        a('for col in active_cols:')
+        a('for col in fc_df.columns:')
         a('    score += fc_df[col].clip(lower=0)')
-        a('if score.sum() == 0:  # all-zero fallback: rank by total abs FC')
+        a('if score.sum() == 0:  # fallback: rank by total absolute FC')
         a('    score = fc_df.abs().sum(axis=1)')
         a('top_proteins = score.nlargest(TOP_N).index')
         a('')
-        a('# ── 5. Save ──────────────────────────────────────────────────────────')
+        a('# ── 5. Save outputs ──────────────────────────────────────────────────')
         a('Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)')
         a('log2_mat.to_csv(str(Path(OUTPUT_DIR) / f"{FILE_NAME}_cleaned_expression.csv"))')
         a('fc_df.to_csv(str(Path(OUTPUT_DIR) / f"{FILE_NAME}_fold_changes.csv"))')
-        a('print("Saved cleaned expression and fold change CSVs")')
+        a('fc_df.loc[fc_df.index.isin(top_proteins)].to_csv(')
+        a('    str(Path(OUTPUT_DIR) / f"{FILE_NAME}_top50_rescued.csv"))')
+        a('print("Saved: cleaned expression, fold changes, top rescued proteins")')
         a('print(fc_df.loc[top_proteins].head(10).to_string())')
 
         return '\n'.join(L)

@@ -99,16 +99,23 @@ class VisualizationAgent(BaseAgent):
         stem = Path(result_path).stem if result_path else "biomarker"
 
         # ── Run plot suite ────────────────────────────────────────────────────
+        analysis_params = state.get("analysis_params") or {}
         try:
             result = self.plot_suite.execute(
                 top_proteins       = protein_source,
                 analysis_mode      = state.get("analysis_mode", "supervised"),
+                omic_type          = state.get("omic_type", "proteomics"),
+                test_method        = state.get("test_method", "welch"),
+                is_paired          = state.get("is_paired", False),
+                all_groups         = state.get("all_groups"),
                 data_path          = state.get("data_path", ""),
                 sample_columns     = state.get("sample_columns") or [],
                 group1_samples     = state.get("group1_samples") or [],
                 group2_samples     = state.get("group2_samples") or [],
                 group1_label       = state.get("group1_label", "Group1"),
                 group2_label       = state.get("group2_label", "Group2"),
+                adj_pval_cutoff    = float(analysis_params.get("adj_pval_cutoff", 0.05)),
+                log2fc_cutoff      = float(analysis_params.get("log2fc_cutoff", 1.0)),
                 top_pathways       = state.get("pathways"),
                 enrichment_result_path = state.get("enrichment_result_path", ""),
                 contrast_groups    = [

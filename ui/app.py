@@ -1,5 +1,5 @@
 """
-ui/app.py  —  BiomarkerAI  (BioSpace modern UI)
+ui/app.py  —  BiomarkerAI  (chat-only, no sidebar)
 """
 from __future__ import annotations
 
@@ -8,6 +8,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import json as _json
+
+import plotly.graph_objects as _go
 import requests
 import streamlit as st
 
@@ -22,17 +25,18 @@ st.set_page_config(
     page_title="BiomarkerAI",
     page_icon="🧬",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CSS  —  BioSpace Theme
+# CSS  —  BioSpace Theme (chat-only)
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
 /* ── Reset ── */
 #MainMenu, footer, header { visibility: hidden; }
-.stDeployButton, [data-testid="stToolbar"] { display: none; }
+.stDeployButton, [data-testid="stToolbar"],
+[data-testid="stSidebar"] { display: none !important; }
 
 /* ── Page background ── */
 .stApp {
@@ -40,144 +44,36 @@ st.markdown("""
     min-height: 100vh;
 }
 [data-testid="stMain"] { background: transparent !important; }
-[data-testid="stAppViewBlockContainer"] { padding-top: 1rem !important; }
+[data-testid="stAppViewBlockContainer"] { padding-top: 0.5rem !important; }
 
-/* ── Sidebar ── */
-[data-testid="stSidebar"] {
-    background: #08101e !important;
-    border-right: 1px solid rgba(255,255,255,0.06) !important;
-}
-[data-testid="stSidebar"] > div { padding: 0 0.8rem !important; }
-[data-testid="stSidebar"] * { color: #cbd5e1 !important; }
-
-/* ── Brand ── */
-.brand-wrap {
-    padding: 18px 4px 12px;
+/* ── Top bar ── */
+.topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 0 14px;
     border-bottom: 1px solid rgba(255,255,255,0.05);
-    margin-bottom: 14px;
+    margin-bottom: 6px;
 }
-.brand-name {
-    font-size: 1.15rem;
+.topbar-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.topbar-name {
+    font-size: 1.05rem;
     font-weight: 800;
     background: linear-gradient(120deg, #38bdf8, #818cf8);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
-    letter-spacing: -0.5px;
-    display: block;
+    letter-spacing: -0.4px;
 }
-.brand-tag {
-    font-size: 0.67rem;
-    color: #475569 !important;
-    letter-spacing: 0.6px;
-    display: block;
-    margin-top: 2px;
-}
-
-/* ── Section header ── */
-.sh {
+.topbar-tag {
     font-size: 0.65rem;
-    font-weight: 700;
-    color: #475569 !important;
-    text-transform: uppercase;
-    letter-spacing: 1.2px;
-    margin: 14px 0 7px;
-    display: block;
-}
-
-/* ── Glass card ── */
-.gcard {
-    background: rgba(255,255,255,0.025);
-    border: 1px solid rgba(255,255,255,0.07);
-    border-radius: 12px;
-    padding: 12px 14px;
-    margin-bottom: 10px;
-}
-
-/* ── Metric chips ── */
-.mchips { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin: 6px 0 10px; }
-.mchip {
-    background: rgba(56,189,248,0.05);
-    border: 1px solid rgba(56,189,248,0.12);
-    border-radius: 10px;
-    padding: 9px 10px;
-    text-align: center;
-}
-.mchip-val {
-    display: block;
-    font-size: 1.25rem;
-    font-weight: 700;
-    background: linear-gradient(120deg, #38bdf8, #818cf8);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    line-height: 1.2;
-}
-.mchip-lbl {
-    display: block;
-    font-size: 0.63rem;
-    color: #475569 !important;
-    text-transform: uppercase;
+    color: #334155;
     letter-spacing: 0.5px;
-    margin-top: 2px;
 }
-
-/* ── Badge chip (data type) ── */
-.dtype-badge {
-    display: inline-block;
-    background: rgba(129,140,248,0.1);
-    border: 1px solid rgba(129,140,248,0.25);
-    border-radius: 6px;
-    padding: 2px 10px;
-    font-size: 0.7rem;
-    color: #818cf8 !important;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-    margin-bottom: 4px;
-}
-
-/* ── Pipeline steps ── */
-.pipeline { display: flex; flex-direction: column; gap: 5px; margin: 4px 0; }
-.pstep {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 7px 11px;
-    border-radius: 9px;
-    font-size: 0.8rem;
-    font-weight: 500;
-    transition: all 0.2s;
-}
-.pstep.done {
-    background: rgba(52,211,153,0.07);
-    border: 1px solid rgba(52,211,153,0.18);
-    color: #34d399 !important;
-}
-.pstep.running {
-    background: rgba(56,189,248,0.07);
-    border: 1px solid rgba(56,189,248,0.22);
-    color: #38bdf8 !important;
-}
-.pstep.idle {
-    background: rgba(255,255,255,0.02);
-    border: 1px solid rgba(255,255,255,0.06);
-    color: #334155 !important;
-}
-.pdot {
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    flex-shrink: 0;
-}
-.pdot.done { background: #34d399; box-shadow: 0 0 6px #34d399; }
-.pdot.running {
-    background: #38bdf8;
-    box-shadow: 0 0 8px #38bdf8;
-    animation: blink 1.6s ease-in-out infinite;
-}
-.pdot.idle { background: #1e293b; }
-@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
-
-/* ── Session chip ── */
 .session-chip {
     display: inline-flex;
     align-items: center;
@@ -188,98 +84,54 @@ st.markdown("""
     padding: 3px 10px;
     font-size: 0.67rem;
     color: #475569 !important;
-    margin-bottom: 10px;
 }
-.session-dot { width: 5px; height: 5px; border-radius: 50%; background: #34d399; box-shadow: 0 0 5px #34d399; }
-
-/* ── Sidebar buttons ── */
-[data-testid="stSidebar"] .stButton > button {
-    background: rgba(255,255,255,0.03) !important;
-    color: #94a3b8 !important;
-    border: 1px solid rgba(255,255,255,0.07) !important;
-    border-radius: 9px !important;
-    font-size: 0.8rem !important;
-    font-weight: 500 !important;
-    padding: 7px 13px !important;
-    width: 100%;
-    text-align: left;
-    transition: all 0.18s;
-}
-[data-testid="stSidebar"] .stButton > button:hover {
-    border-color: rgba(56,189,248,0.3) !important;
-    background: rgba(56,189,248,0.05) !important;
-    color: #38bdf8 !important;
-}
-[data-testid="stSidebar"] .stButton > button[kind="primary"] {
-    background: linear-gradient(135deg, rgba(56,189,248,0.12), rgba(129,140,248,0.12)) !important;
-    border: 1px solid rgba(56,189,248,0.35) !important;
-    color: #38bdf8 !important;
-    font-weight: 600 !important;
-}
-[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
-    background: linear-gradient(135deg, rgba(56,189,248,0.2), rgba(129,140,248,0.2)) !important;
-    box-shadow: 0 2px 16px rgba(56,189,248,0.18) !important;
-}
-[data-testid="stSidebar"] .stDownloadButton > button {
-    background: linear-gradient(135deg, #38bdf8, #818cf8) !important;
-    color: #fff !important;
-    border: none !important;
-    border-radius: 9px !important;
-    font-weight: 700 !important;
-    width: 100%;
-    box-shadow: 0 2px 14px rgba(56,189,248,0.28);
-    font-size: 0.82rem !important;
+.session-dot {
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: #34d399;
+    box-shadow: 0 0 5px #34d399;
+    display: inline-block;
 }
 
-/* ── Sidebar form controls ── */
-[data-testid="stSidebar"] label {
-    color: #475569 !important;
-    font-size: 0.73rem !important;
-    font-weight: 600 !important;
-    text-transform: uppercase !important;
-    letter-spacing: 0.6px !important;
+/* ── Pipeline status strip ── */
+.pstrip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0 10px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    margin-bottom: 4px;
+    flex-wrap: wrap;
 }
-[data-testid="stSidebar"] [data-testid="stSelectbox"] > div > div {
-    background: rgba(255,255,255,0.03) !important;
-    border: 1px solid rgba(255,255,255,0.08) !important;
-    color: #cbd5e1 !important;
-    border-radius: 8px !important;
-    font-size: 0.82rem !important;
+.pstep {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-size: 0.73rem;
+    font-weight: 500;
 }
-[data-testid="stSidebar"] [data-testid="stTextInput"] > div > div > input {
-    background: rgba(255,255,255,0.03) !important;
-    border: 1px solid rgba(255,255,255,0.08) !important;
-    color: #cbd5e1 !important;
-    border-radius: 8px !important;
-    font-size: 0.82rem !important;
+.pstep.done {
+    background: rgba(52,211,153,0.07);
+    border: 1px solid rgba(52,211,153,0.2);
+    color: #34d399;
 }
-[data-testid="stSidebar"] [data-testid="stMultiSelect"] > div {
-    background: rgba(255,255,255,0.03) !important;
-    border: 1px solid rgba(255,255,255,0.08) !important;
-    border-radius: 8px !important;
-    font-size: 0.82rem !important;
+.pstep.idle {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.06);
+    color: #1e293b;
 }
-[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.05) !important; margin: 10px 0 !important; }
-[data-testid="stSidebar"] .stMetric { background: transparent !important; }
-[data-testid="stSidebar"] .stAlert {
-    border-radius: 9px !important;
-    font-size: 0.78rem !important;
-}
+.pdot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.pdot.done { background: #34d399; box-shadow: 0 0 5px #34d399; }
+.pdot.idle { background: #1e293b; }
 
-/* ── Expanders in sidebar ── */
-[data-testid="stSidebar"] [data-testid="stExpander"] {
-    background: rgba(255,255,255,0.02) !important;
-    border: 1px solid rgba(255,255,255,0.06) !important;
-    border-radius: 9px !important;
-}
-
-/* ── Main chat messages ── */
+/* ── Chat messages ── */
 [data-testid="stChatMessage"] {
     background: transparent !important;
     border: none !important;
     padding: 3px 0 !important;
 }
-/* User message */
 [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) > div:last-child {
     background: rgba(56,189,248,0.05) !important;
     border: 1px solid rgba(56,189,248,0.14) !important;
@@ -289,19 +141,17 @@ st.markdown("""
     margin-left: auto !important;
     backdrop-filter: blur(8px);
 }
-/* Assistant message */
 [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) > div:last-child {
     background: transparent !important;
     padding: 4px 0 !important;
 }
-/* Avatar icon */
 [data-testid="chatAvatarIcon-assistant"] {
     background: linear-gradient(135deg, rgba(56,189,248,0.15), rgba(129,140,248,0.15)) !important;
     border: 1px solid rgba(56,189,248,0.22) !important;
     border-radius: 50% !important;
 }
 
-/* ── Text in messages ── */
+/* ── Message text ── */
 [data-testid="stChatMessage"] p,
 [data-testid="stChatMessage"] li,
 [data-testid="stChatMessage"] td { color: #cbd5e1 !important; font-size: 0.94rem; line-height: 1.75; }
@@ -390,7 +240,7 @@ st.markdown("""
 }
 [data-testid="stFileUploaderDropzoneInstructions"] small { display: none !important; }
 
-/* ── Quick action pill buttons ── */
+/* ── Quick action / top-bar pill buttons ── */
 .stButton > button {
     background: rgba(255,255,255,0.03) !important;
     color: #64748b !important;
@@ -408,10 +258,25 @@ st.markdown("""
     box-shadow: 0 0 12px rgba(56,189,248,0.1) !important;
 }
 
+/* ── Download button ── */
+.stDownloadButton > button {
+    background: linear-gradient(135deg, rgba(56,189,248,0.12), rgba(129,140,248,0.12)) !important;
+    border: 1px solid rgba(56,189,248,0.3) !important;
+    color: #38bdf8 !important;
+    border-radius: 20px !important;
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    padding: 5px 14px !important;
+}
+.stDownloadButton > button:hover {
+    background: linear-gradient(135deg, rgba(56,189,248,0.22), rgba(129,140,248,0.22)) !important;
+    box-shadow: 0 2px 16px rgba(56,189,248,0.18) !important;
+}
+
 /* ── Welcome hero ── */
 .hero {
     text-align: center;
-    padding: 56px 20px 36px;
+    padding: 48px 20px 32px;
 }
 .hero-eyebrow {
     display: inline-flex;
@@ -429,31 +294,31 @@ st.markdown("""
     text-transform: uppercase;
 }
 .hero-title {
-    font-size: 2.8rem;
+    font-size: 2.6rem;
     font-weight: 800;
     background: linear-gradient(135deg, #e2e8f0 30%, #38bdf8 65%, #818cf8 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
     line-height: 1.12;
-    margin-bottom: 18px;
-    letter-spacing: -1.2px;
+    margin-bottom: 16px;
+    letter-spacing: -1.1px;
 }
 .hero-sub {
     font-size: 1rem;
     color: #475569;
-    max-width: 460px;
-    margin: 0 auto 40px;
+    max-width: 520px;
+    margin: 0 auto 36px;
     line-height: 1.75;
 }
 
-/* ── Feature cards grid ── */
+/* ── Feature cards ── */
 .fc-grid {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
     gap: 11px;
-    max-width: 720px;
-    margin: 0 auto 32px;
+    max-width: 740px;
+    margin: 0 auto 28px;
 }
 .fc-card {
     background: rgba(255,255,255,0.025);
@@ -462,7 +327,6 @@ st.markdown("""
     padding: 16px 14px;
     text-align: left;
     transition: all 0.22s;
-    cursor: pointer;
 }
 .fc-card:hover {
     border-color: rgba(56,189,248,0.28);
@@ -479,8 +343,8 @@ st.markdown("""
     background: rgba(56,189,248,0.03);
     border: 1.5px dashed rgba(56,189,248,0.18);
     border-radius: 16px;
-    padding: 20px 24px 14px;
-    margin-bottom: 16px;
+    padding: 18px 24px 12px;
+    margin-bottom: 14px;
     text-align: center;
     transition: all 0.22s;
 }
@@ -493,12 +357,8 @@ st.markdown("""
     border-radius: 10px !important;
     font-size: 0.83rem !important;
 }
-[data-testid="stAlert"][data-baseweb="notification"] {
-    background: rgba(56,189,248,0.07) !important;
-    border: 1px solid rgba(56,189,248,0.2) !important;
-}
 
-/* ── Expander (main area) ── */
+/* ── Expander ── */
 [data-testid="stExpander"] {
     background: rgba(255,255,255,0.02) !important;
     border: 1px solid rgba(255,255,255,0.07) !important;
@@ -519,7 +379,7 @@ st.markdown("""
 # API helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _api_create_session(disease_program: str, organism: str) -> str | None:
+def _api_create_session(disease_program: str = "General", organism: str = "human") -> str | None:
     try:
         r = requests.post(
             f"{API_BASE}/chat/session",
@@ -544,22 +404,13 @@ def _api_fetch_state(session_id: str) -> dict:
 
 
 def _api_send_message(session_id: str, message: str) -> dict | None:
+    """Send a chat message. Groups come entirely from the LLM — not pre-set by the UI."""
     payload: dict[str, Any] = {
         "session_id":      session_id,
         "message":         message,
         "disease_program": st.session_state.get("disease_program", "General"),
         "organism":        st.session_state.get("organism", "human"),
     }
-    g1       = st.session_state.get("group1_samples") or []
-    g2       = st.session_state.get("group2_samples") or []
-    g1_label = (st.session_state.get("group1_label") or "Group1").strip() or "Group1"
-    g2_label = (st.session_state.get("group2_label") or "Group2").strip() or "Group2"
-    if g1:
-        payload["group1_samples"] = g1
-        payload["group1_label"]   = g1_label
-    if g2:
-        payload["group2_samples"] = g2
-        payload["group2_label"]   = g2_label
     try:
         r = requests.post(f"{API_BASE}/chat/", json=payload, timeout=300)
         if r.status_code == 200:
@@ -575,16 +426,17 @@ def _api_send_message(session_id: str, message: str) -> dict | None:
 
 
 def _api_upload_file(
-    file_bytes: bytes, filename: str, file_type: str,
-    session_id: str, disease_program: str, organism: str,
+    file_bytes: bytes, filename: str, file_type: str, session_id: str,
 ) -> dict | None:
     try:
         r = requests.post(
             f"{API_BASE}/upload/",
             files={"file": (filename, file_bytes, file_type)},
-            data={"session_id": session_id,
-                  "disease_program": disease_program,
-                  "organism": organism},
+            data={
+                "session_id":      session_id,
+                "disease_program": st.session_state.get("disease_program", "General"),
+                "organism":        st.session_state.get("organism", "human"),
+            },
             timeout=120,
         )
     except requests.exceptions.ConnectionError:
@@ -606,207 +458,86 @@ def _api_upload_file(
 
 def _init_session() -> None:
     defaults: dict[str, Any] = {
-        "session_id":        None,
-        "messages":          [],
-        "analysis_state":    {},
-        "upload_result":     None,
-        "disease_program":   "General",
-        "organism":          "human",
-        "group1_samples":    [],
-        "group2_samples":    [],
-        "group1_label":      "Group1",
-        "group2_label":      "Group2",
-        "api_error":         None,
-        "_attach_ver":       0,
+        "session_id":     None,
+        "messages":       [],
+        "analysis_state": {},
+        "upload_result":  None,
+        "disease_program": "General",
+        "organism":        "human",
+        "api_error":       None,
+        "_attach_ver":     0,
         "_last_attach_name": None,
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
 
+def _ensure_session() -> str | None:
+    """Create a backend session on first load if one doesn't exist yet."""
+    if st.session_state.get("session_id"):
+        return st.session_state["session_id"]
+    sid = _api_create_session(
+        st.session_state.get("disease_program", "General"),
+        st.session_state.get("organism", "human"),
+    )
+    if sid:
+        st.session_state["session_id"] = sid
+    return sid
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# Sidebar
+# Top bar
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _render_sidebar() -> None:
-    with st.sidebar:
-        # ── Brand ─────────────────────────────────────────────────────────────
-        st.markdown(
-            "<div class='brand-wrap'>"
-            "<span class='brand-name'>🧬 BiomarkerAI</span>"
-            "<span class='brand-tag'>Proteomics · Multi-Agent Platform</span>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
+def _render_topbar(session_id: str | None, astate: dict) -> None:
+    _, bar_col, _ = st.columns([1, 10, 1])
+    with bar_col:
+        left, right = st.columns([4, 2])
 
-        # ── New chat button ───────────────────────────────────────────────────
-        if st.button("＋  New Conversation", use_container_width=True):
+        with left:
+            sid_text = f"Session {session_id[:8]}…" if session_id else "No session"
+            st.markdown(
+                "<div class='topbar-brand'>"
+                "<span class='topbar-name'>🧬 BiomarkerAI</span>"
+                "<span class='topbar-tag'>Proteomics · Multi-Agent Platform</span>"
+                f"<span class='session-chip'><span class='session-dot'></span>{sid_text}</span>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+        with right:
+            # Pipeline status strip — compact dots in the top bar
+            data_done     = bool(astate.get("data_type"))
+            analysis_done = astate.get("n_significant") is not None
+            enrich_done   = bool(astate.get("pathways"))
+            plots_done    = bool(astate.get("plot_paths"))
+
+            def _dot(label: str, icon: str, done: bool) -> str:
+                cls = "done" if done else "idle"
+                return (
+                    f"<span class='pstep {cls}'>"
+                    f"<span class='pdot {cls}'></span>{icon} {label}"
+                    f"</span>"
+                )
+
+            st.markdown(
+                "<div class='pstrip'>"
+                + _dot("Data", "📂", data_done)
+                + _dot("Analysis", "🔬", analysis_done)
+                + _dot("Enrichment", "🧬", enrich_done)
+                + _dot("Plots", "📊", plots_done)
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+
+        # New conversation button — full row below
+        if st.button("＋  New Conversation", key="new_conv"):
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.rerun()
 
-        # ── Settings ──────────────────────────────────────────────────────────
-        st.markdown("<span class='sh'>Settings</span>", unsafe_allow_html=True)
-        disease = st.selectbox(
-            "Disease / Program",
-            ["General", "DMD", "FA", "SMA", "Cancer", "Other"],
-            index=["General", "DMD", "FA", "SMA", "Cancer", "Other"].index(
-                st.session_state["disease_program"]
-                if st.session_state["disease_program"] in ["General", "DMD", "FA", "SMA", "Cancer", "Other"]
-                else "General"
-            ),
-        )
-        organism = st.selectbox(
-            "Organism",
-            ["human", "mouse", "rat"],
-            index=["human", "mouse", "rat"].index(st.session_state["organism"]),
-        )
-        if (disease != st.session_state["disease_program"]
-                or organism != st.session_state["organism"]):
-            st.session_state["disease_program"] = disease
-            st.session_state["organism"]        = organism
-            st.session_state["session_id"]      = None
-
-        # ── Ensure session ─────────────────────────────────────────────────────
-        if st.session_state["session_id"] is None:
-            sid = _api_create_session(disease, organism)
-            if sid:
-                st.session_state["session_id"] = sid
-            else:
-                st.error("API server not reachable.")
-                st.code("uvicorn api.main:app --reload --port 8000", language="bash")
-                return
-
-        st.markdown(
-            f"<div class='session-chip'>"
-            f"<span class='session-dot'></span>"
-            f"Session {st.session_state['session_id'][:8]}…"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-        # ── Dataset card (after upload) ────────────────────────────────────────
-        ur = st.session_state.get("upload_result")
-        if ur:
-            st.markdown("<span class='sh'>Dataset</span>", unsafe_allow_html=True)
-
-            dtype = (ur.get("data_type") or "unknown").upper()
-            dformat = (ur.get("data_format") or "").upper()
-            badge_label = f"{dtype}" + (f" · {dformat}" if dformat else "")
-            st.markdown(
-                f"<div class='gcard'>"
-                f"<span class='dtype-badge'>{badge_label}</span>"
-                f"<div class='mchips'>"
-                f"<div class='mchip'><span class='mchip-val'>{ur.get('n_proteins','–')}</span><span class='mchip-lbl'>Proteins</span></div>"
-                f"<div class='mchip'><span class='mchip-val'>{ur.get('n_samples','–')}</span><span class='mchip-lbl'>Samples</span></div>"
-                f"</div>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-
-            sample_cols = ur.get("sample_columns") or []
-            is_pooled   = bool(ur.get("is_pooled_design", False))
-            label_map   = ur.get("label_map") or {}
-
-            if is_pooled:
-                st.info("Pooled design — groups auto-detected.")
-                if label_map:
-                    with st.expander("Detected groups", expanded=False):
-                        for code, name in label_map.items():
-                            st.markdown(f"`{code}` → **{name}**")
-                if st.button("▶  Run Fold-Change Analysis", type="primary", use_container_width=True):
-                    _trigger_analysis(
-                        st.session_state["session_id"],
-                        "Run pooled fold-change analysis",
-                    )
-
-            elif sample_cols:
-                st.markdown("<span class='sh'>Group Assignment</span>", unsafe_allow_html=True)
-                col_l1, col_l2 = st.columns(2)
-                with col_l1:
-                    st.session_state["group1_label"] = st.text_input(
-                        "Group 1", value=st.session_state.get("group1_label", "Group1"),
-                        key="g1_label_input",
-                    )
-                with col_l2:
-                    st.session_state["group2_label"] = st.text_input(
-                        "Group 2", value=st.session_state.get("group2_label", "Group2"),
-                        key="g2_label_input",
-                    )
-                g2_assigned = set(st.session_state.get("group2_samples") or [])
-                g1_assigned = set(st.session_state.get("group1_samples") or [])
-                st.session_state["group1_samples"] = st.multiselect(
-                    f"→ {st.session_state['group1_label']}",
-                    options=[c for c in sample_cols if c not in g2_assigned],
-                    default=[c for c in (st.session_state.get("group1_samples") or [])
-                             if c not in g2_assigned],
-                    key="g1_multiselect",
-                )
-                st.session_state["group2_samples"] = st.multiselect(
-                    f"→ {st.session_state['group2_label']}",
-                    options=[c for c in sample_cols if c not in g1_assigned],
-                    default=[c for c in (st.session_state.get("group2_samples") or [])
-                             if c not in g1_assigned],
-                    key="g2_multiselect",
-                )
-                g1_n = len(st.session_state["group1_samples"])
-                g2_n = len(st.session_state["group2_samples"])
-                if g1_n >= 2 and g2_n >= 2:
-                    st.success(f"{g1_n} vs {g2_n} samples ready")
-                    if st.button("▶  Run Analysis", type="primary", use_container_width=True):
-                        g1l = st.session_state["group1_label"]
-                        g2l = st.session_state["group2_label"]
-                        _trigger_analysis(
-                            st.session_state["session_id"],
-                            f"Run differential expression analysis: {g1l} vs {g2l}",
-                        )
-                elif g1_n or g2_n:
-                    st.warning("Need ≥ 2 samples per group.")
-
-        # ── Pipeline steps ─────────────────────────────────────────────────────
-        astate = st.session_state.get("analysis_state") or {}
-        st.markdown("<span class='sh'>Pipeline</span>", unsafe_allow_html=True)
-
-        def _pstep(label: str, icon: str, state_class: str) -> str:
-            return (
-                f"<div class='pstep {state_class}'>"
-                f"<span class='pdot {state_class}'></span>"
-                f"{icon} {label}"
-                f"</div>"
-            )
-
-        data_done    = bool(astate.get("data_type"))
-        analysis_done = astate.get("n_significant") is not None
-        excel_done   = bool(astate.get("excel_path"))
-        enrich_done  = bool(astate.get("pathways"))
-        plots_done   = bool(astate.get("plot_paths"))
-
-        st.markdown(
-            "<div class='pipeline'>"
-            + _pstep("Data Loaded",   "📂", "done" if data_done else "idle")
-            + _pstep("Analysis",      "🔬", "done" if analysis_done else ("running" if data_done else "idle"))
-            + _pstep("Enrichment",    "🧬", "done" if enrich_done else "idle")
-            + _pstep("Visualisation", "📊", "done" if plots_done else "idle")
-            + "</div>",
-            unsafe_allow_html=True,
-        )
-
-        # ── Excel download ──────────────────────────────────────────────────────
-        if excel_done:
-            st.markdown("<hr>", unsafe_allow_html=True)
-            sid = st.session_state["session_id"]
-            try:
-                r = requests.get(f"{API_BASE}/results/{sid}/excel", timeout=30)
-                if r.status_code == 200:
-                    st.download_button(
-                        "⬇  Download Excel Report",
-                        data=r.content,
-                        file_name=f"biomarkers_{sid[:8]}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
-            except Exception:
-                pass
+        st.markdown("<div style='border-bottom:1px solid rgba(255,255,255,0.05);margin-bottom:8px'></div>",
+                    unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -829,16 +560,12 @@ def _handle_file_attach(attached, session_id: str) -> None:
             attached.getvalue(), attached.name,
             attached.type or "application/octet-stream",
             session_id,
-            st.session_state.get("disease_program", "General"),
-            st.session_state.get("organism", "human"),
         )
 
     if result:
         returned_sid = result.get("session_id") or session_id
         st.session_state["session_id"]     = returned_sid
         st.session_state["upload_result"]  = result
-        st.session_state["group1_samples"] = []
-        st.session_state["group2_samples"] = []
         st.session_state["analysis_state"] = _api_fetch_state(returned_sid)
 
         server_msg = result.get("message") or _build_upload_message(result)
@@ -857,32 +584,27 @@ def _build_upload_message(result: dict) -> str:
     dtype     = result.get("data_type", "unknown")
     is_pooled = result.get("is_pooled_design", False)
     label_map = result.get("label_map") or {}
-    lines = [f"**Data loaded** — {n_p} proteins · {n_s} samples · {dtype}"]
+    sample_cols = result.get("sample_columns") or []
+
+    lines = [f"**Data loaded** — {n_p} proteins · {n_s} samples · `{dtype}`"]
+
     if is_pooled and label_map:
-        groups = ", ".join(f"{k}→{v}" for k, v in label_map.items())
+        groups = ", ".join(f"`{k}` → **{v}**" for k, v in label_map.items())
         lines += [
-            f"\nPooled design detected: **{groups}**",
-            "Click **▶ Run Fold-Change Analysis** in the sidebar or type *run analysis*.",
+            f"\nPooled design detected: {groups}",
+            "\nType **run analysis** to compute log₂ fold-changes across all groups.",
         ]
     else:
-        lines.append("\nAssign samples to groups in the sidebar, then run analysis.")
+        if sample_cols:
+            preview = ", ".join(f"`{c}`" for c in sample_cols[:8])
+            more    = f" … (+{len(sample_cols)-8} more)" if len(sample_cols) > 8 else ""
+            lines.append(f"\nSample columns: {preview}{more}")
+        lines.append(
+            "\nTell me which groups to compare — for example:\n"
+            "> *\"Compare Control_1, Control_2, Control_3 vs Disease_1, Disease_2, Disease_3\"*\n\n"
+            "Or type **run all comparisons** to auto-detect groups and analyse everything."
+        )
     return "\n".join(lines)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Trigger analysis
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _trigger_analysis(session_id: str, message: str) -> None:
-    st.session_state["messages"].append({"role": "user", "content": message})
-    with st.spinner("Running analysis…"):
-        resp = _api_send_message(session_id, message)
-    if resp:
-        st.session_state["messages"].append({
-            "role": "assistant", "content": resp["response"]
-        })
-        st.session_state["analysis_state"] = _api_fetch_state(session_id)
-    st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -915,7 +637,6 @@ def _render_welcome() -> str | None:
          "Ranked list with fold changes and p-values"),
     ]
 
-    # Inject the feature-card grid via HTML (non-interactive visual)
     cards_html = "<div class='fc-grid'>"
     for icon, title, desc in suggestions:
         cards_html += (
@@ -928,48 +649,101 @@ def _render_welcome() -> str | None:
     cards_html += "</div>"
     st.markdown(cards_html, unsafe_allow_html=True)
 
-    # Invisible buttons that map to each card (using st.columns for click logic)
     cols = st.columns(3)
     for i, (_, title, _desc) in enumerate(suggestions):
         with cols[i % 3]:
-            if st.button(title, key=f"sug_{i}", use_container_width=True,
-                         help=_desc):
+            if st.button(title, key=f"sug_{i}", use_container_width=True, help=_desc):
                 return title
 
     return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Inline plot renderer
+# Inline plot renderer  (PNG grid + interactive HTML expander)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_file(session_id: str, path: str) -> bytes | None:
+    try:
+        r = requests.get(
+            f"{API_BASE}/results/{session_id}/file",
+            params={"path": path},
+            timeout=20,
+        )
+        return r.content if r.status_code == 200 else None
+    except Exception:
+        return None
+
 
 def _render_inline_plots(session_id: str, plot_paths: list[str]) -> None:
+    """Render PNG thumbnail grid inside a chat message bubble."""
     if not plot_paths:
         return
-    n             = len(plot_paths)
-    cols_per_row  = 2 if n > 1 else 1
-    cols          = st.columns(cols_per_row)
-    for i, path in enumerate(plot_paths):
-        filename = Path(path).name
-        label    = filename.replace("_", " ").replace(".png", "").title()
-        try:
-            r = requests.get(
-                f"{API_BASE}/results/{session_id}/file",
-                params={"path": path},
-                timeout=15,
+
+    # Only PNG paths (skip any HTML paths that ended up in the list)
+    png_paths = [p for p in plot_paths if str(p).endswith(".png")]
+    if not png_paths:
+        return
+
+    st.markdown(
+        "<div style='margin:14px 0 8px;font-size:0.82rem;color:#475569;"
+        "font-weight:600;letter-spacing:0.4px;text-transform:uppercase;'>"
+        f"📊 {len(png_paths)} plot{'s' if len(png_paths) != 1 else ''} generated</div>",
+        unsafe_allow_html=True,
+    )
+
+    cols_per_row = 2
+    rows = [png_paths[i:i + cols_per_row] for i in range(0, len(png_paths), cols_per_row)]
+
+    for row_paths in rows:
+        cols = st.columns(len(row_paths))
+        for col, path in zip(cols, row_paths):
+            label = (
+                Path(path).stem
+                .split("_", 1)[-1]          # strip "stem_" prefix
+                .replace("_", " ")
+                .title()
             )
-            if r.status_code == 200:
-                with cols[i % cols_per_row]:
-                    st.image(r.content, caption=label, use_container_width=True)
-        except Exception:
-            pass
+            img_bytes = _fetch_file(session_id, path)
+            if img_bytes:
+                with col:
+                    st.image(img_bytes, caption=label, use_container_width=True)
+
+
+def _render_interactive_plots(session_id: str, plot_paths: list[str]) -> None:
+    """Render interactive Plotly charts in a standalone expander OUTSIDE chat messages."""
+    png_paths = [p for p in plot_paths if str(p).endswith(".png")]
+    if not png_paths:
+        return
+
+    with st.expander("🔬 Explore plots interactively  (zoom · hover · pan)", expanded=False):
+        for path in png_paths:
+            label = (
+                Path(path).stem
+                .split("_", 1)[-1]
+                .replace("_", " ")
+                .title()
+            )
+            json_path = path.replace(".png", ".json")
+            json_bytes = _fetch_file(session_id, json_path)
+            if not json_bytes:
+                continue
+            try:
+                fig = _go.Figure(_json.loads(json_bytes.decode("utf-8")))
+                st.markdown(
+                    f"<div style='font-size:0.82rem;font-weight:600;color:#94a3b8;"
+                    f"margin:16px 0 4px;'>📊 {label}</div>",
+                    unsafe_allow_html=True,
+                )
+                st.plotly_chart(fig, use_container_width=True, key=f"plotly_{Path(path).stem}")
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Quick action chips (above input)
+# Quick action chips
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _render_quick_actions(astate: dict) -> str | None:
+def _render_quick_actions(session_id: str, astate: dict) -> str | None:
     data_loaded   = bool(astate.get("data_type"))
     analysis_done = bool(astate.get("excel_path"))
 
@@ -982,21 +756,41 @@ def _render_quick_actions(astate: dict) -> str | None:
             "Show analysis code",
         ]
     elif data_loaded:
-        ur        = st.session_state.get("upload_result") or {}
-        is_pooled = bool(ur.get("is_pooled_design"))
-        g1        = st.session_state.get("group1_samples") or []
-        g2        = st.session_state.get("group2_samples") or []
-        if is_pooled or (g1 and g2):
-            actions = ["Run analysis", "Describe the dataset", "What groups are detected?"]
-        else:
-            actions = ["Describe the dataset", "What proteins are in my data?"]
+        actions = [
+            "Run all comparisons",
+            "Describe the dataset",
+            "What groups are in my data?",
+        ]
     else:
         return None
 
-    cols = st.columns(len(actions))
-    for col, action in zip(cols, actions):
-        if col.button(action, key=f"qa_{action[:15]}", use_container_width=True):
-            return action
+    # Excel download — shown alongside quick actions when available
+    excel_path = astate.get("excel_path")
+    if excel_path and session_id:
+        dl_col, chips_col = st.columns([1, 4])
+        with dl_col:
+            try:
+                r = requests.get(f"{API_BASE}/results/{session_id}/excel", timeout=20)
+                if r.status_code == 200:
+                    st.download_button(
+                        "⬇ Download Excel",
+                        data=r.content,
+                        file_name=f"biomarkers_{session_id[:8]}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+            except Exception:
+                pass
+        with chips_col:
+            cols = st.columns(len(actions))
+            for col, action in zip(cols, actions):
+                if col.button(action, key=f"qa_{action[:18]}", use_container_width=True):
+                    return action
+    else:
+        cols = st.columns(len(actions))
+        for col, action in zip(cols, actions):
+            if col.button(action, key=f"qa_{action[:18]}", use_container_width=True):
+                return action
+
     return None
 
 
@@ -1031,10 +825,13 @@ def _render_attachment_area(session_id: str, welcome: bool = False) -> None:
 
 def _render_main() -> None:
     session_id = st.session_state.get("session_id")
+
     if not session_id:
         st.markdown(
-            "<div style='text-align:center; color:#475569; padding-top:120px; font-size:0.9rem;'>"
-            "Connecting to API server…</div>",
+            "<div style='text-align:center; color:#334155; padding-top:100px; font-size:0.9rem;'>"
+            "⚠ Cannot reach the API server.<br><br>"
+            "<code>uvicorn api.main:app --reload --port 8000</code>"
+            "</div>",
             unsafe_allow_html=True,
         )
         return
@@ -1043,12 +840,14 @@ def _render_main() -> None:
         err = st.session_state.pop("api_error")
         st.error(err)
 
-    # Centre column
-    _, chat_col, _ = st.columns([1, 6, 1])
+    _, chat_col, _ = st.columns([1, 10, 1])
 
     with chat_col:
         messages = st.session_state.get("messages") or []
         astate   = st.session_state.get("analysis_state") or {}
+
+        # ── Top bar (logo + pipeline status + new chat) ────────────────────────
+        _render_topbar(session_id, astate)
 
         # ── Welcome / empty state ──────────────────────────────────────────────
         if not messages:
@@ -1061,23 +860,27 @@ def _render_main() -> None:
             return
 
         # ── Message history ────────────────────────────────────────────────────
-        plot_paths = astate.get("plot_paths") or []
+        plot_paths   = astate.get("plot_paths") or []
+        show_interactive = False
 
         for m in messages:
             role    = m.get("role", "assistant")
             content = m.get("content", "")
-
             with st.chat_message(role, avatar="🧬" if role == "assistant" else None):
                 st.markdown(content)
-
                 if role == "assistant" and m.get("has_plots") and plot_paths:
                     _render_inline_plots(session_id, plot_paths)
+                    show_interactive = True
+
+        # ── Interactive plots expander (must be OUTSIDE st.chat_message) ──────
+        if show_interactive and plot_paths:
+            _render_interactive_plots(session_id, plot_paths)
 
         # ── Quick action chips ─────────────────────────────────────────────────
-        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-        quick_action = _render_quick_actions(astate)
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        quick_action = _render_quick_actions(session_id, astate)
 
-        # ── Attachment area ────────────────────────────────────────────────────
+        # ── File attachment ────────────────────────────────────────────────────
         _render_attachment_area(session_id)
 
         # ── Chat input ─────────────────────────────────────────────────────────
@@ -1090,16 +893,31 @@ def _render_main() -> None:
             with st.spinner(""):
                 resp = _api_send_message(session_id, user_input)
             if resp:
-                st.session_state["messages"].append({
-                    "role": "assistant", "content": resp["response"]
-                })
                 new_sid = resp.get("session_id")
                 if new_sid and new_sid != session_id:
                     st.session_state["session_id"]     = new_sid
                     st.session_state["upload_result"]  = {}
-                    st.session_state["analysis_state"] = {}
+                    new_astate = {}
                 else:
-                    st.session_state["analysis_state"] = _api_fetch_state(session_id)
+                    new_astate = _api_fetch_state(session_id)
+                st.session_state["analysis_state"] = new_astate
+
+                # Detect whether this response generated new plots
+                old_plots = set(astate.get("plot_paths") or [])
+                new_plots = set(new_astate.get("plot_paths") or [])
+                has_plots = bool(new_plots - old_plots)   # True only when brand-new plots appear
+
+                # Clear has_plots from all previous messages so plots attach
+                # to exactly the message that produced them
+                if has_plots:
+                    for m in st.session_state["messages"]:
+                        m.pop("has_plots", None)
+
+                st.session_state["messages"].append({
+                    "role":      "assistant",
+                    "content":   resp["response"],
+                    "has_plots": has_plots,
+                })
             st.rerun()
 
 
@@ -1109,7 +927,7 @@ def _render_main() -> None:
 
 def main() -> None:
     _init_session()
-    _render_sidebar()
+    _ensure_session()
     _render_main()
 
 

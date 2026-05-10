@@ -71,6 +71,31 @@ class BiomarkerState(TypedDict, total=False):
     group2_label:   Optional[str]         # human-readable label (e.g. "Control")
     analysis_mode:  Optional[str]         # "supervised" | "unsupervised"
 
+    # Per-session analysis parameter overrides (set when user asks to change thresholds)
+    # These override the global defaults from config/settings.py for THIS session.
+    # Keys: adj_pval_cutoff, log2fc_cutoff, missing_threshold, top_n,
+    #       test_method, is_paired, all_groups, tmt_batches
+    analysis_params: Optional[Dict[str, Any]]
+
+    # Statistical test selection
+    # "auto"    → auto-select (limma when n≤4, Welch otherwise)
+    # "welch"   → Welch two-sample t-test (default for n≥5)
+    # "limma"   → empirical Bayes moderated t-test (recommended for n<5)
+    # "paired_t"→ paired t-test (before/after, matched pairs)
+    # "anova"   → one-way ANOVA for >2 groups simultaneously
+    test_method: Optional[str]
+
+    # Paired design — g1_samples[i] is the same biological unit as g2_samples[i]
+    is_paired:    Optional[bool]
+
+    # Multi-group ANOVA: {"GroupA": ["col1","col2"], "GroupB": [...], "GroupC": [...]}
+    # Used when the user specifies >2 groups for simultaneous testing
+    all_groups:   Optional[Dict[str, List[str]]]
+
+    # TMT multi-batch structure for IRS normalisation
+    # {"plex1": {"samples": ["ch1","ch2",...], "reference": "ref_col"}, ...}
+    tmt_batches:  Optional[Dict[str, Any]]
+
     # Legacy fields — kept for backward compatibility with enrichment/viz agents
     sample_group_col: Optional[str]       # column containing group label
     contrast_groups:  Optional[List[str]] # [group1_name, group2_name]

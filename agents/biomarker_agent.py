@@ -32,6 +32,7 @@ from core.tracing import get_biomarker_metadata
 from skills.omics_registry import OmicsSkillRegistry
 from skills.pooled_fold_change import PooledFoldChangeSkill
 from skills.proteomics_analysis import ProteomicsAnalysisSkill
+from skills.silac_analysis import SilacAnalysisSkill
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ class BiomarkerAgent(BaseAgent):
         self._registry = OmicsSkillRegistry()
         self._registry.register(ProteomicsAnalysisSkill())
         self._registry.register(PooledFoldChangeSkill())
+        self._registry.register(SilacAnalysisSkill())
         # Future registrations (uncomment when implemented):
         # self._registry.register(TranscriptomicsSkill())
         # self._registry.register(MetabolomicsSkill())
@@ -94,9 +96,33 @@ class BiomarkerAgent(BaseAgent):
                 "No data found. Please upload your file before running analysis.",
             )
 
-        # Auto-detect pooled design: ingestion agent sets omic_type to
-        # "proteomics_pooled" when it finds a label map in the Excel file.
-        # Also honour an explicit is_pooled_design flag as a fallback.
+        # ── Route to the correct omic skill ──────────────────────────────────
+        #
+        # Routing rules (in priority order):
+        #   1. omic_type already set in state (e.g. "proteomics_pooled") → honour it
+        #   2. is_pooled_design flag set (label_map extracted from Identifier Info sheet,
+        #      AND each group truly has a single sample) → proteomics_pooled
+        #   3. group labels provided with ≥2 replicates each → proteomics (supervised)
+        #   4. No group labels → proteomics (unsupervised CV ranking)
+        #
+        # Downgrade pooled→standard if both group samples are given AND each has
+        # multiple replicates — the user explicitly assigned replicated groups,
+        # so Welch t-test is more appropriate than a fold-change-only analysis.
+        g1 = state.get("group1_samples") or []
+        g2 = state.get("group2_samples") or []
+
+        if (
+            state.get("omic_type") == "proteomics_pooled"
+            and len(g1) >= 2
+            and len(g2) >= 2
+        ):
+            logger.info(
+                "Downgrading pooled→proteomics: replicated groups detected "
+                "(g1=%d, g2=%d samples).", len(g1), len(g2),
+            )
+            state["omic_type"]        = "proteomics"
+            state["is_pooled_design"] = False
+
         if state.get("is_pooled_design") and not state.get("omic_type"):
             state["omic_type"] = "proteomics_pooled"
 
@@ -112,32 +138,76 @@ class BiomarkerAgent(BaseAgent):
             )
 
         # Determine supervised vs unsupervised mode
-        g1 = state.get("group1_samples") or []
-        g2 = state.get("group2_samples") or []
         mode = "supervised" if (g1 and g2) else "unsupervised"
         state["analysis_mode"] = mode
         state["status"] = "analyzing"
 
+        # Resolve overrides early — needed for the progress message and analysis
+        _overrides = state.get("analysis_params") or {}
+
+        # User-facing progress message — clearly names what is running and why
         if omic_type == "proteomics_pooled":
-            mode_label = "pooled fold-change"
+            mode_label = (
+                "pooled log₂ fold-change analysis (n=1 per group — no replicates). "
+                "All pairwise contrasts will be computed."
+            )
         elif mode == "supervised":
-            mode_label = "differential expression"
+            g1_lbl = state.get("group1_label", "Group 1")
+            g2_lbl = state.get("group2_label", "Group 2")
+            n1, n2 = len(g1), len(g2)
+            _req_method = _overrides.get("test_method") or state.get("test_method") or "auto"
+            _method_label = {
+                "limma":    "limma moderated t-test (eBayes)",
+                "paired_t": "paired t-test",
+                "anova":    "one-way ANOVA",
+                "welch":    "Welch t-test",
+            }.get(_req_method, "auto-selected test (limma for n≤4, Welch for n≥5)")
+            mode_label = (
+                f"differential expression analysis — **{g1_lbl}** (n={n1}) vs "
+                f"**{g2_lbl}** (n={n2}) — {_method_label}. "
+                f"Pipeline: log₂ transform → median normalisation → "
+                f"group-aware filter → half-min imputation → {_method_label} → BH FDR."
+            )
         else:
-            mode_label = "unsupervised CV"
+            mode_label = (
+                "unsupervised variability analysis (no group labels). "
+                "Proteins ranked by CV%, MAD, and IQR across all samples."
+            )
         state["messages"].append({
             "role": "assistant",
-            "content": f"Running {mode_label} analysis ({omic_type}) — please wait…",
+            "content": f"Running {mode_label}",
         })
+
+        # ── Resolve analysis parameters (session overrides > global settings) ──
+        adj_pval_cutoff   = float(_overrides.get("adj_pval_cutoff",   settings.adj_pval_cutoff))
+        log2fc_cutoff     = float(_overrides.get("log2fc_cutoff",     settings.log2fc_cutoff))
+        missing_threshold = float(_overrides.get("missing_threshold", settings.missing_value_threshold))
+        top_n             = int(  _overrides.get("top_n",             settings.top_n_biomarkers))
+
+        if _overrides:
+            logger.info(
+                "Analysis params (session overrides active): adj_p=%.3f log2fc=%.2f "
+                "missing=%.2f top_n=%d",
+                adj_pval_cutoff, log2fc_cutoff, missing_threshold, top_n,
+            )
 
         # Dispatch to the registered skill
         skill = self._registry.get(omic_type)
-        # For pooled designs use the original raw file name; for processed CSV
-        # use its stem so output files are named sensibly.
-        raw_path = state.get("raw_data_path") or state.get("data_path", "analysis")
+        raw_path  = state.get("raw_data_path") or state.get("data_path", "analysis")
         file_name = Path(raw_path).stem
 
+        # Resolve extended test parameters from session overrides + state
+        _test_method = (
+            _overrides.get("test_method")
+            or state.get("test_method")
+            or "auto"
+        )
+        _is_paired   = bool(state.get("is_paired") or _overrides.get("is_paired", False))
+        _all_groups  = state.get("all_groups") or _overrides.get("all_groups")
+        _tmt_batches = state.get("tmt_batches")
+
         result = skill.execute(
-            # Standard parameters (used by ProteomicsAnalysisSkill)
+            # Standard parameters
             data_path=state.get("data_path", ""),
             sample_columns=state.get("sample_columns") or [],
             group1_samples=g1,
@@ -146,13 +216,18 @@ class BiomarkerAgent(BaseAgent):
             group2_label=state.get("group2_label") or "Group2",
             analysis_mode=mode,
             data_type=state.get("data_type") or "generic",
-            adj_pval_cutoff=settings.adj_pval_cutoff,
-            log2fc_cutoff=settings.log2fc_cutoff,
-            missing_threshold=settings.missing_value_threshold,
-            top_n=settings.top_n_biomarkers,
+            adj_pval_cutoff=adj_pval_cutoff,
+            log2fc_cutoff=log2fc_cutoff,
+            missing_threshold=missing_threshold,
+            top_n=top_n,
             output_dir=settings.output_dir,
             file_name=file_name,
-            # Pooled-design parameters (used by PooledFoldChangeSkill)
+            # Extended test method (ProteomicsAnalysisSkill)
+            test_method=_test_method,
+            is_paired=_is_paired,
+            all_groups=_all_groups,
+            tmt_batches=_tmt_batches,
+            # Pooled-design parameters (PooledFoldChangeSkill)
             raw_data_path=state.get("raw_data_path", ""),
             label_map=state.get("label_map"),
         )
@@ -256,40 +331,54 @@ class BiomarkerAgent(BaseAgent):
                 for b in top5
             )
 
+        # Use the actual parameters that were passed to the skill (including overrides)
+        _overrides    = state.get("analysis_params") or {}
+        _adj_pval     = float(_overrides.get("adj_pval_cutoff",   settings.adj_pval_cutoff))
+        _log2fc       = float(_overrides.get("log2fc_cutoff",     settings.log2fc_cutoff))
+        _overrides_note = (
+            " *(custom thresholds set by user)*" if _overrides else ""
+        )
+
         # Describe the exact statistical method used
         if omic_type == "proteomics_pooled":
             method_str = (
                 "**Method:** Log₂ fold-change (pooled n=1 design — no replicates, no p-values). "
-                "Pseudocount +1 applied before log₂ transform."
+                "Pseudocount +1 applied before log₂ transform. "
+                "All pairwise contrasts computed from the uploaded label map."
             )
         elif mode == "supervised":
             method_str = (
-                f"**Method:** Welch two-sample t-test — "
-                f"{g1} vs {g2}. "
-                f"FDR correction: Benjamini-Hochberg. "
-                f"Significance thresholds: adj. p < {settings.adj_pval_cutoff}, "
-                f"|log₂FC| ≥ {settings.log2fc_cutoff}."
+                f"**Method:** Welch two-sample t-test — {g1} vs {g2}. "
+                f"Pipeline: log₂ transform → median normalisation → group-aware missing filter "
+                f"→ half-min imputation → Welch t-test → Benjamini-Hochberg FDR. "
+                f"Significance thresholds: adj. p < {_adj_pval}{_overrides_note}, "
+                f"|log₂FC| ≥ {_log2fc}{_overrides_note}. "
+                f"Effect size: Cohen's d (pooled SD)."
             )
         else:
             method_str = (
-                "**Method:** Unsupervised coefficient of variation (CV) ranking. "
-                "Proteins ranked by CV% across all samples — no group labels required."
+                "**Method:** Unsupervised variability ranking (no group labels). "
+                "Proteins ranked by CV%, MAD, and IQR across all samples. "
+                "Pipeline: log₂ transform → median normalisation → half-min imputation → ranking."
             )
 
         prompt = (
             f"{omic_type.capitalize()} biomarker analysis complete.\n\n"
             f"Mode: {mode}\n"
             + (f"Comparison: {g1} vs {g2}\n" if mode == "supervised" else "")
-            + f"Features after QC: {qc.get('proteins_after_qc', 'N/A')}\n"
+            + f"Proteins input: {qc.get('proteins_input', 'N/A')}\n"
+            f"Contaminants removed: {qc.get('contaminants_removed', 0)}\n"
+            f"Proteins after QC: {qc.get('proteins_after_qc', 'N/A')}\n"
             f"Log2 transformed: {qc.get('log2_transformed', False)}\n"
+            f"Normalised: {qc.get('normalised', False)} ({qc.get('normalisation_method','none')})\n"
             f"Significant biomarkers: {result.get('n_significant', 0)}\n\n"
             f"Top 5:\n{top5_lines}\n\n"
             f"Statistical method: {method_str}\n\n"
             "Write a concise (≤200 words) plain-language summary for a researcher:\n"
-            "1. Which statistical method was used and why\n"
+            "1. Which statistical method was used (be specific about the pipeline steps)\n"
             "2. Key findings and comparison made\n"
             "3. Most interesting biomarker(s) with their values\n"
-            "4. Any QC notes\n"
+            "4. QC notes (proteins removed, normalisation applied)\n"
             "5. What the downloaded Excel file contains\n"
             "Always include the method name in the summary. Use markdown formatting."
         )

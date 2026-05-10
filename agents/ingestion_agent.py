@@ -150,9 +150,20 @@ class IngestionAgent(BaseAgent):
         if all_sheets:
             state["all_sheets"] = all_sheets
 
+        # ── TMT batch structure ───────────────────────────────────────────────
+        tmt_batches = result.get("tmt_batches")
+        if tmt_batches:
+            state["tmt_batches"] = tmt_batches
+            logger.info("TMT multi-batch structure stored: %s", list(tmt_batches.keys()))
+
+        # ── omic_type routing ─────────────────────────────────────────────────
         if is_pooled:
             state["omic_type"] = "proteomics_pooled"
             logger.info("Pooled design — omic_type='proteomics_pooled'. Label map: %s", label_map)
+        elif result.get("omic_type"):
+            # DataLoadingSkill may hint the omic type (e.g. "proteomics_silac")
+            state["omic_type"] = result["omic_type"]
+            logger.info("omic_type set from DataLoadingSkill hint: '%s'", result["omic_type"])
 
         # ── Auto-detect groups from column names (non-pooled) ─────────────────
         inferred_groups: Dict[str, List[str]] = {}
@@ -298,5 +309,5 @@ class IngestionAgent(BaseAgent):
             g = list(inferred_groups.keys())
             lines += [f"- Groups detected: {', '.join(g)}", "\n**Ready for analysis.**"]
         else:
-            lines.append("\nAssign **Group 1** and **Group 2** in the sidebar, then run analysis.")
+            lines.append("\nTell me which groups to compare, e.g. *'compare Control vs Disease'*, then I'll run the analysis.")
         return "\n".join(lines)

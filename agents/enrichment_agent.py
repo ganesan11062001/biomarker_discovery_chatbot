@@ -1,13 +1,19 @@
 """
 agents/enrichment_agent.py
-Knowledge Layer — pathway enrichment with LLM-generated interpretation.
+Knowledge Layer — pathway enrichment with LLM-generated biological interpretation.
 
-Runs KEGG/GO enrichment via PathwaySkill then asks the LLM to produce
-a biologically meaningful summary of what was found.
+Design:
+  - Only significant proteins (significance != "NS") are submitted for enrichment
+  - Up- and down-regulated proteins are separated so enrichment is directional
+  - All measured proteins are used as background (avoids genome-wide inflation)
+  - LLM summary receives full biological context: groups, direction, fold changes
 """
 from __future__ import annotations
 
 import logging
+from typing import List, Optional
+
+import pandas as pd
 
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
@@ -30,10 +36,22 @@ except ImportError:
         return None
 
 
+def _get_log2fc(protein_dict: dict) -> float:
+    """Retrieve log2 fold-change from any of the field names used across skills."""
+    for field in ("log2fc", "log2_ratio", "log2_fold_change", "max_pairwise_log2fc"):
+        val = protein_dict.get(field)
+        if val is not None:
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                pass
+    return 0.0
+
+
 class EnrichmentAgent(BaseAgent):
     """
-    Runs KEGG and GO pathway enrichment then uses the LLM to interpret
-    the biological meaning of the top pathways in context.
+    Runs KEGG and GO pathway enrichment, then uses the LLM to produce
+    a biologically grounded interpretation of the top pathways.
     """
 
     def __init__(self) -> None:
@@ -54,8 +72,8 @@ class EnrichmentAgent(BaseAgent):
                 rt.extra.setdefault("metadata", {}).update(get_enrichment_metadata(state))
             except Exception:
                 pass
-        protein_source = state.get("top_biomarkers") or state.get("top_proteins")
 
+        protein_source = state.get("top_biomarkers") or state.get("top_proteins")
         if not protein_source:
             msg = self._llm_no_data()
             state["status"]        = "error"
@@ -63,19 +81,41 @@ class EnrichmentAgent(BaseAgent):
             state["messages"].append({"role": "assistant", "content": msg})
             return state
 
-        protein_list = [p.get("protein") for p in protein_source if p.get("protein")]
-        if not protein_list:
+        # Filter to significant proteins only (NS excluded from gene set)
+        sig_proteins = [
+            p for p in protein_source
+            if p.get("significance") not in (None, "NS", "")
+            and p.get("protein")
+        ]
+        if not sig_proteins:
+            # Fallback: no significance field means all results are valid candidates
+            sig_proteins = [p for p in protein_source if p.get("protein")]
+            logger.info("No significance field found; using all %d top proteins.", len(sig_proteins))
+
+        if not sig_proteins:
             state["messages"].append({
                 "role": "assistant",
-                "content": "No protein identifiers available for enrichment.",
+                "content": "No significant proteins found for pathway enrichment.",
             })
             return state
+
+        protein_list = [p["protein"] for p in sig_proteins]
+
+        # Separate by direction of regulation
+        up_proteins   = [p["protein"] for p in sig_proteins if _get_log2fc(p) > 0]
+        down_proteins = [p["protein"] for p in sig_proteins if _get_log2fc(p) < 0]
+
+        # Background: all measured proteins from the experiment
+        background_proteins = self._get_background_proteins(state)
 
         results_path = state.get("excel_path") or state.get("dea_result_path") or ""
 
         try:
             result = self.pathway_skill.execute(
                 protein_list=protein_list,
+                background_proteins=background_proteins,
+                up_proteins=up_proteins   or None,
+                down_proteins=down_proteins or None,
                 dea_result_path=results_path,
                 organism=state.get("organism", "human"),
             )
@@ -84,15 +124,18 @@ class EnrichmentAgent(BaseAgent):
             state["pathways"]               = result["top_pathways"]
             state["status"]                 = "enrichment_complete"
 
-            # LLM-generated biological interpretation
-            msg = self._llm_enrichment_summary(result, state)
+            msg = self._llm_enrichment_summary(result, state, sig_proteins,
+                                               up_proteins, down_proteins,
+                                               background_proteins)
             state["messages"].append({"role": "assistant", "content": msg})
 
             logger.info(
-                "Enrichment complete | session=%s kegg=%d go=%d",
+                "Enrichment complete | session=%s sig=%d up=%d down=%d kegg=%d go=%d bg=%s",
                 state.get("session_id"),
+                len(protein_list), len(up_proteins), len(down_proteins),
                 result.get("n_kegg_significant", 0),
                 result.get("n_go_significant", 0),
+                result.get("background_size"),
             )
 
             rt = _get_run_tree()
@@ -113,32 +156,79 @@ class EnrichmentAgent(BaseAgent):
 
         return state
 
+    # ── Background extraction ─────────────────────────────────────────────────
+
+    def _get_background_proteins(self, state: BiomarkerState) -> Optional[List[str]]:
+        """Read the first column of the processed data file as background gene set."""
+        data_path = state.get("data_path")
+        if not data_path:
+            return None
+        try:
+            col = pd.read_csv(data_path, usecols=[0], header=0).iloc[:, 0]
+            proteins = [str(p) for p in col.tolist() if pd.notna(p) and str(p).strip()]
+            logger.info("Background: %d measured proteins from data file", len(proteins))
+            return proteins or None
+        except Exception as exc:
+            logger.warning("Could not read background proteins from data file: %s", exc)
+            return None
+
     # ── LLM summary ───────────────────────────────────────────────────────────
 
     @_traceable(run_type="chain", name="enrichment.summary",
                 tags=["biomarker-discovery", "enrichment"])
-    def _llm_enrichment_summary(self, result: dict, state: BiomarkerState) -> str:
-        top5 = result.get("top_pathways", [])[:5]
-        pathway_lines = "\n".join(
-            f"  {i+1}. {p['pathway']} | lib={p.get('library','')} | "
-            f"adj_p={float(p.get('p_adjust') or 1.0):.3e} | genes={p.get('gene_count','?')} | "
-            f"overlap={p.get('overlap','')}"
-            for i, p in enumerate(top5)
+    def _llm_enrichment_summary(
+        self,
+        result: dict,
+        state: BiomarkerState,
+        sig_proteins: list,
+        up_proteins: List[str],
+        down_proteins: List[str],
+        background_proteins: Optional[List[str]],
+    ) -> str:
+        g1      = state.get("group1_label", "Group1")
+        g2      = state.get("group2_label", "Group2")
+        omic    = state.get("omic_type", "proteomics")
+        organism = state.get("organism", "human")
+        bg_size = result.get("background_size") or (len(background_proteins) if background_proteins else "genome-wide")
+
+        # Top 3 up and down pathways
+        up_lines   = _format_pathway_lines(result.get("up_pathways",   [])[:3], "↑")
+        down_lines = _format_pathway_lines(result.get("down_pathways", [])[:3], "↓")
+        all_top    = _format_pathway_lines(result.get("top_pathways",  [])[:5], "")
+
+        # Top proteins with fold-changes
+        top_fc = sorted(sig_proteins, key=lambda p: abs(_get_log2fc(p)), reverse=True)[:5]
+        fc_lines = "\n".join(
+            f"  {p['protein']} (log2FC={_get_log2fc(p):+.2f})" for p in top_fc
         )
 
-        g1 = state.get("group1_label", "Group1")
-        g2 = state.get("group2_label", "Group2")
-        omic = state.get("omic_type", "proteomics")
-
         ctx = (
-            f"Enrichment analysis complete for {omic} comparison: {g1} vs {g2}\n\n"
-            f"Statistics:\n"
-            f"  - Proteins submitted: {result.get('genes_submitted', len(result.get('gene_symbols', [])))}\n"
-            f"  - KEGG pathways significant: {result.get('n_kegg_significant', 0)}\n"
-            f"  - GO terms significant: {result.get('n_go_significant', 0)}\n\n"
-            f"Top enriched pathways:\n{pathway_lines}\n\n"
-            f"Gene symbols used: {result.get('gene_symbols', [])[:15]}\n\n"
-            "Provide a biologically meaningful interpretation of these enrichment results."
+            f"PATHWAY ENRICHMENT ANALYSIS COMPLETE\n\n"
+            f"Comparison: {g1} vs {g2}\n"
+            f"Omic type: {omic} | Organism: {organism}\n\n"
+            f"Proteins submitted for enrichment: {len(sig_proteins)} significant proteins\n"
+            f"  - Up-regulated ({g1} > {g2}): {len(up_proteins)}\n"
+            f"  - Down-regulated ({g1} < {g2}): {len(down_proteins)}\n"
+            f"Background gene set: {bg_size} measured proteins\n\n"
+            f"Results:\n"
+            f"  KEGG pathways significant: {result.get('n_kegg_significant', 0)}\n"
+            f"  GO terms significant:      {result.get('n_go_significant', 0)}\n\n"
+        )
+
+        if up_lines:
+            ctx += f"Top UP-regulated pathways (activated in {g1}):\n{up_lines}\n\n"
+        if down_lines:
+            ctx += f"Top DOWN-regulated pathways (suppressed in {g1}):\n{down_lines}\n\n"
+        if not up_lines and not down_lines and all_top:
+            ctx += f"Top enriched pathways:\n{all_top}\n\n"
+
+        ctx += f"Proteins with largest fold-changes:\n{fc_lines}\n\n"
+        ctx += (
+            "Task: provide a concise, biologically meaningful interpretation. "
+            "Explain what biological processes are activated and suppressed in the comparison. "
+            "Connect the pathway findings to the experimental context. "
+            "Mention if the directionality reveals a coherent biological story. "
+            "Be specific — cite actual pathway names and gene names from above."
         )
 
         messages = [
@@ -146,10 +236,12 @@ class EnrichmentAgent(BaseAgent):
             {"role": "user",   "content": ctx},
         ]
         try:
-            return self._call_llm(messages, max_tokens=400)
+            return self._call_llm(messages, max_tokens=500)
         except Exception as exc:
             logger.warning("Enrichment LLM summary failed: %s — using fallback.", exc)
-            return self._fallback_summary(result)
+            return self._fallback_summary(result, g1, g2)
+
+    # ── LLM error / no-data helpers ───────────────────────────────────────────
 
     def _llm_no_data(self) -> str:
         messages = [
@@ -177,17 +269,35 @@ class EnrichmentAgent(BaseAgent):
     # ── Fallback ──────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _fallback_summary(result: dict) -> str:
-        top5 = result.get("top_pathways", [])[:5]
+    def _fallback_summary(result: dict, g1: str = "Group1", g2: str = "Group2") -> str:
+        top5  = result.get("top_pathways", [])[:5]
         lines = [
-            f"**Pathway Enrichment Complete**\n",
+            f"**Pathway Enrichment Complete** ({g1} vs {g2})\n",
             f"- KEGG pathways: **{result.get('n_kegg_significant', 0)}**",
-            f"- GO terms: **{result.get('n_go_significant', 0)}**\n",
-            "**Top pathways:**",
+            f"- GO terms: **{result.get('n_go_significant', 0)}**",
         ]
+        bg = result.get("background_size")
+        if bg:
+            lines.append(f"- Background: **{bg} measured proteins**")
+        lines.append("\n**Top pathways:**")
         for i, p in enumerate(top5):
+            direction = f" [{p.get('direction', '')}]" if p.get("direction") not in (None, "all", "") else ""
             lines.append(
-                f"  {i+1}. {p['pathway']} "
+                f"  {i+1}. {p['pathway']}{direction} "
                 f"(adj.p={float(p.get('p_adjust') or 1.0):.3e}, genes={p.get('gene_count','?')})"
             )
         return "\n".join(lines)
+
+
+# ── Module-level helper ───────────────────────────────────────────────────────
+
+def _format_pathway_lines(pathways: list, prefix: str) -> str:
+    lines = []
+    for p in pathways:
+        tag = f" {prefix}" if prefix else ""
+        lines.append(
+            f"  •{tag} {p['pathway']} | {p.get('library','')} | "
+            f"adj_p={float(p.get('p_adjust') or 1.0):.3e} | "
+            f"genes={p.get('gene_count','?')} ({p.get('overlap','')})"
+        )
+    return "\n".join(lines)

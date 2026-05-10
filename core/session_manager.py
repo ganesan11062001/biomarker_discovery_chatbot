@@ -63,6 +63,11 @@ class SessionManager:
             group1_label         = None,
             group2_label         = None,
             analysis_mode        = None,
+            test_method          = None,
+            is_paired            = False,
+            all_groups           = None,
+            analysis_params      = None,
+            tmt_batches          = None,
             # ── QC ────────────────────────────────────────────────────────────
             qc_passed            = None,
             qc_summary           = None,

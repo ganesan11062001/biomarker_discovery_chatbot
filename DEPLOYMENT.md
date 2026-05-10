@@ -12,7 +12,16 @@ cd biomarker_discovery_chatbot
 make install
 ```
 
-### 2. Configure environment
+### 2. Install kaleido for static PNG export
+
+```bash
+pip install kaleido
+```
+
+Kaleido is required to export plots as high-resolution PNGs. If it is absent,
+the pipeline falls back to HTML-only output — all plots still render in the UI.
+
+### 3. Configure environment
 
 ```bash
 cp .env.example .env
@@ -52,19 +61,19 @@ LANGSMITH_TRACING=true
 APP_ENV=development
 ```
 
-### 3. Create data directories
+### 4. Create data directories
 
 ```bash
 make dirs
 ```
 
-### 4. Run tests
+### 5. Run tests
 
 ```bash
 make test
 ```
 
-### 5. Start services
+### 6. Start services
 
 ```bash
 # Terminal 1
@@ -171,9 +180,14 @@ Create `Dockerfile`:
 ```dockerfile
 FROM python:3.11-slim
 
+# System deps for kaleido (Chromium-based PNG renderer)
+RUN apt-get update && apt-get install -y \
+    chromium-driver \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && pip install kaleido
 
 COPY . .
 RUN python -c "import pathlib; [pathlib.Path(p).mkdir(parents=True, exist_ok=True) for p in ['data/raw','data/processed','outputs','logs']]"
@@ -244,24 +258,25 @@ Set `API_BASE_URL` to the API App Service URL in the UI app settings.
 | `AZURE_OPENAI_ENDPOINT` | Yes | — | Azure OpenAI resource URL |
 | `AZURE_OPENAI_API_KEY` | Yes | — | Azure OpenAI API key |
 | `AZURE_OPENAI_API_VERSION` | Yes | `2024-08-01-preview` | API version |
-| `AZURE_DEPLOYMENT_CHAT` | Yes | `gpt-4o` | Deployment name for chat agent |
+| `AZURE_DEPLOYMENT_CHAT` | Yes | `gpt-4o` | Deployment name for chat/orchestration agent |
 | `AZURE_DEPLOYMENT_INGESTION` | No | `gpt-4o` | Deployment for ingestion agent |
 | `AZURE_DEPLOYMENT_BIOMARKER` | No | `gpt-4o` | Deployment for biomarker agent |
 | `AZURE_DEPLOYMENT_ENRICHMENT` | No | `gpt-4o` | Deployment for enrichment agent |
 | `AZURE_DEPLOYMENT_VISUALIZATION` | No | `gpt-4o` | Deployment for visualization agent |
 | `API_HOST` | No | `0.0.0.0` | Bind address for uvicorn |
 | `API_PORT` | No | `8000` | Port for FastAPI |
-| `API_BASE_URL` | No | `http://localhost:8000` | URL the UI calls |
+| `API_BASE_URL` | No | `http://localhost:8000` | URL the Streamlit UI calls |
 | `DATA_RAW_DIR` | No | `data/raw` | Raw upload storage |
 | `DATA_PROCESSED_DIR` | No | `data/processed` | Processed data storage |
-| `OUTPUT_DIR` | No | `outputs` | Excel + plot output dir |
-| `MAX_FILE_SIZE_MB` | No | `100` | Upload size limit |
+| `OUTPUT_DIR` | No | `outputs` | Excel, PNG, HTML, and JSON plot output dir |
+| `MAX_FILE_SIZE_MB` | No | `200` | Upload size limit |
 | `TOP_N_BIOMARKERS` | No | `50` | Biomarkers in Excel top sheet |
-| `LOG2FC_CUTOFF` | No | `1.0` | Significance threshold |
+| `ADJ_PVAL_CUTOFF` | No | `0.05` | Default adjusted p-value significance threshold |
+| `LOG2FC_CUTOFF` | No | `1.0` | Default log₂FC significance threshold |
 | `MISSING_VALUE_THRESHOLD` | No | `0.5` | Max missing fraction per protein |
 | `LANGSMITH_API_KEY` | No | — | LangSmith API key |
 | `LANGSMITH_PROJECT` | No | `biomarker-discovery` | LangSmith project name |
-| `LANGSMITH_TRACING` | No | `false` | Enable LangSmith tracing |
+| `LANGSMITH_TRACING` | No | `true` | Enable LangSmith tracing |
 | `APP_ENV` | No | `development` | `development` or `production` |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 
@@ -283,11 +298,45 @@ curl http://localhost:8000/health
 | `GET` | `/health` | Health check |
 | `GET` | `/docs` | Swagger UI |
 | `GET` | `/redoc` | ReDoc |
-| `POST` | `/chat/session` | Create a new session |
-| `POST` | `/chat/` | Send a message |
-| `POST` | `/upload/` | Upload proteomics file |
+| `POST` | `/chat/session` | Create a new analysis session |
+| `POST` | `/chat/` | Send a message; runs the full LangGraph pipeline |
+| `POST` | `/upload/` | Upload a proteomics file (CSV / XLSX / XLS) |
 | `GET` | `/results/{session_id}` | Fetch full session state |
-| `GET` | `/static/{filename}` | Serve generated plots / Excel |
+| `GET` | `/results/{session_id}/excel` | Download formatted Excel biomarker results |
+| `GET` | `/results/{session_id}/file?path=<path>` | Serve any generated output file (PNG, HTML, JSON, CSV) |
+
+---
+
+## Visualization Output Format
+
+Each plot is saved in three formats:
+
+| Format | Extension | Purpose |
+|---|---|---|
+| PNG | `.png` | High-resolution static image (2× scale via kaleido) |
+| HTML | `.html` | Standalone interactive chart (full Plotly.js embedded) |
+| JSON | `.json` | Plotly figure JSON loaded by `st.plotly_chart()` for in-app interactivity |
+
+The 16 available plot types are:
+
+| Plot | Standard suite | Triggered by |
+|---|---|---|
+| `volcano` | Supervised | DEA results |
+| `ma_plot` | Supervised | DEA results |
+| `waterfall` | Supervised | DEA results |
+| `heatmap` | Supervised | Top biomarkers + wide data |
+| `pca` | Supervised | Wide data |
+| `sample_correlation` | Supervised | Wide data |
+| `boxplot` | Supervised | Wide data |
+| `violin` | Supervised | Wide data |
+| `topn_bar` | Supervised | Top biomarkers |
+| `paired_lines` | Paired only | Paired design |
+| `anova_multigroup` | ANOVA only | ≥3 groups |
+| `cv_distribution` | Unsupervised | All modes |
+| `fc_heatmap` | Supervised | Top biomarkers |
+| `rescue_bar` | Pooled only | Pooled design |
+| `silac_ratio_dist` | SILAC only | SILAC data |
+| `pathway_dotplot` | When enrichment available | Pathway results |
 
 ---
 
@@ -297,6 +346,7 @@ curl http://localhost:8000/health
 - **Uvicorn workers** — set `--workers` to `(2 × CPU cores) + 1` for concurrency. LangGraph state is not shared between workers, so each worker needs its own session store.
 - **File storage** — `data/raw` and `outputs` are local disk. Mount a shared volume (NFS, Azure Files, S3) when running multiple workers or containers.
 - **LLM costs** — each chat turn makes 1–3 Azure OpenAI calls. Monitor token usage in LangSmith or Azure portal.
+- **PNG export** — kaleido spawns a Chromium process per plot. On memory-constrained servers, consider disabling PNG export (`kaleido` absent = HTML-only fallback) and relying on in-app Plotly rendering instead.
 
 ---
 
@@ -305,8 +355,11 @@ curl http://localhost:8000/health
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `KeyError: session_id` | Session expired after server restart | Re-upload your file — session data is in-memory only |
-| Plots not showing | `OUTPUT_DIR` not mounted / wrong path | Check `outputs/` directory exists and is writable |
-| `gseapy` enrichment fails | Enrichr API unreachable | Check internet connectivity; enrichment will return empty gracefully |
+| Plots not showing in UI | `OUTPUT_DIR` not mounted or wrong path | Confirm `outputs/` exists and is writable; check `GET /results/{sid}` returns `plot_paths` |
+| Plots show as PNG only (no interactive expand) | Normal behaviour — interactive expander renders below chat | Click **🔬 Explore plots interactively** section below the last message |
+| PNG export produces blank files | kaleido not installed | `pip install kaleido`; plots fall back to HTML if kaleido absent |
+| `gseapy` enrichment fails | Enrichr API unreachable | Check internet connectivity; enrichment returns empty gracefully |
 | `wrap_openai` warning on startup | LangSmith not installed or key missing | Install `langsmith` or set `LANGSMITH_TRACING=false` |
 | Analysis returns no proteins | All proteins filtered by missing-value threshold | Lower `MISSING_VALUE_THRESHOLD` in `.env` (default 0.5) |
 | Upload rejected | Wrong file extension | Accepted: `.csv`, `.xlsx`, `.xls` — rename `.txt`/`.tsv` to `.csv` |
+| File exceeds size limit | File > `MAX_FILE_SIZE_MB` | Increase `MAX_FILE_SIZE_MB` in `.env` (default 200 MB) |

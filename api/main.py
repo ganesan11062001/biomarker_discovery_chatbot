@@ -6,7 +6,6 @@ Start:  uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 """
 
 import logging
-import logging.config
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI

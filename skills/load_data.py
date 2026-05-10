@@ -54,10 +54,6 @@ _METADATA_HINTS = {
     "subject", "donor", "cohort", "replicate",
 }
 
-_FALLBACK_LABEL_MAP: Dict[str, str] = {
-    "A": "WT", "B": "mdx", "C": "uDys5", "D": "H2", "E": "nNOS_KO",
-}
-
 # A sheet is EXPRESSION if it has ≥ this many rows
 _EXPRESSION_MIN_ROWS = 20
 # … and ≥ this fraction of its columns are numeric
@@ -99,6 +95,10 @@ def _detect_data_type(df: pd.DataFrame, sample_cols: List[str]) -> str:
     combined = [c.lower() for c in df.columns] + [str(i).lower() for i in df.index]
     if any("npx" in s or "olink" in s for s in combined):
         return "olink_npx"
+    if _is_spectronaut(df):
+        return "dia_spectronaut"
+    if _is_silac(df):
+        return "silac_ratio"
     if any(kw in s for s in combined
            for kw in ("intensity", "lfq", "tmt", "itraq", "ms1", "spectral", "spc")):
         return "ms_lfq"
@@ -112,6 +112,107 @@ def _detect_data_type(df: pd.DataFrame, sample_cols: List[str]) -> str:
         if float(mx) > 1_000:
             return "ms_lfq"
     return "generic"
+
+
+def _is_spectronaut(df: pd.DataFrame) -> bool:
+    """Return True when the DataFrame looks like a Spectronaut wide-format export."""
+    col_str = " ".join(str(c) for c in df.columns)
+    spectronaut_markers = ("PG.Genes", "PG.ProteinAccessions", "PG.UniProtIds",
+                           "PG.Quantity", "EG.Sequence", "R.Condition")
+    return (
+        any(m in col_str for m in spectronaut_markers)
+        or sum(1 for c in df.columns if "PG." in str(c) or "EG." in str(c)) >= 2
+    )
+
+
+def _is_silac(df: pd.DataFrame) -> bool:
+    """Return True when column names suggest SILAC ratio data."""
+    _kw = ("ratio h/l", "ratio h/m", "ratio m/l", "h/l ratio", "silac ratio",
+           "normalized ratio", "ratio hl", "ratio hm")
+    col_lower = " ".join(str(c).lower() for c in df.columns)
+    return any(kw in col_lower for kw in _kw)
+
+
+def _parse_spectronaut(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reshape a Spectronaut wide-format export into a standard proteins × samples matrix.
+
+    Spectronaut typically has:
+      • PG.Genes / PG.ProteinAccessions / PG.UniProtIds — protein identifier columns
+      • [SampleName].PG.Quantity — per-sample intensity columns
+      • Other metadata columns (PG.Cscore, EG.*, R.*)
+    """
+    # Find protein ID column
+    id_candidates = [c for c in df_raw.columns
+                     if any(m in str(c) for m in
+                            ("PG.Genes", "PG.ProteinAccessions", "PG.UniProtIds",
+                             "Protein.Ids", "Protein IDs"))]
+    id_col = id_candidates[0] if id_candidates else df_raw.columns[0]
+
+    # Find quantity / expression columns
+    qty_cols = [
+        c for c in df_raw.columns
+        if c != id_col and (
+            "PG.Quantity" in str(c)
+            or "Quantity" in str(c)
+            or (pd.to_numeric(df_raw[c], errors="coerce").notna().mean() >= 0.6
+                and "PG." not in str(c) and "EG." not in str(c) and "R." != str(c)[:2])
+        )
+    ]
+    if not qty_cols:
+        qty_cols = [c for c in df_raw.columns if c != id_col]
+
+    df_expr = df_raw[[id_col] + qty_cols].copy()
+    df_expr = df_expr.set_index(id_col)
+    df_expr.index.name = "Protein"
+
+    # Clean column names: strip ".PG.Quantity" suffix and brackets
+    df_expr.columns = [
+        str(c).replace(".PG.Quantity", "").replace("[", "").replace("]", "").strip()
+        for c in df_expr.columns
+    ]
+    logger.info(
+        "Spectronaut: parsed %d proteins × %d samples from wide-format export.",
+        len(df_expr), len(df_expr.columns),
+    )
+    return df_expr
+
+
+def _detect_tmt_batches(
+    sample_cols: List[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Detect multi-plex TMT structure from column names.
+
+    Recognised patterns
+    -------------------
+    • Plex1_ChannelName, TMT2_Sample, Batch3_Ref
+    • P1_Sample, B2_Reference
+    Reference channels are identified by keywords: ref, pool, reference, standard.
+
+    Returns {plex_name: {"samples": [...], "reference": col_or_None}} or None.
+    """
+    batch_pat = re.compile(
+        r"^((?:Plex|TMT|Batch|Plx|plex|tmt|batch|BN)\s*\d+)[_\-\s](.+)$",
+        re.IGNORECASE,
+    )
+    batches: Dict[str, List[str]] = {}
+    for col in sample_cols:
+        m = batch_pat.match(col)
+        if m:
+            batches.setdefault(m.group(1), []).append(col)
+
+    if len(batches) < 2:
+        return None
+
+    ref_kw = ("ref", "pool", "reference", "ctrl", "standard", "iref")
+    result: Dict[str, Any] = {}
+    for bname, cols in batches.items():
+        ref_col = next((c for c in cols if any(kw in c.lower() for kw in ref_kw)), None)
+        result[bname] = {"samples": cols, "reference": ref_col}
+
+    logger.info("TMT batch structure detected: %s", list(result.keys()))
+    return result
 
 
 def _separate_columns(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
@@ -307,6 +408,12 @@ class DataLoadingSkill:
         df.dropna(axis=1, how="all", inplace=True)
         df.index = df.index.astype(str).str.strip()
 
+        # ── 2b. Spectronaut — reshape before column classification ────────────
+        is_spectronaut = _is_spectronaut(df)
+        if is_spectronaut:
+            logger.info("Spectronaut DIA export detected — reshaping to proteins × samples.")
+            df = _parse_spectronaut(df)
+
         if not is_pooled:
             df = self._ensure_proteins_are_rows(df)
 
@@ -320,6 +427,16 @@ class DataLoadingSkill:
         # ── 4. Detect data type ───────────────────────────────────────────────
         data_type = _detect_data_type(df, sample_cols)
         logger.info("Data type: %s", data_type)
+
+        # ── 4b. TMT multi-batch detection ─────────────────────────────────────
+        tmt_batches = _detect_tmt_batches(sample_cols)
+
+        # ── 4c. SILAC omic type ───────────────────────────────────────────────
+        omic_type_hint: Optional[str] = None
+        if data_type == "silac_ratio":
+            omic_type_hint = "proteomics_silac"
+        elif data_type == "dia_spectronaut":
+            omic_type_hint = "proteomics"   # DIA uses the standard proteomics pipeline
 
         # ── 5. Persist processed CSV ──────────────────────────────────────────
         out_name = f"{path.stem}_processed_{uuid.uuid4().hex[:8]}.csv"
@@ -336,12 +453,17 @@ class DataLoadingSkill:
             "sample_columns":   sample_cols,
             "metadata_columns": metadata_cols,
             "is_pooled_design": is_pooled,
-            "all_sheets":       all_sheets,   # every sheet, keyed by sheet name
+            "all_sheets":       all_sheets,
         }
         if label_map:
             result["label_map"] = label_map
         if identifier_info is not None:
             result["identifier_info"] = identifier_info
+        if tmt_batches:
+            result["tmt_batches"] = tmt_batches
+            logger.info("TMT batches stored: %s", list(tmt_batches.keys()))
+        if omic_type_hint:
+            result["omic_type"] = omic_type_hint
         return result
 
     # ── Core multi-sheet loader ───────────────────────────────────────────────

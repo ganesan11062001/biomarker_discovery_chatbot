@@ -18,7 +18,7 @@ import json
 import logging
 import re
 from itertools import combinations
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, field_validator
 
@@ -51,7 +51,9 @@ except ImportError:
 _VALID_ACTIONS = {
     "load_data", "run_analysis", "run_all_comparisons",
     "run_enrichment", "run_visualization",
-    "show_code", "modify_code", "query_database", "answer",
+    "show_code", "modify_code", "query_database",
+    "ask_clarification",
+    "answer",
 }
 
 
@@ -70,6 +72,23 @@ class DecisionSchema(BaseModel):
     confidence:      float          = 1.0
     reason:          str            = ""
 
+    # Analysis parameter overrides — extracted from user message when present.
+    # Null means "use the session default"; populated value overrides it.
+    adj_pval_cutoff:   Optional[float] = None   # e.g. 0.01, 0.05, 0.10
+    log2fc_cutoff:     Optional[float] = None   # log2 scale, e.g. 1.0 = 2-fold
+    missing_threshold: Optional[float] = None   # fraction, e.g. 0.5 = 50% allowed missing
+    top_n:             Optional[int]   = None   # number of proteins to report
+
+    # Extended test method — extracted when user explicitly requests a test type
+    test_method:  Optional[str]                     = None  # "welch"|"limma"|"paired_t"|"anova"
+    is_paired:    Optional[bool]                    = None  # True for matched/before-after designs
+    all_groups:   Optional[Dict[str, List[str]]]    = None  # ANOVA: {group: [cols], ...}
+    omic_type:    Optional[str]                     = None  # "proteomics_silac" etc.
+
+    # Clarification question — only used when action == "ask_clarification".
+    # Write a complete, kind, professional question the user sees verbatim.
+    clarification_question: Optional[str]           = None
+
     @field_validator("action")
     @classmethod
     def _validate_action(cls, v: str) -> str:
@@ -82,6 +101,64 @@ class DecisionSchema(BaseModel):
             return max(0.0, min(1.0, float(v)))
         except (TypeError, ValueError):
             return 1.0
+
+    @field_validator("adj_pval_cutoff", mode="before")
+    @classmethod
+    def _clamp_pval(cls, v) -> Optional[float]:
+        if v is None:
+            return None
+        try:
+            return max(1e-6, min(1.0, float(v)))
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator("log2fc_cutoff", mode="before")
+    @classmethod
+    def _clamp_lfc(cls, v) -> Optional[float]:
+        if v is None:
+            return None
+        try:
+            return max(0.0, min(20.0, float(v)))
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator("missing_threshold", mode="before")
+    @classmethod
+    def _clamp_missing(cls, v) -> Optional[float]:
+        if v is None:
+            return None
+        try:
+            return max(0.0, min(1.0, float(v)))
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator("top_n", mode="before")
+    @classmethod
+    def _clamp_topn(cls, v) -> Optional[int]:
+        if v is None:
+            return None
+        try:
+            return max(1, min(5000, int(v)))
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator("test_method", mode="before")
+    @classmethod
+    def _validate_test_method(cls, v) -> Optional[str]:
+        if v is None:
+            return None
+        valid = {"auto", "welch", "limma", "paired_t", "anova"}
+        s = str(v).lower().strip()
+        return s if s in valid else None
+
+    @field_validator("omic_type", mode="before")
+    @classmethod
+    def _validate_omic_type(cls, v) -> Optional[str]:
+        if v is None:
+            return None
+        valid = {"proteomics", "proteomics_pooled", "proteomics_silac"}
+        s = str(v).lower().strip()
+        return s if s in valid else None
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -100,25 +177,150 @@ that drives the pipeline. Choose exactly one action:
   "show_code"           — user wants to see the reproducible analysis code
   "modify_code"         — user wants to change, alter, or extend the analysis code
   "query_database"      — look up protein info, gene names, UniProt annotation, or convert IDs
+  "ask_clarification"   — ask the user a focused, professional question before proceeding
   "answer"              — answer a question, explain something, or have a conversation
+
+Analysis routing — the pipeline automatically selects the right method:
+  • Regular proteomics (CSV or standard Excel, any number of replicates) →
+      Test method auto-selected: limma eBayes for n≤4 per group, Welch t-test for n≥5.
+      If ≥2 samples per group: supervised differential expression (log₂FC, Cohen's d, adj. p-value).
+      If no group labels given: unsupervised CV/MAD/IQR variability ranking.
+  • Pooled n=1 design (MaxQuant Excel with Identifier Info label sheet, one sample per label) →
+      log₂ fold-change across all pairwise contrasts (no p-values, by design).
+  • SILAC data (H/L or H/M ratios detected) → SilacAnalysisSkill (omic_type="proteomics_silac").
+  • DIA/Spectronaut output → automatically reshaped, then ProteomicsAnalysisSkill.
+  • Multi-batch TMT with IRS → IRS normalisation applied automatically when plex structure detected.
+
+TEST METHOD EXTRACTION (populate "test_method" when user explicitly requests one):
+  "limma"    — user says "limma", "moderated t-test", "eBayes", "small n", "few replicates"
+  "welch"    — user says "Welch t-test", "standard t-test", "regular t-test"
+  "paired_t" — user says "paired", "matched samples", "before/after", "pre/post", "same subject"
+  "anova"    — user says "ANOVA", "more than 2 groups", "multiple groups simultaneously", "F-test"
+  Leave null for "auto" (default; pipeline auto-selects limma vs Welch by sample size).
+
+MULTI-GROUP ANOVA (populate "all_groups" when user has >2 groups for ANOVA):
+  When user says "compare WT, KO, and HET" or "ANOVA across all 4 groups":
+    • Set test_method = "anova"
+    • Set all_groups = {"WT": ["WT_1","WT_2"], "KO": ["KO_1","KO_2"], "HET": ["HET_1","HET_2"]}
+    • Leave group1_samples / group2_samples empty
+
+PAIRED DESIGN (set is_paired = true when user describes matched samples):
+  "compare before and after treatment for each patient" → is_paired = true
+  "paired t-test with samples matched by patient ID" → is_paired = true, test_method = "paired_t"
+
+SILAC (set omic_type when user specifies data type):
+  "my data is SILAC" / "heavy/light ratios" → omic_type = "proteomics_silac"
 
 Decision rules (in priority order):
 1.  Questions ("what is X", "explain X", "how does Y work", "what did the analysis find") → "answer"
-2.  Off-topic messages (random forest, Python, general statistics, etc.) → "answer"
+2.  Off-topic messages → "answer"
 3.  No data loaded yet → "answer" (tell user to upload a file first)
 4.  "show code" / "give me the code" / "what code was used" → "show_code"
-5.  "modify the code" / "change threshold" / "alter the script" / "add volcano" → "modify_code"
-6.  "look up proteins" / "get gene names" / "annotate proteins" / "UniProt" / "convert IDs" → "query_database"
-7.  "run analysis" with NO group names AND non-pooled design → "run_all_comparisons"
-8.  "run analysis" / "analyze" with specific group names mentioned → "run_analysis"
-    - Set group1_label, group1_samples, group2_label, group2_samples
-    - Match names to available_columns; leave lists empty if uncertain
-9.  Pathway / enrichment / KEGG / GO → "run_enrichment"
-10. Plot / visualize / chart / heatmap / volcano / report → "run_visualization"
-11. Pooled design "run analysis" → "run_all_comparisons"
+5.  Re-run with new parameter values (see below) → "run_analysis" + fill parameter fields
+6.  "change the code to use X method" / "add a step to the script" → "modify_code"
+7.  "look up proteins" / "get gene names" / "annotate" / "UniProt" / "convert IDs" → "query_database"
+8.  Pathway / enrichment / KEGG / GO → "run_enrichment"
+9.  Plot / visualize / chart / heatmap / volcano / report → "run_visualization"
+10. Pooled design AND "run analysis" with no specific group pair → "run_all_comparisons"
+11. "run analysis" / "analyze" / "find biomarkers" with NO specific group pair named → "run_all_comparisons"
+12. "run analysis" / "analyze" with SPECIFIC group names (e.g. "Disease vs Control") → "run_analysis"
+    - Set group1_label, group1_samples, group2_label, group2_samples from available_columns.
+    - Leave sample lists empty if you cannot confidently match column names.
 
-For "run_analysis" populate groups only when you can confidently match column names.
-Leave group sample lists empty if the user hasn't given enough information.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CLARIFICATION PHILOSOPHY  —  ask the user rather than assume anything uncertain
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You are a professional scientific collaborator. Your primary responsibility is to
+run the *right* analysis, not the fastest one. Whenever anything in the user's
+request or the session data is ambiguous — at any stage of the pipeline — pause
+and ask a clear, focused question before proceeding.
+
+USE "ask_clarification" whenever you are genuinely uncertain about:
+  • Which groups or samples to compare
+  • What experimental design the data represents (paired, independent, time-series)
+  • Which statistical method is most appropriate given the context
+  • How many groups should be analysed and whether simultaneously or pairwise
+  • What a column, label, or parameter means in the user's experiment
+  • Whether a detected data feature (SILAC ratios, TMT batches, pooled design,
+    Spectronaut output) matches the user's actual experiment
+  • What the user wants to do next when their message is ambiguous
+  • Any detail where guessing wrong would produce misleading biological results
+
+This applies across the ENTIRE workflow — data loading, group assignment,
+statistical testing, enrichment, visualisation, and interpretation.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW TO WRITE EVERY CLARIFICATION QUESTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Tone: Kind, warm, professional. Never imply the user did anything wrong.
+Structure:
+  1. One sentence acknowledging what you *can* see or have understood.
+  2. The specific question — concrete, not vague.
+  3. If there are distinct choices, list them as numbered options with a brief
+     explanation of what each one does scientifically.
+  4. A short closing that makes it easy to reply (e.g. "Just let me know!" or
+     "Feel free to reply with whichever fits your experiment.").
+
+Ask only ONE question per turn. If multiple things are unclear, ask about the
+most critical one first and resolve the others in subsequent turns.
+
+Use markdown formatting (bold for key terms, inline code for column names,
+bullet/number lists for options) — the question is shown verbatim in chat.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMON SITUATIONS THAT WARRANT CLARIFICATION (non-exhaustive — use judgement)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+• Groups not specified and column names don't clearly imply them
+• Sample names suggest a paired/longitudinal design (e.g. `Pat1_Pre`, `Pat1_Post`)
+  but the user hasn't confirmed it
+• Three or more groups detected — should analysis be ANOVA or pairwise?
+• SILAC ratio data — single-condition (H/L vs 1) or two-condition (comparing ratios)?
+• Multi-batch TMT detected but no reference channel column can be identified
+• User requests a specific comparison but some named columns don't exist in the data
+• User asks to "re-run with different thresholds" but doesn't specify which thresholds
+• Enrichment requested but no significant proteins from a previous analysis are available
+• Visualisation requested but it's unclear which plot types or which comparison to show
+• Any request where two reasonable interpretations would produce different results
+• User's message is genuinely ambiguous (e.g. "compare the groups" with no prior context)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHEN NOT TO ASK (proceed without clarification)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+• The user's current or recent message already contains the answer
+• The intent is unambiguous and the pipeline can proceed correctly without guessing
+• The user is asking a general question (not requesting an action) — just answer it
+• Pooled MaxQuant design is auto-detected — the routing is determined automatically
+• The user is responding to a clarification you already asked — use their answer now
+• The detail is minor and the default is scientifically reasonable for most cases
+  (e.g. auto-selecting limma for small n is always appropriate — no need to ask)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PARAMETER EXTRACTION (for run_analysis and run_all_comparisons):
+Extract analysis thresholds from the user message and populate the relevant fields.
+Leave a field null if the user did not mention it.
+
+  adj_pval_cutoff   — adjusted p-value / FDR threshold (0.0–1.0)
+    Examples: "p-value < 0.01" → 0.01 | "5% FDR" → 0.05 | "stricter p-value of 0.001" → 0.001
+
+  log2fc_cutoff     — minimum |log₂ fold-change| (already in log2 scale)
+    Examples: "log2FC > 1.5" → 1.5 | "2-fold change" → 1.0 (log2(2)=1) | "FC threshold 2 on log2 scale" → 2.0
+
+  missing_threshold — maximum fraction of missing values allowed per protein (0.0–1.0)
+    Examples: "allow 60% missing" → 0.6 | "require 70% valid values" → 0.3 | "30% missing threshold" → 0.3
+
+  top_n             — number of top proteins/biomarkers to report (integer)
+    Examples: "top 100 proteins" → 100 | "show me 200 results" → 200
+
+IMPORTANT: When the user says "re-run with p<0.01", "change threshold to 0.01 and re-analyze",
+"use stricter cutoffs and run again", or similar → action = "run_analysis" (NOT "modify_code").
+Only use "modify_code" when the user wants to change the code itself (add a step, change an algorithm, etc.)
+that CANNOT be done by adjusting a threshold value.
+
+For "run_analysis" populate groups only when you can confidently match column names to group labels.
 
 OUTPUT: valid JSON only — no markdown fences, no prose, no trailing text.
 {
@@ -129,15 +331,24 @@ OUTPUT: valid JSON only — no markdown fences, no prose, no trailing text.
   "group2_samples": [],
   "requested_plots": [],
   "confidence": 0.95,
-  "reason": "<one sentence explaining the decision>"
+  "reason": "<one sentence explaining the decision>",
+  "adj_pval_cutoff": null,
+  "log2fc_cutoff": null,
+  "missing_threshold": null,
+  "top_n": null,
+  "test_method": null,
+  "is_paired": null,
+  "all_groups": null,
+  "omic_type": null,
+  "clarification_question": null
 }
 
-"confidence" is a float 0.0–1.0 representing how certain you are of this decision.
-The system will automatically demote decisions with confidence < 0.7 to "answer"
-as a safety measure against misrouted pipeline actions.
+For "ask_clarification": set "clarification_question" to the full question text
+(markdown supported). Leave all group/param fields null. Set confidence ≥ 0.9.
 
-For "run_visualization": populate "requested_plots" with the canonical names of plots the user
-specifically asked for (e.g. ["volcano", "pca", "heatmap"]).
+"confidence" is a float 0.0–1.0. Decisions with confidence < 0.7 are auto-demoted to "answer".
+
+For "run_visualization": populate "requested_plots" with canonical plot names the user asked for.
 Leave it empty [] if the user wants all standard plots or was not specific.
 Available plot names: volcano, ma_plot, heatmap, pca, boxplot, sample_correlation,
 cv_distribution, fc_heatmap, topn_bar, rescue_bar, pathway_dotplot.
@@ -283,6 +494,10 @@ class LearningAgent(BaseAgent):
         sample_cols = state.get("sample_columns") or []
         label_map   = state.get("label_map") or {}
         top_bm      = state.get("top_biomarkers") or []
+        g1_samps    = state.get("group1_samples") or []
+        g2_samps    = state.get("group2_samples") or []
+        g1_lbl      = state.get("group1_label") or ""
+        g2_lbl      = state.get("group2_label") or ""
 
         ctx  = "SESSION STATE:\n"
         ctx += f"  data_loaded: {bool(state.get('data_type'))}\n"
@@ -291,17 +506,45 @@ class LearningAgent(BaseAgent):
         ctx += f"  n_samples: {state.get('n_samples', 0)}\n"
         ctx += f"  is_pooled_design: {state.get('is_pooled_design', False)}\n"
         ctx += f"  omic_type: {state.get('omic_type', 'none')}\n"
+        ctx += f"  data_type: {state.get('data_type', 'none')}\n"
         ctx += f"  analysis_complete: {state.get('n_significant') is not None}\n"
         ctx += f"  n_significant: {state.get('n_significant', 'none')}\n"
         ctx += f"  analysis_mode: {state.get('analysis_mode', 'none')}\n"
-        ctx += f"  group1_label: {state.get('group1_label', 'none')}\n"
-        ctx += f"  group2_label: {state.get('group2_label', 'none')}\n"
         ctx += f"  has_analysis_code: {bool(state.get('analysis_code'))}\n"
         ctx += f"  has_plots: {bool(state.get('plot_paths'))}\n"
         ctx += f"  enrichment_done: {bool(state.get('pathways'))}\n"
         ctx += f"  status: {state.get('status', 'ready')}\n"
-        ctx += f"  available_columns (first 20): {sample_cols[:20]}\n"
-        ctx += f"  label_map (pooled groups): {label_map}\n"
+        ctx += f"  is_paired: {state.get('is_paired', False)}\n"
+        ctx += f"  test_method_set: {(state.get('analysis_params') or {}).get('test_method', 'auto')}\n"
+
+        # TMT batch structure hint
+        tmt = state.get("tmt_batches")
+        if tmt:
+            has_ref = all(v.get("reference") for v in tmt.values())
+            ctx += f"  tmt_batches_detected: {list(tmt.keys())} | all_refs_found: {has_ref}\n"
+        else:
+            ctx += "  tmt_batches_detected: none\n"
+
+        # ALL sample columns — the LLM must see these to populate group_samples correctly.
+        ctx += f"  all_sample_columns ({len(sample_cols)} total): {sample_cols[:100]}\n"
+        if label_map:
+            ctx += f"  pooled_label_map: {label_map}\n"
+
+        # Current group assignments (from chat or ingestion auto-detection).
+        if g1_samps or g2_samps:
+            ctx += (
+                f"  currently_assigned_groups:\n"
+                f"    '{g1_lbl}' ({len(g1_samps)} samples): {g1_samps}\n"
+                f"    '{g2_lbl}' ({len(g2_samps)} samples): {g2_samps}\n"
+            )
+        else:
+            ctx += "  currently_assigned_groups: none\n"
+
+        # Inferred group count from column patterns (helps LLM decide on ANOVA vs pairwise)
+        all_groups_state = state.get("all_groups")
+        if all_groups_state:
+            ctx += f"  all_groups_assigned: {list(all_groups_state.keys())}\n"
+
         if top_bm:
             ctx += f"  top_5_biomarkers: {[b.get('protein','') for b in top_bm[:5]]}\n"
 
@@ -348,6 +591,29 @@ class LearningAgent(BaseAgent):
             self.logger.warning("Decision LLM failed (%s) — defaulting to answer.", exc)
             return {"action": "answer", "confidence": 1.0, "reason": "LLM fallback"}
 
+    # ── Group column matching ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _match_columns_by_label(label: str, columns: List[str]) -> List[str]:
+        """
+        Return columns whose names match a group label by prefix or substring.
+
+        Examples
+        --------
+        label="WT",      columns=["WT_1","WT_2","KO_1"] → ["WT_1","WT_2"]
+        label="Control", columns=["ctrl_A","ctrl_B","dis_A"] → ["ctrl_A","ctrl_B"]
+        """
+        if not label or not columns:
+            return []
+        lbl = label.strip().lower()
+        # Exact prefix (most reliable — "WT" → "WT_1")
+        hits = [c for c in columns if c.lower().startswith(lbl)]
+        if hits:
+            return hits
+        # Substring (fallback — "control" → "sample_control_1")
+        hits = [c for c in columns if lbl in c.lower()]
+        return hits
+
     # ── Group inference ───────────────────────────────────────────────────────
 
     def _infer_groups(self, sample_columns: List[str]) -> Dict[str, List[str]]:
@@ -374,25 +640,32 @@ class LearningAgent(BaseAgent):
 
     def _run_all_comparisons(self, state: BiomarkerState) -> BiomarkerState:
         """
-        Run BiomarkerAgent for every pair of detected groups.
-        Pooled designs delegate to PooledFoldChangeSkill (covers all contrasts).
+        Route to the appropriate analysis for the loaded data:
+
+        • Pooled n=1 design (is_pooled_design=True, no replicates):
+          Delegate entirely to BiomarkerAgent → PooledFoldChangeSkill.
+          That skill computes all pairwise log₂FC contrasts in a single pass.
+
+        • Standard proteomics (replicated groups):
+          Infer groups from column names, then run Welch t-test + BH FDR for
+          every pairwise combination via ProteomicsAnalysisSkill.
         """
         is_pooled = state.get("is_pooled_design") or state.get("omic_type") == "proteomics_pooled"
 
+        # For truly pooled n=1 designs, PooledFoldChangeSkill handles everything
         if is_pooled:
             label_map = state.get("label_map") or {}
             groups = list(label_map.values()) if label_map else ["all groups"]
-            contrast_preview = " · ".join(groups)
             state["messages"].append({
                 "role": "assistant",
                 "content": (
-                    f"Pooled design detected — running log₂ fold-change analysis "
-                    f"across all contrasts for groups: **{contrast_preview}** …"
+                    f"Pooled n=1 design detected. Running log₂ fold-change analysis "
+                    f"across all pairwise contrasts for groups: **{', '.join(groups)}** …"
                 ),
             })
             return self._specialist("biomarker").run(state)
 
-        # Non-pooled: infer groups from column names
+        # Standard replicated proteomics — infer groups and run pairwise DEA
         sample_cols = state.get("sample_columns") or []
         groups = self._infer_groups(sample_cols)
 
@@ -401,22 +674,27 @@ class LearningAgent(BaseAgent):
                 "role": "assistant",
                 "content": (
                     "I couldn't automatically detect groups from your column names. "
-                    "Please assign **Group 1** and **Group 2** in the sidebar and click "
-                    "**▶ Run Analysis**, or type something like: "
-                    "*'compare WT_1, WT_2, WT_3 vs KO_1, KO_2, KO_3'*."
+                    "Please tell me which groups to compare, e.g.: "
+                    "*'compare Control_1, Control_2, Control_3 vs Disease_1, Disease_2, Disease_3'*."
                 ),
             })
             return state
 
         group_names = list(groups.keys())
         pairs = list(combinations(group_names, 2))
-        summary_lines = [
-            f"Running **{len(pairs)} pairwise comparisons** across "
-            f"{len(group_names)} groups: {', '.join(group_names)}\n"
-        ]
+        state["messages"].append({
+            "role": "assistant",
+            "content": (
+                f"Running standard proteomics differential expression analysis "
+                f"(**{len(pairs)} pairwise comparisons** across {len(group_names)} groups: "
+                f"{', '.join(group_names)}).\n\n"
+                f"Pipeline: log₂ transform → median normalisation → group-aware filter "
+                f"→ half-min imputation → Welch t-test → BH FDR."
+            ),
+        })
 
         biomarker = self._specialist("biomarker")
-        last_n_sig = 0
+        summary_lines: List[str] = []
 
         for g1_name, g2_name in pairs:
             state["group1_label"]   = g1_name
@@ -424,10 +702,11 @@ class LearningAgent(BaseAgent):
             state["group2_label"]   = g2_name
             state["group2_samples"] = groups[g2_name]
             state["analysis_mode"]  = "supervised"
+            # Force standard proteomics analysis regardless of what was loaded
+            state["omic_type"]      = "proteomics"
 
             state = biomarker.run(state)
             n_sig = state.get("n_significant", 0)
-            last_n_sig = n_sig
             top3 = [b.get("protein", "") for b in (state.get("top_biomarkers") or [])[:3]]
             summary_lines.append(
                 f"- **{g1_name} vs {g2_name}**: {n_sig} significant | "
@@ -436,7 +715,7 @@ class LearningAgent(BaseAgent):
 
         state["messages"].append({
             "role": "assistant",
-            "content": "\n".join(summary_lines),
+            "content": "**All pairwise comparisons complete:**\n" + "\n".join(summary_lines),
         })
         return state
 
@@ -714,6 +993,42 @@ class LearningAgent(BaseAgent):
         state["intent"]       = action
         state["active_agent"] = "learning_agent"
 
+        # ── Capture analysis parameter overrides from the decision ─────────────
+        # Merge any non-null params from this decision into the session overrides.
+        # Existing overrides are preserved so values set in earlier turns carry
+        # forward until the user explicitly changes them.
+        _param_keys = (
+            "adj_pval_cutoff", "log2fc_cutoff", "missing_threshold", "top_n",
+            "test_method",
+        )
+        new_params = {k: decision[k] for k in _param_keys
+                      if k in decision and decision[k] is not None}
+        if new_params:
+            existing = dict(state.get("analysis_params") or {})
+            existing.update(new_params)
+            state["analysis_params"] = existing
+            self.logger.info("Analysis params updated: %s", existing)
+
+        # ── Persist state-level fields from decision ──────────────────────────
+        if decision.get("is_paired") is not None:
+            state["is_paired"] = bool(decision["is_paired"])
+        if decision.get("all_groups"):
+            state["all_groups"] = decision["all_groups"]
+        if decision.get("omic_type"):
+            state["omic_type"] = decision["omic_type"]
+
+        # ── Clarification question ────────────────────────────────────────────
+        if action == "ask_clarification":
+            question = (
+                decision.get("clarification_question")
+                or decision.get("reason")
+                or "Could you provide a bit more detail so I can run the most appropriate analysis for you?"
+            )
+            state["messages"].append({"role": "assistant", "content": question})
+            state["status"] = "awaiting_clarification"
+            self.logger.info("Clarification requested; awaiting user reply.")
+            return state
+
         # ── Load data ─────────────────────────────────────────────────────────
         if action == "load_data":
             return self._specialist("ingestion").run(state)
@@ -724,11 +1039,52 @@ class LearningAgent(BaseAgent):
             g1_samples = decision.get("group1_samples") or []
             g2_label   = decision.get("group2_label")
             g2_samples = decision.get("group2_samples") or []
+            all_cols   = state.get("sample_columns") or []
+
+            # Fallback: LLM gave group labels but couldn't match column names →
+            # try pattern-matching the label against actual column names.
+            if g1_label and not g1_samples:
+                g1_samples = self._match_columns_by_label(g1_label, all_cols)
+                if g1_samples:
+                    self.logger.info(
+                        "Pattern-matched '%s' → %s", g1_label, g1_samples
+                    )
+            if g2_label and not g2_samples:
+                g2_samples = self._match_columns_by_label(g2_label, all_cols)
+                if g2_samples:
+                    self.logger.info(
+                        "Pattern-matched '%s' → %s", g2_label, g2_samples
+                    )
+
             if g1_samples and g2_samples:
+                # Successfully identified both groups — update state and run
                 state["group1_label"]   = g1_label or "Group1"
                 state["group1_samples"] = g1_samples
                 state["group2_label"]   = g2_label or "Group2"
                 state["group2_samples"] = g2_samples
+
+            elif (g1_label or g2_label) and not (
+                (state.get("group1_samples") or []) and (state.get("group2_samples") or [])
+            ):
+                # User asked for a specific comparison but we have no group assignments.
+                # Ask for clarification instead of silently running unsupervised.
+                preview = all_cols[:15]
+                more    = f" … (+{len(all_cols)-15} more)" if len(all_cols) > 15 else ""
+                state["messages"].append({
+                    "role": "assistant",
+                    "content": (
+                        f"I couldn't automatically match the group names you specified "
+                        f"(**{g1_label}** / **{g2_label}**) to sample column names.\n\n"
+                        f"Available columns: `{preview}{more}`\n\n"
+                        "Please type the exact column names, e.g.:\n"
+                        "*'compare Control_1, Control_2, Control_3 vs "
+                        "Disease_1, Disease_2, Disease_3'*"
+                    ),
+                })
+                state["status"] = "answered"
+                return state
+
+            # Groups resolved (either from this turn or already in state) → run analysis
             return self._specialist("biomarker").run(state)
 
         # ── All pairwise comparisons ───────────────────────────────────────────
