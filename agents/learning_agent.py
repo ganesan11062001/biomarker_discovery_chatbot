@@ -153,17 +153,36 @@ You have deep knowledge of:
 - General science, machine learning, and statistics
 
 ANTI-HALLUCINATION RULES (strictly enforced):
-1. When referencing this session's results, ONLY cite proteins, fold-change values,
-   p-values, and pathways that are explicitly listed in the session context below.
-2. If you are asked for a specific value (e.g. "what is the fold-change of PROTEIN_X")
-   and it is NOT in the session data, say "that value is not in the current results"
-   rather than estimating or fabricating it.
-3. For off-topic / general science questions (not about this session's data),
-   answer freely and accurately from your training knowledge — the grounding
-   rule applies only to session-specific claims.
-4. Do NOT invent protein names, gene symbols, accession IDs, or pathway names
-   that are not grounded in the session context or your training knowledge.
-5. Use markdown formatting. Be concise and precise.
+
+RULE 1 — SESSION DATA IS THE ONLY SOURCE OF TRUTH FOR "MY" QUESTIONS:
+  When the user asks anything about their uploaded data — including but not limited to:
+    "describe my data", "what samples do I have", "what groups were detected",
+    "how many proteins", "summarize my dataset", "what is in my file",
+    "what did the analysis find", "what are my top biomarkers"
+  — you MUST answer ONLY from the session context provided below.
+  Do NOT supplement, guess, or fill gaps with general proteomics knowledge.
+  If the session context does not contain the answer, say:
+    "I don't have that information yet — [action needed, e.g. run analysis first]."
+  Never describe what a "typical" proteomics dataset looks like as if it were the user's data.
+
+RULE 2 — GROUNDED RESULTS ONLY:
+  When referencing analysis results (proteins, fold-change values, p-values, pathways),
+  ONLY cite values explicitly listed in the grounded data sections of the session context.
+  If a specific value is not in the session data, say "that value is not in the current results."
+
+RULE 3 — GENERAL SCIENCE QUESTIONS ARE FREE:
+  For questions that are clearly general / off-topic (not about the user's specific file
+  or session), answer freely from your training knowledge. Examples: "what is a t-test?",
+  "how does KEGG enrichment work?", "explain PCA". These do NOT involve the user's data.
+
+RULE 4 — NO INVENTED IDENTIFIERS:
+  Do NOT invent protein names, gene symbols, accession IDs, or pathway names
+  that are not grounded in the session context or your verified training knowledge.
+
+RULE 5 — FORMAT:
+  Use markdown formatting. Be concise and precise. For session-data summaries,
+  present actual numbers from the context (n_proteins, n_samples, sample_columns, etc.)
+  rather than generic descriptions.
 """
 
 _GROUP_INFERENCE_PROMPT = """\
@@ -581,35 +600,56 @@ class LearningAgent(BaseAgent):
             cannot fabricate protein names or statistics that differ from what
             was computed.
         """
-        ctx = ["## Session context"]
+        ctx = ["## Session context (ONLY use this when answering questions about the user's data)"]
         if state.get("data_type"):
+            sample_cols = state.get("sample_columns") or []
+            label_map   = state.get("label_map") or {}
+            g1          = state.get("group1_label")
+            g2          = state.get("group2_label")
+            g1_samps    = state.get("group1_samples") or []
+            g2_samps    = state.get("group2_samples") or []
+
             ctx += [
-                f"- Data loaded: YES — {state.get('n_proteins','?')} proteins, "
-                f"{state.get('n_samples','?')} samples, type={state.get('data_type','?')}",
+                f"- Data loaded: YES",
+                f"- Proteins: {state.get('n_proteins','?')}",
+                f"- Samples: {state.get('n_samples','?')}",
+                f"- Data type: {state.get('data_type','?')}",
                 f"- Omic type: {state.get('omic_type','proteomics')}",
                 f"- Pooled design: {state.get('is_pooled_design', False)}",
-                f"- Groups: {state.get('label_map') or {state.get('group1_label'): 'g1', state.get('group2_label'): 'g2'}}",
-                f"- Organism: {state.get('organism', 'unknown')}",
+                f"- Organism: {state.get('organism', 'not set')}",
                 f"- Disease program: {state.get('disease_program', 'General')}",
+                f"- Sample columns (first 20): {sample_cols[:20]}",
             ]
+            if label_map:
+                ctx.append(f"- Pooled groups (label map): { {k: v for k, v in label_map.items()} }")
+            elif g1 and g2:
+                ctx += [
+                    f"- Group 1: {g1} — {len(g1_samps)} samples: {g1_samps}",
+                    f"- Group 2: {g2} — {len(g2_samps)} samples: {g2_samps}",
+                ]
+            else:
+                ctx.append("- Groups: not yet assigned")
+
             if state.get("n_significant") is not None:
                 top5 = [b.get("protein","") for b in (state.get("top_biomarkers") or [])[:5]]
                 ctx += [
                     "- Analysis complete: YES",
                     f"- Significant biomarkers: {state.get('n_significant')}",
-                    f"- Top 5: {top5}",
+                    f"- Top 5 proteins: {top5}",
                     f"- Method: {state.get('analysis_mode','?')} mode",
-                    f"- Comparison: {state.get('group1_label','?')} vs {state.get('group2_label','?')}",
+                    f"- Comparison: {g1 or '?'} vs {g2 or '?'}",
                 ]
             else:
-                ctx.append("- Analysis complete: NO")
+                ctx.append("- Analysis complete: NO — analysis has not been run yet")
             if state.get("pathways"):
                 top3pw = [p.get("pathway","") for p in state["pathways"][:3]]
                 ctx.append(f"- Enrichment done: YES — top pathways: {top3pw}")
+            else:
+                ctx.append("- Enrichment done: NO")
             if state.get("plot_paths"):
                 ctx.append(f"- Plots generated: {len(state['plot_paths'])}")
         else:
-            ctx.append("- Data loaded: NO")
+            ctx.append("- Data loaded: NO — user has not uploaded a file yet")
 
         # ── Grounding anchor: inject actual values so LLM cannot hallucinate ──
         # This is the primary hallucination guard for session-specific claims.

@@ -439,14 +439,13 @@ class DataLoadingSkill:
                         sheet_name, label_map,
                     )
 
-        # Fallback label map if any expression sheet exists but no map found
-        if expression_sheets and label_map is None:
-            label_map = _FALLBACK_LABEL_MAP
-            logger.info("Using fallback label map: %s", label_map)
-            # Use first metadata sheet as identifier_info if available
-            if metadata_sheets:
-                identifier_info = all_sheets[metadata_sheets[0][0]]
+        # Only use identifier_info from the first metadata sheet (no fake label_map)
+        if label_map is None and metadata_sheets:
+            identifier_info = all_sheets[metadata_sheets[0][0]]
 
+        # is_pooled only when a real label_map was extracted from the file.
+        # The old fallback to _FALLBACK_LABEL_MAP caused every Excel file to be
+        # misclassified as a pooled DMD design and routed to PooledFoldChangeSkill.
         is_pooled = label_map is not None
         return primary_df, label_map, is_pooled, identifier_info, all_sheets
 
