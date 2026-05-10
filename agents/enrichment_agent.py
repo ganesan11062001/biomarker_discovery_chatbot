@@ -12,10 +12,22 @@ import logging
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
 from core.state import BiomarkerState
+from core.tracing import get_enrichment_metadata
 from skills.run_enrichment import PathwaySkill
 
 settings = get_settings()
 logger   = logging.getLogger(__name__)
+
+# ── LangSmith @traceable (graceful no-op if not installed) ───────────────────
+try:
+    from langsmith import traceable as _traceable
+    from langsmith.run_helpers import get_current_run_tree as _get_run_tree
+except ImportError:
+    def _traceable(**_kw):          # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap
+    def _get_run_tree():            # type: ignore[misc]
+        return None
 
 
 class EnrichmentAgent(BaseAgent):
@@ -33,7 +45,15 @@ class EnrichmentAgent(BaseAgent):
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
+    @_traceable(run_type="chain", name="agent.enrichment",
+                tags=["biomarker-discovery", "enrichment"])
     def run(self, state: BiomarkerState) -> BiomarkerState:
+        rt = _get_run_tree()
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update(get_enrichment_metadata(state))
+            except Exception:
+                pass
         protein_source = state.get("top_biomarkers") or state.get("top_proteins")
 
         if not protein_source:
@@ -75,6 +95,15 @@ class EnrichmentAgent(BaseAgent):
                 result.get("n_go_significant", 0),
             )
 
+            rt = _get_run_tree()
+            if rt is not None:
+                try:
+                    rt.extra.setdefault("metadata", {}).update(
+                        get_enrichment_metadata(state, result)
+                    )
+                except Exception:
+                    pass
+
         except Exception as exc:
             logger.exception("Pathway enrichment failed: %s", exc)
             state["status"]        = "error"
@@ -86,6 +115,8 @@ class EnrichmentAgent(BaseAgent):
 
     # ── LLM summary ───────────────────────────────────────────────────────────
 
+    @_traceable(run_type="chain", name="enrichment.summary",
+                tags=["biomarker-discovery", "enrichment"])
     def _llm_enrichment_summary(self, result: dict, state: BiomarkerState) -> str:
         top5 = result.get("top_pathways", [])[:5]
         pathway_lines = "\n".join(

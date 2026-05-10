@@ -20,10 +20,22 @@ from typing import Dict, List
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
 from core.state import BiomarkerState
+from core.tracing import get_ingestion_metadata
 from skills.load_data import DataLoadingSkill
 
 logger   = logging.getLogger(__name__)
 settings = get_settings()
+
+# ── LangSmith @traceable (graceful no-op if not installed) ───────────────────
+try:
+    from langsmith import traceable as _traceable
+    from langsmith.run_helpers import get_current_run_tree as _get_run_tree
+except ImportError:
+    def _traceable(**_kw):          # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap
+    def _get_run_tree():            # type: ignore[misc]
+        return None
 
 PROCESSED_DIR = Path("data/processed")
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,7 +81,15 @@ class IngestionAgent(BaseAgent):
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
+    @_traceable(run_type="chain", name="agent.ingestion",
+                tags=["biomarker-discovery", "ingestion"])
     def run(self, state: BiomarkerState) -> BiomarkerState:
+        rt = _get_run_tree()
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update(get_ingestion_metadata(state))
+            except Exception:
+                pass
         data_path   = state.get("data_path")
         data_format = state.get("data_format", "csv")
 
@@ -155,10 +175,23 @@ class IngestionAgent(BaseAgent):
             result["n_proteins"], result["n_samples"], is_pooled,
             list(inferred_groups.keys()) if inferred_groups else label_map,
         )
+
+        # Update span metadata with post-load values
+        rt = _get_run_tree()
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update(
+                    get_ingestion_metadata(state, result)
+                )
+            except Exception:
+                pass
+
         return state
 
     # ── Group inference ───────────────────────────────────────────────────────
 
+    @_traceable(run_type="chain", name="ingestion.group_inference",
+                tags=["biomarker-discovery", "ingestion"])
     def _infer_groups(self, sample_columns: List[str]) -> Dict[str, List[str]]:
         prompt = _GROUP_INFERENCE_PROMPT + f"\nColumn names:\n{sample_columns}"
         messages = [

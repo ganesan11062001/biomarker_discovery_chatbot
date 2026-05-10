@@ -1,11 +1,10 @@
 """
-ui/app.py  —  BiomarkerAI  (ChatGPT-style interface)
+ui/app.py  —  BiomarkerAI  (BioSpace modern UI)
 """
 from __future__ import annotations
 
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -27,244 +26,491 @@ st.set_page_config(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CSS  — ChatGPT look
+# CSS  —  BioSpace Theme
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-/* ── Reset Streamlit defaults ── */
+/* ── Reset ── */
 #MainMenu, footer, header { visibility: hidden; }
-.stDeployButton { display: none; }
-[data-testid="stToolbar"] { display: none; }
+.stDeployButton, [data-testid="stToolbar"] { display: none; }
 
 /* ── Page background ── */
-.stApp { background: #212121; }
-[data-testid="stMain"] { background: #212121; }
+.stApp {
+    background: linear-gradient(160deg, #060b18 0%, #0b1428 55%, #0d1a2f 100%) !important;
+    min-height: 100vh;
+}
+[data-testid="stMain"] { background: transparent !important; }
+[data-testid="stAppViewBlockContainer"] { padding-top: 1rem !important; }
 
-/* ── Sidebar (dark) ── */
+/* ── Sidebar ── */
 [data-testid="stSidebar"] {
-    background: #171717 !important;
-    border-right: 1px solid #2f2f2f;
+    background: #08101e !important;
+    border-right: 1px solid rgba(255,255,255,0.06) !important;
 }
-[data-testid="stSidebar"] * { color: #ececec !important; }
-[data-testid="stSidebar"] .stSelectbox label,
-[data-testid="stSidebar"] .stTextInput label,
-[data-testid="stSidebar"] .stMultiSelect label { color: #8e8ea0 !important; font-size:0.78rem !important; }
-[data-testid="stSidebar"] [data-testid="stSelectbox"] > div > div,
-[data-testid="stSidebar"] [data-testid="stTextInput"] > div > div > input {
-    background: #2f2f2f !important;
-    border: 1px solid #3f3f3f !important;
-    color: #ececec !important;
-    border-radius: 8px !important;
+[data-testid="stSidebar"] > div { padding: 0 0.8rem !important; }
+[data-testid="stSidebar"] * { color: #cbd5e1 !important; }
+
+/* ── Brand ── */
+.brand-wrap {
+    padding: 18px 4px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    margin-bottom: 14px;
 }
-[data-testid="stSidebar"] [data-testid="stMultiSelect"] > div {
-    background: #2f2f2f !important;
-    border: 1px solid #3f3f3f !important;
-    border-radius: 8px !important;
+.brand-name {
+    font-size: 1.15rem;
+    font-weight: 800;
+    background: linear-gradient(120deg, #38bdf8, #818cf8);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    letter-spacing: -0.5px;
+    display: block;
 }
-[data-testid="stSidebar"] hr { border-color: #2f2f2f !important; }
-[data-testid="stSidebar"] .stMetric { background: #2a2a2a; border-radius:8px; padding:8px 12px; }
-[data-testid="stSidebar"] [data-testid="stMetricValue"] { color: #ececec !important; font-size:1.2rem !important; }
-[data-testid="stSidebar"] [data-testid="stMetricLabel"] { color: #8e8ea0 !important; font-size:0.72rem !important; }
+.brand-tag {
+    font-size: 0.67rem;
+    color: #475569 !important;
+    letter-spacing: 0.6px;
+    display: block;
+    margin-top: 2px;
+}
+
+/* ── Section header ── */
+.sh {
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: #475569 !important;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    margin: 14px 0 7px;
+    display: block;
+}
+
+/* ── Glass card ── */
+.gcard {
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+}
+
+/* ── Metric chips ── */
+.mchips { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin: 6px 0 10px; }
+.mchip {
+    background: rgba(56,189,248,0.05);
+    border: 1px solid rgba(56,189,248,0.12);
+    border-radius: 10px;
+    padding: 9px 10px;
+    text-align: center;
+}
+.mchip-val {
+    display: block;
+    font-size: 1.25rem;
+    font-weight: 700;
+    background: linear-gradient(120deg, #38bdf8, #818cf8);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    line-height: 1.2;
+}
+.mchip-lbl {
+    display: block;
+    font-size: 0.63rem;
+    color: #475569 !important;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 2px;
+}
+
+/* ── Badge chip (data type) ── */
+.dtype-badge {
+    display: inline-block;
+    background: rgba(129,140,248,0.1);
+    border: 1px solid rgba(129,140,248,0.25);
+    border-radius: 6px;
+    padding: 2px 10px;
+    font-size: 0.7rem;
+    color: #818cf8 !important;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+/* ── Pipeline steps ── */
+.pipeline { display: flex; flex-direction: column; gap: 5px; margin: 4px 0; }
+.pstep {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 11px;
+    border-radius: 9px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    transition: all 0.2s;
+}
+.pstep.done {
+    background: rgba(52,211,153,0.07);
+    border: 1px solid rgba(52,211,153,0.18);
+    color: #34d399 !important;
+}
+.pstep.running {
+    background: rgba(56,189,248,0.07);
+    border: 1px solid rgba(56,189,248,0.22);
+    color: #38bdf8 !important;
+}
+.pstep.idle {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.06);
+    color: #334155 !important;
+}
+.pdot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.pdot.done { background: #34d399; box-shadow: 0 0 6px #34d399; }
+.pdot.running {
+    background: #38bdf8;
+    box-shadow: 0 0 8px #38bdf8;
+    animation: blink 1.6s ease-in-out infinite;
+}
+.pdot.idle { background: #1e293b; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+/* ── Session chip ── */
+.session-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 20px;
+    padding: 3px 10px;
+    font-size: 0.67rem;
+    color: #475569 !important;
+    margin-bottom: 10px;
+}
+.session-dot { width: 5px; height: 5px; border-radius: 50%; background: #34d399; box-shadow: 0 0 5px #34d399; }
 
 /* ── Sidebar buttons ── */
 [data-testid="stSidebar"] .stButton > button {
-    background: #2f2f2f !important;
-    color: #ececec !important;
-    border: 1px solid #3f3f3f !important;
-    border-radius: 8px !important;
-    font-size: 0.82rem !important;
-    padding: 6px 12px !important;
+    background: rgba(255,255,255,0.03) !important;
+    color: #94a3b8 !important;
+    border: 1px solid rgba(255,255,255,0.07) !important;
+    border-radius: 9px !important;
+    font-size: 0.8rem !important;
+    font-weight: 500 !important;
+    padding: 7px 13px !important;
     width: 100%;
     text-align: left;
-    transition: background 0.15s;
+    transition: all 0.18s;
 }
-[data-testid="stSidebar"] .stButton > button:hover { background: #3a3a3a !important; }
+[data-testid="stSidebar"] .stButton > button:hover {
+    border-color: rgba(56,189,248,0.3) !important;
+    background: rgba(56,189,248,0.05) !important;
+    color: #38bdf8 !important;
+}
 [data-testid="stSidebar"] .stButton > button[kind="primary"] {
-    background: #10a37f !important;
-    border-color: #10a37f !important;
-    color: #fff !important;
-    border-radius: 8px !important;
+    background: linear-gradient(135deg, rgba(56,189,248,0.12), rgba(129,140,248,0.12)) !important;
+    border: 1px solid rgba(56,189,248,0.35) !important;
+    color: #38bdf8 !important;
+    font-weight: 600 !important;
 }
-[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover { background: #0d8a6b !important; }
+[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
+    background: linear-gradient(135deg, rgba(56,189,248,0.2), rgba(129,140,248,0.2)) !important;
+    box-shadow: 0 2px 16px rgba(56,189,248,0.18) !important;
+}
 [data-testid="stSidebar"] .stDownloadButton > button {
-    background: #10a37f !important;
+    background: linear-gradient(135deg, #38bdf8, #818cf8) !important;
     color: #fff !important;
     border: none !important;
+    border-radius: 9px !important;
+    font-weight: 700 !important;
+    width: 100%;
+    box-shadow: 0 2px 14px rgba(56,189,248,0.28);
+    font-size: 0.82rem !important;
+}
+
+/* ── Sidebar form controls ── */
+[data-testid="stSidebar"] label {
+    color: #475569 !important;
+    font-size: 0.73rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.6px !important;
+}
+[data-testid="stSidebar"] [data-testid="stSelectbox"] > div > div {
+    background: rgba(255,255,255,0.03) !important;
+    border: 1px solid rgba(255,255,255,0.08) !important;
+    color: #cbd5e1 !important;
     border-radius: 8px !important;
     font-size: 0.82rem !important;
-    width: 100%;
+}
+[data-testid="stSidebar"] [data-testid="stTextInput"] > div > div > input {
+    background: rgba(255,255,255,0.03) !important;
+    border: 1px solid rgba(255,255,255,0.08) !important;
+    color: #cbd5e1 !important;
+    border-radius: 8px !important;
+    font-size: 0.82rem !important;
+}
+[data-testid="stSidebar"] [data-testid="stMultiSelect"] > div {
+    background: rgba(255,255,255,0.03) !important;
+    border: 1px solid rgba(255,255,255,0.08) !important;
+    border-radius: 8px !important;
+    font-size: 0.82rem !important;
+}
+[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.05) !important; margin: 10px 0 !important; }
+[data-testid="stSidebar"] .stMetric { background: transparent !important; }
+[data-testid="stSidebar"] .stAlert {
+    border-radius: 9px !important;
+    font-size: 0.78rem !important;
 }
 
-/* ── Main chat column background ── */
-.main-chat-col {
-    max-width: 780px;
-    margin: 0 auto;
-    padding-bottom: 100px;
+/* ── Expanders in sidebar ── */
+[data-testid="stSidebar"] [data-testid="stExpander"] {
+    background: rgba(255,255,255,0.02) !important;
+    border: 1px solid rgba(255,255,255,0.06) !important;
+    border-radius: 9px !important;
 }
 
-/* ── Chat message bubbles ── */
+/* ── Main chat messages ── */
 [data-testid="stChatMessage"] {
     background: transparent !important;
     border: none !important;
-    padding: 2px 0 !important;
+    padding: 3px 0 !important;
 }
-/* User bubble */
-[data-testid="stChatMessage"][data-testid*="user"],
-.stChatMessage:has([data-testid="chatAvatarIcon-user"]) {
-    background: transparent !important;
-}
-/* User bubble pill */
+/* User message */
 [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) > div:last-child {
-    background: #2f2f2f !important;
-    border-radius: 18px 18px 4px 18px !important;
+    background: rgba(56,189,248,0.05) !important;
+    border: 1px solid rgba(56,189,248,0.14) !important;
+    border-radius: 18px 18px 5px 18px !important;
     padding: 12px 18px !important;
-    max-width: 80% !important;
+    max-width: 78% !important;
     margin-left: auto !important;
-    color: #ececec !important;
+    backdrop-filter: blur(8px);
 }
-/* Assistant bubble */
+/* Assistant message */
 [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) > div:last-child {
     background: transparent !important;
     padding: 4px 0 !important;
-    color: #ececec !important;
+}
+/* Avatar icon */
+[data-testid="chatAvatarIcon-assistant"] {
+    background: linear-gradient(135deg, rgba(56,189,248,0.15), rgba(129,140,248,0.15)) !important;
+    border: 1px solid rgba(56,189,248,0.22) !important;
+    border-radius: 50% !important;
 }
 
-/* ── Markdown inside messages ── */
+/* ── Text in messages ── */
 [data-testid="stChatMessage"] p,
 [data-testid="stChatMessage"] li,
-[data-testid="stChatMessage"] td { color: #ececec !important; font-size: 0.95rem; line-height:1.65; }
-[data-testid="stChatMessage"] h1,[data-testid="stChatMessage"] h2,
-[data-testid="stChatMessage"] h3,[data-testid="stChatMessage"] h4 {
-    color: #ececec !important; margin-top: 0.8rem; margin-bottom: 0.3rem;
-}
+[data-testid="stChatMessage"] td { color: #cbd5e1 !important; font-size: 0.94rem; line-height: 1.75; }
+[data-testid="stChatMessage"] h1,
+[data-testid="stChatMessage"] h2,
+[data-testid="stChatMessage"] h3,
+[data-testid="stChatMessage"] h4 { color: #e2e8f0 !important; margin: 0.8rem 0 0.3rem; }
+[data-testid="stChatMessage"] strong { color: #f1f5f9 !important; }
+[data-testid="stChatMessage"] em { color: #94a3b8 !important; }
 [data-testid="stChatMessage"] code {
-    background: #2f2f2f !important;
-    color: #e2e2e2 !important;
-    border-radius: 4px;
-    padding: 1px 5px;
-    font-size: 0.85em;
+    background: rgba(56,189,248,0.08) !important;
+    color: #38bdf8 !important;
+    border: 1px solid rgba(56,189,248,0.18) !important;
+    border-radius: 5px;
+    padding: 1px 6px;
+    font-size: 0.84em;
 }
 [data-testid="stChatMessage"] pre {
-    background: #1e1e1e !important;
-    border: 1px solid #3a3a3a !important;
-    border-radius: 10px !important;
-    padding: 14px 16px !important;
+    background: rgba(6,11,24,0.7) !important;
+    border: 1px solid rgba(56,189,248,0.12) !important;
+    border-radius: 12px !important;
+    padding: 16px 18px !important;
+    backdrop-filter: blur(8px);
 }
-[data-testid="stChatMessage"] table {
-    border-collapse: collapse;
-    width: 100%;
-    font-size: 0.88rem;
-}
+[data-testid="stChatMessage"] table { border-collapse: collapse; width: 100%; font-size: 0.87rem; }
 [data-testid="stChatMessage"] th {
-    background: #2f2f2f !important;
-    color: #ececec !important;
-    padding: 7px 12px;
-    text-align: left;
-    border: 1px solid #3a3a3a;
+    background: rgba(56,189,248,0.07) !important;
+    color: #38bdf8 !important;
+    padding: 8px 14px;
+    border: 1px solid rgba(56,189,248,0.12);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 700;
 }
 [data-testid="stChatMessage"] td {
-    padding: 6px 12px;
-    border: 1px solid #2f2f2f;
-    color: #d0d0d0 !important;
+    padding: 7px 14px;
+    border: 1px solid rgba(255,255,255,0.05);
+    color: #cbd5e1 !important;
 }
-[data-testid="stChatMessage"] tr:nth-child(even) td { background: #262626; }
-[data-testid="stChatMessage"] hr { border-color: #3a3a3a !important; }
-[data-testid="stChatMessage"] strong { color: #fff !important; }
+[data-testid="stChatMessage"] tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
+[data-testid="stChatMessage"] hr { border-color: rgba(255,255,255,0.07) !important; }
+[data-testid="stChatMessage"] blockquote {
+    border-left: 3px solid #38bdf8 !important;
+    margin: 0;
+    padding: 4px 14px;
+    background: rgba(56,189,248,0.04);
+    border-radius: 0 8px 8px 0;
+    color: #94a3b8 !important;
+}
 
-/* ── Chat input bar ── */
+/* ── Chat input ── */
 [data-testid="stChatInput"] {
-    background: #2f2f2f !important;
-    border: 1px solid #3a3a3a !important;
+    background: rgba(255,255,255,0.03) !important;
+    border: 1px solid rgba(255,255,255,0.08) !important;
     border-radius: 16px !important;
+    transition: all 0.2s;
+}
+[data-testid="stChatInput"]:focus-within {
+    border-color: rgba(56,189,248,0.4) !important;
+    box-shadow: 0 0 0 3px rgba(56,189,248,0.07), 0 0 20px rgba(56,189,248,0.1) !important;
 }
 [data-testid="stChatInput"] textarea {
     background: transparent !important;
-    color: #ececec !important;
-    font-size: 0.95rem !important;
+    color: #e2e8f0 !important;
+    font-size: 0.94rem !important;
 }
-[data-testid="stChatInput"] textarea::placeholder { color: #8e8ea0 !important; }
-[data-testid="stChatInput"] button { color: #8e8ea0 !important; }
-[data-testid="stChatInput"] button:hover { color: #ececec !important; }
+[data-testid="stChatInput"] textarea::placeholder { color: #475569 !important; }
+[data-testid="stChatInput"] button { color: #475569 !important; }
+[data-testid="stChatInput"] button:hover { color: #38bdf8 !important; }
 
-/* ── File uploader (attachment) ── */
+/* ── File uploader ── */
 [data-testid="stFileUploader"] {
-    background: #2f2f2f !important;
-    border: 1.5px dashed #4a4a4a !important;
+    background: rgba(56,189,248,0.02) !important;
+    border: 1.5px dashed rgba(56,189,248,0.2) !important;
+    border-radius: 12px !important;
+    transition: all 0.2s;
+}
+[data-testid="stFileUploader"]:hover {
+    border-color: rgba(56,189,248,0.45) !important;
+    background: rgba(56,189,248,0.04) !important;
+}
+[data-testid="stFileUploaderDropzoneInstructions"] span {
+    color: #475569 !important;
+    font-size: 0.8rem !important;
+}
+[data-testid="stFileUploaderDropzoneInstructions"] small { display: none !important; }
+
+/* ── Quick action pill buttons ── */
+.stButton > button {
+    background: rgba(255,255,255,0.03) !important;
+    color: #64748b !important;
+    border: 1px solid rgba(255,255,255,0.07) !important;
+    border-radius: 20px !important;
+    font-size: 0.78rem !important;
+    font-weight: 500 !important;
+    padding: 5px 14px !important;
+    transition: all 0.18s;
+}
+.stButton > button:hover {
+    border-color: rgba(56,189,248,0.35) !important;
+    color: #38bdf8 !important;
+    background: rgba(56,189,248,0.06) !important;
+    box-shadow: 0 0 12px rgba(56,189,248,0.1) !important;
+}
+
+/* ── Welcome hero ── */
+.hero {
+    text-align: center;
+    padding: 56px 20px 36px;
+}
+.hero-eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(56,189,248,0.08);
+    border: 1px solid rgba(56,189,248,0.2);
+    border-radius: 20px;
+    padding: 4px 14px;
+    font-size: 0.72rem;
+    color: #38bdf8;
+    margin-bottom: 22px;
+    font-weight: 600;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+}
+.hero-title {
+    font-size: 2.8rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #e2e8f0 30%, #38bdf8 65%, #818cf8 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    line-height: 1.12;
+    margin-bottom: 18px;
+    letter-spacing: -1.2px;
+}
+.hero-sub {
+    font-size: 1rem;
+    color: #475569;
+    max-width: 460px;
+    margin: 0 auto 40px;
+    line-height: 1.75;
+}
+
+/* ── Feature cards grid ── */
+.fc-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 11px;
+    max-width: 720px;
+    margin: 0 auto 32px;
+}
+.fc-card {
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 14px;
+    padding: 16px 14px;
+    text-align: left;
+    transition: all 0.22s;
+    cursor: pointer;
+}
+.fc-card:hover {
+    border-color: rgba(56,189,248,0.28);
+    background: rgba(56,189,248,0.04);
+    box-shadow: 0 4px 24px rgba(56,189,248,0.08);
+    transform: translateY(-2px);
+}
+.fc-icon { font-size: 1.3rem; margin-bottom: 9px; display: block; }
+.fc-title { font-size: 0.86rem; font-weight: 600; color: #cbd5e1; margin-bottom: 5px; }
+.fc-desc { font-size: 0.73rem; color: #475569; line-height: 1.55; }
+
+/* ── Upload zone ── */
+.upload-cta {
+    background: rgba(56,189,248,0.03);
+    border: 1.5px dashed rgba(56,189,248,0.18);
+    border-radius: 16px;
+    padding: 20px 24px 14px;
+    margin-bottom: 16px;
+    text-align: center;
+    transition: all 0.22s;
+}
+.upload-cta:hover { border-color: rgba(56,189,248,0.4); background: rgba(56,189,248,0.05); }
+.upload-cta-title { font-size: 0.85rem; font-weight: 600; color: #94a3b8; margin-bottom: 4px; }
+.upload-cta-sub { font-size: 0.73rem; color: #475569; margin-bottom: 12px; }
+
+/* ── Alerts ── */
+[data-testid="stAlert"] {
+    border-radius: 10px !important;
+    font-size: 0.83rem !important;
+}
+[data-testid="stAlert"][data-baseweb="notification"] {
+    background: rgba(56,189,248,0.07) !important;
+    border: 1px solid rgba(56,189,248,0.2) !important;
+}
+
+/* ── Expander (main area) ── */
+[data-testid="stExpander"] {
+    background: rgba(255,255,255,0.02) !important;
+    border: 1px solid rgba(255,255,255,0.07) !important;
     border-radius: 12px !important;
 }
-[data-testid="stFileUploaderDropzone"] {
-    background: #2a2a2a !important;
-    border-radius: 10px !important;
-    padding: 10px !important;
-}
-[data-testid="stFileUploaderDropzoneInstructions"] span { color: #8e8ea0 !important; font-size:0.82rem !important; }
-[data-testid="stFileUploaderDropzoneInstructions"] small { display:none !important; }
+[data-testid="stExpander"] summary { color: #94a3b8 !important; font-size: 0.83rem !important; }
 
-/* ── Quick-action suggestion pills ── */
-.suggestion-grid { display:flex; flex-wrap:wrap; gap:10px; margin:16px 0; justify-content:center; }
-.suggestion-pill {
-    background: #2f2f2f;
-    border: 1px solid #3a3a3a;
-    border-radius: 12px;
-    padding: 10px 16px;
-    cursor: pointer;
-    font-size: 0.88rem;
-    color: #d0d0d0;
-    transition: background 0.15s, border-color 0.15s;
-    text-align: left;
-    line-height: 1.4;
-}
-.suggestion-pill:hover { background: #3a3a3a; border-color: #555; color: #fff; }
-.suggestion-pill .pill-icon { font-size: 1.1rem; margin-bottom: 4px; display:block; }
-.suggestion-pill .pill-text { display:block; font-size:0.82rem; color:#8e8ea0; }
-
-/* ── Quick action buttons (above input) ── */
-.stButton > button {
-    background: #2f2f2f !important;
-    color: #d0d0d0 !important;
-    border: 1px solid #3a3a3a !important;
-    border-radius: 20px !important;
-    font-size: 0.82rem !important;
-    padding: 5px 14px !important;
-    transition: background 0.15s;
-}
-.stButton > button:hover { background: #3a3a3a !important; color: #fff !important; }
-
-/* ── Tabs in sidebar ── */
-[data-testid="stSidebar"] .stTabs [data-baseweb="tab"] {
-    background: transparent !important;
-    color: #8e8ea0 !important;
-    font-size: 0.78rem !important;
-    padding: 4px 8px !important;
-}
-[data-testid="stSidebar"] .stTabs [aria-selected="true"] { color: #ececec !important; }
-
-/* ── Expanders in dark theme ── */
-[data-testid="stExpander"] {
-    background: #2a2a2a !important;
-    border: 1px solid #3a3a3a !important;
-    border-radius: 10px !important;
-}
-[data-testid="stExpander"] summary { color: #ececec !important; }
-
-/* ── Welcome page ── */
-.welcome-title { text-align:center; color:#ececec; font-size:1.9rem; font-weight:600; margin-top:60px; }
-.welcome-sub { text-align:center; color:#8e8ea0; font-size:0.95rem; margin-bottom:32px; }
-
-/* ── Dataframe ── */
-[data-testid="stDataFrame"] { border-radius:10px; overflow:hidden; }
-
-/* ── Attach chip ── */
-.attach-chip {
-    display:inline-flex; align-items:center; gap:8px;
-    background:#2a2a2a; border:1px solid #3a3a3a; border-radius:20px;
-    padding:5px 12px; font-size:0.82rem; color:#ececec; margin-bottom:8px;
-}
-.attach-chip .fname { font-weight:600; }
-.attach-chip .fmeta { color:#8e8ea0; font-size:0.75rem; }
-
-/* ── Section label (above attachment) ── */
-.section-label { color:#8e8ea0; font-size:0.78rem; margin-bottom:4px; }
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(56,189,248,0.3); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -321,8 +567,7 @@ def _api_send_message(session_id: str, message: str) -> dict | None:
         st.session_state["api_error"] = f"API {r.status_code}: {r.text[:200]}"
     except requests.exceptions.ConnectionError:
         st.session_state["api_error"] = (
-            "Cannot reach the API server. "
-            "Run: `uvicorn api.main:app --reload --port 8000`"
+            "Cannot reach API. Run: `uvicorn api.main:app --reload --port 8000`"
         )
     except requests.exceptions.Timeout:
         st.session_state["api_error"] = "Request timed out — analysis may still be running."
@@ -387,37 +632,29 @@ def _render_sidebar() -> None:
     with st.sidebar:
         # ── Brand ─────────────────────────────────────────────────────────────
         st.markdown(
-            "<div style='padding:12px 0 4px; font-size:1.15rem; font-weight:700;"
-            "color:#ececec; letter-spacing:-0.3px;'>🧬 BiomarkerAI</div>"
-            "<div style='font-size:0.72rem; color:#8e8ea0; margin-bottom:14px;'>"
-            "Proteomics · Multi-Agent Platform</div>",
+            "<div class='brand-wrap'>"
+            "<span class='brand-name'>🧬 BiomarkerAI</span>"
+            "<span class='brand-tag'>Proteomics · Multi-Agent Platform</span>"
+            "</div>",
             unsafe_allow_html=True,
         )
 
-        # ── New chat button ────────────────────────────────────────────────────
-        if st.button("＋  New conversation", use_container_width=True):
+        # ── New chat button ───────────────────────────────────────────────────
+        if st.button("＋  New Conversation", use_container_width=True):
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.rerun()
 
-        st.markdown("<hr style='margin:10px 0;'>", unsafe_allow_html=True)
-
         # ── Settings ──────────────────────────────────────────────────────────
-        st.markdown(
-            "<div style='font-size:0.72rem; color:#8e8ea0; "
-            "text-transform:uppercase; letter-spacing:0.8px; "
-            "margin-bottom:6px;'>Settings</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("<span class='sh'>Settings</span>", unsafe_allow_html=True)
         disease = st.selectbox(
-            "Disease / program",
+            "Disease / Program",
             ["General", "DMD", "FA", "SMA", "Cancer", "Other"],
             index=["General", "DMD", "FA", "SMA", "Cancer", "Other"].index(
                 st.session_state["disease_program"]
                 if st.session_state["disease_program"] in ["General", "DMD", "FA", "SMA", "Cancer", "Other"]
                 else "General"
             ),
-            label_visibility="visible",
         )
         organism = st.selectbox(
             "Organism",
@@ -441,28 +678,29 @@ def _render_sidebar() -> None:
                 return
 
         st.markdown(
-            f"<div style='font-size:0.7rem; color:#555; margin-top:4px;'>"
-            f"Session: {st.session_state['session_id'][:8]}…</div>",
+            f"<div class='session-chip'>"
+            f"<span class='session-dot'></span>"
+            f"Session {st.session_state['session_id'][:8]}…"
+            f"</div>",
             unsafe_allow_html=True,
         )
-        st.markdown("<hr style='margin:10px 0;'>", unsafe_allow_html=True)
 
-        # ── Dataset (after upload) ─────────────────────────────────────────────
+        # ── Dataset card (after upload) ────────────────────────────────────────
         ur = st.session_state.get("upload_result")
         if ur:
+            st.markdown("<span class='sh'>Dataset</span>", unsafe_allow_html=True)
+
+            dtype = (ur.get("data_type") or "unknown").upper()
+            dformat = (ur.get("data_format") or "").upper()
+            badge_label = f"{dtype}" + (f" · {dformat}" if dformat else "")
             st.markdown(
-                "<div style='font-size:0.72rem; color:#8e8ea0; "
-                "text-transform:uppercase; letter-spacing:0.8px; "
-                "margin-bottom:8px;'>Dataset</div>",
-                unsafe_allow_html=True,
-            )
-            c1, c2 = st.columns(2)
-            c1.metric("Proteins", ur.get("n_proteins", "–"))
-            c2.metric("Samples",  ur.get("n_samples",  "–"))
-            st.markdown(
-                f"<div style='font-size:0.75rem; color:#8e8ea0; margin:4px 0 10px;'>"
-                f"{ur.get('data_type','?').upper()} · "
-                f"{(ur.get('data_format') or '').upper()}</div>",
+                f"<div class='gcard'>"
+                f"<span class='dtype-badge'>{badge_label}</span>"
+                f"<div class='mchips'>"
+                f"<div class='mchip'><span class='mchip-val'>{ur.get('n_proteins','–')}</span><span class='mchip-lbl'>Proteins</span></div>"
+                f"<div class='mchip'><span class='mchip-val'>{ur.get('n_samples','–')}</span><span class='mchip-lbl'>Samples</span></div>"
+                f"</div>"
+                f"</div>",
                 unsafe_allow_html=True,
             )
 
@@ -471,9 +709,9 @@ def _render_sidebar() -> None:
             label_map   = ur.get("label_map") or {}
 
             if is_pooled:
-                st.info("Pooled design — analysis runs automatically.")
+                st.info("Pooled design — groups auto-detected.")
                 if label_map:
-                    with st.expander("Groups detected", expanded=False):
+                    with st.expander("Detected groups", expanded=False):
                         for code, name in label_map.items():
                             st.markdown(f"`{code}` → **{name}**")
                 if st.button("▶  Run Fold-Change Analysis", type="primary", use_container_width=True):
@@ -483,12 +721,7 @@ def _render_sidebar() -> None:
                     )
 
             elif sample_cols:
-                st.markdown(
-                    "<div style='font-size:0.72rem; color:#8e8ea0; "
-                    "text-transform:uppercase; letter-spacing:0.8px; "
-                    "margin-bottom:6px;'>Group Assignment</div>",
-                    unsafe_allow_html=True,
-                )
+                st.markdown("<span class='sh'>Group Assignment</span>", unsafe_allow_html=True)
                 col_l1, col_l2 = st.columns(2)
                 with col_l1:
                     st.session_state["group1_label"] = st.text_input(
@@ -503,14 +736,14 @@ def _render_sidebar() -> None:
                 g2_assigned = set(st.session_state.get("group2_samples") or [])
                 g1_assigned = set(st.session_state.get("group1_samples") or [])
                 st.session_state["group1_samples"] = st.multiselect(
-                    f"Samples → {st.session_state['group1_label']}",
+                    f"→ {st.session_state['group1_label']}",
                     options=[c for c in sample_cols if c not in g2_assigned],
                     default=[c for c in (st.session_state.get("group1_samples") or [])
                              if c not in g2_assigned],
                     key="g1_multiselect",
                 )
                 st.session_state["group2_samples"] = st.multiselect(
-                    f"Samples → {st.session_state['group2_label']}",
+                    f"→ {st.session_state['group2_label']}",
                     options=[c for c in sample_cols if c not in g1_assigned],
                     default=[c for c in (st.session_state.get("group2_samples") or [])
                              if c not in g1_assigned],
@@ -528,36 +761,39 @@ def _render_sidebar() -> None:
                             f"Run differential expression analysis: {g1l} vs {g2l}",
                         )
                 elif g1_n or g2_n:
-                    st.warning("Need ≥2 samples per group.")
+                    st.warning("Need ≥ 2 samples per group.")
 
-            st.markdown("<hr style='margin:10px 0;'>", unsafe_allow_html=True)
-
-        # ── Pipeline status ────────────────────────────────────────────────────
+        # ── Pipeline steps ─────────────────────────────────────────────────────
         astate = st.session_state.get("analysis_state") or {}
-        st.markdown(
-            "<div style='font-size:0.72rem; color:#8e8ea0; "
-            "text-transform:uppercase; letter-spacing:0.8px; "
-            "margin-bottom:8px;'>Pipeline</div>",
-            unsafe_allow_html=True,
-        )
-        steps = [
-            ("Data loaded",       bool(astate.get("data_type"))),
-            ("QC passed",         bool(astate.get("qc_passed"))),
-            ("Analysis complete", astate.get("n_significant") is not None),
-            ("Excel ready",       bool(astate.get("excel_path"))),
-        ]
-        for label, done in steps:
-            icon  = "🟢" if done else "⚪"
-            color = "#ececec" if done else "#555"
-            st.markdown(
-                f"<div style='font-size:0.82rem; color:{color}; "
-                f"padding:3px 0;'>{icon} {label}</div>",
-                unsafe_allow_html=True,
+        st.markdown("<span class='sh'>Pipeline</span>", unsafe_allow_html=True)
+
+        def _pstep(label: str, icon: str, state_class: str) -> str:
+            return (
+                f"<div class='pstep {state_class}'>"
+                f"<span class='pdot {state_class}'></span>"
+                f"{icon} {label}"
+                f"</div>"
             )
 
+        data_done    = bool(astate.get("data_type"))
+        analysis_done = astate.get("n_significant") is not None
+        excel_done   = bool(astate.get("excel_path"))
+        enrich_done  = bool(astate.get("pathways"))
+        plots_done   = bool(astate.get("plot_paths"))
+
+        st.markdown(
+            "<div class='pipeline'>"
+            + _pstep("Data Loaded",   "📂", "done" if data_done else "idle")
+            + _pstep("Analysis",      "🔬", "done" if analysis_done else ("running" if data_done else "idle"))
+            + _pstep("Enrichment",    "🧬", "done" if enrich_done else "idle")
+            + _pstep("Visualisation", "📊", "done" if plots_done else "idle")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
         # ── Excel download ──────────────────────────────────────────────────────
-        if astate.get("excel_path"):
-            st.markdown("<hr style='margin:10px 0;'>", unsafe_allow_html=True)
+        if excel_done:
+            st.markdown("<hr>", unsafe_allow_html=True)
             sid = st.session_state["session_id"]
             try:
                 r = requests.get(f"{API_BASE}/results/{sid}/excel", timeout=30)
@@ -605,7 +841,6 @@ def _handle_file_attach(attached, session_id: str) -> None:
         st.session_state["group2_samples"] = []
         st.session_state["analysis_state"] = _api_fetch_state(returned_sid)
 
-        # Use the server response message directly
         server_msg = result.get("message") or _build_upload_message(result)
         st.session_state["messages"].append({
             "role":    "assistant",
@@ -617,18 +852,18 @@ def _handle_file_attach(attached, session_id: str) -> None:
 
 
 def _build_upload_message(result: dict) -> str:
-    n_p  = result.get("n_proteins", "?")
-    n_s  = result.get("n_samples", "?")
-    dtype = result.get("data_type", "unknown")
+    n_p       = result.get("n_proteins", "?")
+    n_s       = result.get("n_samples", "?")
+    dtype     = result.get("data_type", "unknown")
     is_pooled = result.get("is_pooled_design", False)
     label_map = result.get("label_map") or {}
-    lines = [
-        f"**Data loaded** — {n_p} proteins · {n_s} samples · {dtype}",
-    ]
+    lines = [f"**Data loaded** — {n_p} proteins · {n_s} samples · {dtype}"]
     if is_pooled and label_map:
         groups = ", ".join(f"{k}→{v}" for k, v in label_map.items())
-        lines += [f"\nPooled design detected: **{groups}**",
-                  "Click **▶ Run Fold-Change Analysis** in the sidebar or type *run analysis*."]
+        lines += [
+            f"\nPooled design detected: **{groups}**",
+            "Click **▶ Run Fold-Change Analysis** in the sidebar or type *run analysis*.",
+        ]
     else:
         lines.append("\nAssign samples to groups in the sidebar, then run analysis.")
     return "\n".join(lines)
@@ -651,55 +886,69 @@ def _trigger_analysis(session_id: str, message: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Welcome screen  (shown when no messages)
+# Welcome screen
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _render_welcome() -> str | None:
     st.markdown(
-        "<div class='welcome-title'>What can I help with?</div>"
-        "<div class='welcome-sub'>Upload proteomics data and ask anything — "
-        "analysis, visualisation, enrichment, or general questions.</div>",
+        "<div class='hero'>"
+        "<div class='hero-eyebrow'>⚡ Multi-Agent · LangGraph · Azure OpenAI</div>"
+        "<div class='hero-title'>Biomarker Discovery,<br>Reimagined</div>"
+        "<div class='hero-sub'>Upload your proteomics data and ask anything — "
+        "from differential analysis to pathway enrichment and interactive visualisations.</div>"
+        "</div>",
         unsafe_allow_html=True,
     )
 
     suggestions = [
         ("📊", "Run differential expression analysis",
          "Compare two groups and find significant biomarkers"),
-        ("🔬", "What is a volcano plot?",
-         "Explain the statistics used in proteomics"),
         ("🧬", "Run pathway enrichment on my results",
-         "KEGG and GO enrichment analysis"),
+         "KEGG, GO, Reactome & WikiPathways"),
         ("📈", "Generate PCA and heatmap",
          "Visualise sample clustering and top proteins"),
-        ("💬", "Explain the Benjamini-Hochberg correction",
-         "Statistical methods for multiple testing"),
-        ("🔍", "Show me the top 20 biomarkers",
+        ("🔬", "What is a volcano plot?",
+         "Explain the statistics used in proteomics"),
+        ("💬", "Explain Benjamini-Hochberg FDR",
+         "Multiple testing correction for omics"),
+        ("🔍", "Show top 20 biomarkers",
          "Ranked list with fold changes and p-values"),
     ]
 
-    # 3-column grid of suggestion cards
+    # Inject the feature-card grid via HTML (non-interactive visual)
+    cards_html = "<div class='fc-grid'>"
+    for icon, title, desc in suggestions:
+        cards_html += (
+            f"<div class='fc-card'>"
+            f"<span class='fc-icon'>{icon}</span>"
+            f"<div class='fc-title'>{title}</div>"
+            f"<div class='fc-desc'>{desc}</div>"
+            f"</div>"
+        )
+    cards_html += "</div>"
+    st.markdown(cards_html, unsafe_allow_html=True)
+
+    # Invisible buttons that map to each card (using st.columns for click logic)
     cols = st.columns(3)
-    for i, (icon, title, sub) in enumerate(suggestions):
+    for i, (_, title, _desc) in enumerate(suggestions):
         with cols[i % 3]:
-            if st.button(
-                f"{icon} {title}\n\n_{sub}_",
-                key=f"sug_{i}",
-                use_container_width=True,
-            ):
+            if st.button(title, key=f"sug_{i}", use_container_width=True,
+                         help=_desc):
                 return title
+
     return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Inline plot renderer  (shown inside assistant messages)
+# Inline plot renderer
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _render_inline_plots(session_id: str, plot_paths: list[str]) -> None:
     if not plot_paths:
         return
-    n = len(plot_paths)
-    cols_per_row = 2 if n > 1 else 1
-    cols = st.columns(cols_per_row)
+    n             = len(plot_paths)
+    cols_per_row  = 2 if n > 1 else 1
+    cols          = st.columns(cols_per_row)
     for i, path in enumerate(plot_paths):
         filename = Path(path).name
         label    = filename.replace("_", " ").replace(".png", "").title()
@@ -717,7 +966,7 @@ def _render_inline_plots(session_id: str, plot_paths: list[str]) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Quick actions (above input bar)
+# Quick action chips (above input)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _render_quick_actions(astate: dict) -> str | None:
@@ -752,15 +1001,40 @@ def _render_quick_actions(astate: dict) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Main  —  chat area
+# Attachment area
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _render_attachment_area(session_id: str, welcome: bool = False) -> None:
+    if welcome:
+        st.markdown(
+            "<div class='upload-cta'>"
+            "<div class='upload-cta-title'>📎 Attach your proteomics file to get started</div>"
+            "<div class='upload-cta-sub'>Supports CSV, XLSX, XLS · Max 100 MB</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    attached_file = st.file_uploader(
+        "Attach proteomics file",
+        type=["csv", "xlsx", "xls"],
+        accept_multiple_files=False,
+        key=f"attach_{st.session_state.get('_attach_ver', 0)}",
+        label_visibility="collapsed",
+        help="Drag & drop or browse — CSV, XLSX, XLS supported",
+    )
+    if attached_file is not None:
+        _handle_file_attach(attached_file, session_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main chat area
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _render_main() -> None:
     session_id = st.session_state.get("session_id")
     if not session_id:
         st.markdown(
-            "<div style='text-align:center; color:#8e8ea0; padding-top:100px;'>"
-            "Connecting to API…</div>",
+            "<div style='text-align:center; color:#475569; padding-top:120px; font-size:0.9rem;'>"
+            "Connecting to API server…</div>",
             unsafe_allow_html=True,
         )
         return
@@ -769,7 +1043,7 @@ def _render_main() -> None:
         err = st.session_state.pop("api_error")
         st.error(err)
 
-    # ── Centre the chat column ─────────────────────────────────────────────────
+    # Centre column
     _, chat_col, _ = st.columns([1, 6, 1])
 
     with chat_col:
@@ -782,10 +1056,8 @@ def _render_main() -> None:
             if triggered:
                 st.session_state["_quick"] = triggered
                 st.rerun()
-
-            # File attachment on welcome screen
             st.markdown("<br>", unsafe_allow_html=True)
-            _render_attachment_area(session_id)
+            _render_attachment_area(session_id, welcome=True)
             return
 
         # ── Message history ────────────────────────────────────────────────────
@@ -798,19 +1070,18 @@ def _render_main() -> None:
             with st.chat_message(role, avatar="🧬" if role == "assistant" else None):
                 st.markdown(content)
 
-                # Show plots anchored to the message that produced them
                 if role == "assistant" and m.get("has_plots") and plot_paths:
                     _render_inline_plots(session_id, plot_paths)
 
-        # ── Quick action pills ─────────────────────────────────────────────────
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        # ── Quick action chips ─────────────────────────────────────────────────
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
         quick_action = _render_quick_actions(astate)
 
         # ── Attachment area ────────────────────────────────────────────────────
         _render_attachment_area(session_id)
 
         # ── Chat input ─────────────────────────────────────────────────────────
-        user_input = st.chat_input("Message BiomarkerAI…")
+        user_input = st.chat_input("Ask BiomarkerAI anything…")
         pending    = st.session_state.pop("_quick", None)
         user_input = user_input or quick_action or pending
 
@@ -830,21 +1101,6 @@ def _render_main() -> None:
                 else:
                     st.session_state["analysis_state"] = _api_fetch_state(session_id)
             st.rerun()
-
-
-def _render_attachment_area(session_id: str) -> None:
-    """Compact file attachment row — shown above the chat input."""
-    attach_ver    = st.session_state.get("_attach_ver", 0)
-    attached_file = st.file_uploader(
-        "📎 Attach proteomics file (CSV or Excel)",
-        type=["csv", "xlsx", "xls"],
-        accept_multiple_files=False,
-        key=f"attach_{attach_ver}",
-        label_visibility="collapsed",
-        help="Drag & drop or browse — CSV, XLSX, XLS supported",
-    )
-    if attached_file is not None:
-        _handle_file_attach(attached_file, session_id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

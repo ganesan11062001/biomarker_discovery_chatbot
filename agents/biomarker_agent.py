@@ -28,12 +28,24 @@ from typing import Any, Dict
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
 from core.state import BiomarkerState
+from core.tracing import get_biomarker_metadata
 from skills.omics_registry import OmicsSkillRegistry
 from skills.pooled_fold_change import PooledFoldChangeSkill
 from skills.proteomics_analysis import ProteomicsAnalysisSkill
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
+
+# ── LangSmith @traceable (graceful no-op if not installed) ───────────────────
+try:
+    from langsmith import traceable as _traceable
+    from langsmith.run_helpers import get_current_run_tree as _get_run_tree
+except ImportError:
+    def _traceable(**_kw):          # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap
+    def _get_run_tree():            # type: ignore[misc]
+        return None
 
 # Default omic type when none is set in state
 _DEFAULT_OMIC_TYPE = "proteomics"
@@ -66,7 +78,15 @@ class BiomarkerAgent(BaseAgent):
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
+    @_traceable(run_type="chain", name="agent.biomarker",
+                tags=["biomarker-discovery", "biomarker"])
     def run(self, state: BiomarkerState) -> BiomarkerState:
+        rt = _get_run_tree()
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update(get_biomarker_metadata(state))
+            except Exception:
+                pass
         if not state.get("data_path"):
             return self._error(
                 state,
@@ -171,6 +191,17 @@ class BiomarkerAgent(BaseAgent):
             "Analysis complete | session=%s omic=%s significant=%d",
             state.get("session_id"), omic_type, result["n_significant"],
         )
+
+        # Update span with post-analysis values
+        rt = _get_run_tree()
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update(
+                    get_biomarker_metadata(state, result)
+                )
+            except Exception:
+                pass
+
         return state
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -186,6 +217,8 @@ class BiomarkerAgent(BaseAgent):
 
     # ── LLM summary generation ────────────────────────────────────────────────
 
+    @_traceable(run_type="chain", name="biomarker.summary",
+                tags=["biomarker-discovery", "biomarker"])
     def _build_summary(self, result: Dict[str, Any], state: BiomarkerState) -> str:
         """Ask the LLM to write a plain-language summary of the analysis."""
         mode      = state.get("analysis_mode", "supervised")

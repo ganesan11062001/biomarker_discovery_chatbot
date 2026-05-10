@@ -17,10 +17,22 @@ from typing import List, Optional
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
 from core.state import BiomarkerState
+from core.tracing import get_visualization_metadata
 from skills.run_visualization import ProteomicsPlotSuite, PLOT_REGISTRY, resolve_plot_names
 
 settings = get_settings()
 logger   = logging.getLogger(__name__)
+
+# ── LangSmith @traceable (graceful no-op if not installed) ───────────────────
+try:
+    from langsmith import traceable as _traceable
+    from langsmith.run_helpers import get_current_run_tree as _get_run_tree
+except ImportError:
+    def _traceable(**_kw):          # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap
+    def _get_run_tree():            # type: ignore[misc]
+        return None
 
 _PLOT_DETECTION_PROMPT = f"""\
 You are a bioinformatics assistant.
@@ -57,7 +69,17 @@ class VisualizationAgent(BaseAgent):
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
+    @_traceable(run_type="chain", name="agent.visualization",
+                tags=["biomarker-discovery", "visualization"])
     def run(self, state: BiomarkerState, requested_plots: Optional[List[str]] = None) -> BiomarkerState:
+        rt = _get_run_tree()
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update(
+                    get_visualization_metadata(state)
+                )
+            except Exception:
+                pass
         protein_source = state.get("top_biomarkers") or state.get("top_proteins") or []
 
         if not protein_source and not state.get("excel_path"):
@@ -110,6 +132,15 @@ class VisualizationAgent(BaseAgent):
                 state.get("session_id"), len(result.get("plot_paths", [])),
             )
 
+            rt = _get_run_tree()
+            if rt is not None:
+                try:
+                    rt.extra.setdefault("metadata", {}).update(
+                        get_visualization_metadata(state, result)
+                    )
+                except Exception:
+                    pass
+
         except Exception as exc:
             logger.exception("Visualization failed: %s", exc)
             state["status"]        = "error"
@@ -123,6 +154,8 @@ class VisualizationAgent(BaseAgent):
 
     # ── Plot type detection ───────────────────────────────────────────────────
 
+    @_traceable(run_type="chain", name="viz.plot_detection",
+                tags=["biomarker-discovery", "visualization"])
     def _detect_requested_plots(self, user_query: str) -> List[str]:
         """Ask LLM which specific plots the user wants. Returns [] for 'all'."""
         if not user_query.strip():
@@ -147,6 +180,8 @@ class VisualizationAgent(BaseAgent):
 
     # ── LLM messages ──────────────────────────────────────────────────────────
 
+    @_traceable(run_type="chain", name="viz.summary",
+                tags=["biomarker-discovery", "visualization"])
     def _llm_visualization_summary(self, result: dict, state: BiomarkerState) -> str:
         protein_source = state.get("top_biomarkers") or state.get("top_proteins") or []
         top10    = protein_source[:10]
