@@ -699,7 +699,12 @@ class LearningAgent(BaseAgent):
     # ── Group inference ───────────────────────────────────────────────────────
 
     def _infer_groups(self, sample_columns: List[str]) -> Dict[str, List[str]]:
-        """Ask LLM to detect group structure from column naming patterns."""
+        """Ask LLM to detect group structure from column naming patterns.
+
+        Mirrors IngestionAgent's sanitiser: drops any 1-sample "group" the LLM
+        produces (a group requires ≥ 2 samples to be statistically meaningful)
+        and rejects degenerate inferences entirely.
+        """
         if not sample_columns:
             return {}
         prompt = _GROUP_INFERENCE_PROMPT + f"\nColumn names:\n{sample_columns}"
@@ -712,11 +717,29 @@ class LearningAgent(BaseAgent):
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
             groups = json.loads(raw)
             if isinstance(groups, dict) and groups:
-                self.logger.info("Inferred groups: %s", {k: len(v) for k, v in groups.items()})
-                return groups
+                cleaned = self._sanitize_groups(groups, sample_columns)
+                self.logger.info("Inferred groups (cleaned): %s",
+                                 {k: len(v) for k, v in cleaned.items()})
+                return cleaned
         except Exception as exc:
             self.logger.warning("Group inference failed: %s", exc)
         return {}
+
+    @staticmethod
+    def _sanitize_groups(
+        groups: Dict[str, List[str]],
+        sample_columns: List[str],
+    ) -> Dict[str, List[str]]:
+        """Drop single-sample groups; require ≥ 2 surviving groups total."""
+        valid_cols = set(sample_columns)
+        cleaned: Dict[str, List[str]] = {}
+        for name, samples in groups.items():
+            if not isinstance(samples, list):
+                continue
+            real = [c for c in samples if c in valid_cols]
+            if len(real) >= 2:
+                cleaned[str(name)] = real
+        return cleaned if len(cleaned) >= 2 else {}
 
     # ── Multi-comparison ──────────────────────────────────────────────────────
 
@@ -747,17 +770,48 @@ class LearningAgent(BaseAgent):
             })
             return self._specialist("biomarker").run(state)
 
-        # Standard replicated proteomics — infer groups and run pairwise DEA
+        # Standard replicated proteomics — prefer the sanitised group map built
+        # at ingestion time; only re-infer if it's missing.
         sample_cols = state.get("sample_columns") or []
-        groups = self._infer_groups(sample_cols)
+        groups: Dict[str, List[str]] = state.get("all_groups") or {}
+        if not groups:
+            groups = self._infer_groups(sample_cols)
+
+        # ── n=1 design fallback ───────────────────────────────────────────────
+        # If every plausible group has just one sample (e.g. {strain × tissue}
+        # with one mouse per cell), Welch / limma are undefined. Route to the
+        # pooled-design skill which computes pairwise log₂FC + rescue scores
+        # without requiring replicates.
+        all_singleton = (
+            bool(sample_cols)
+            and (not groups or all(len(v) <= 1 for v in groups.values()))
+        )
+        if all_singleton:
+            n = len(sample_cols)
+            label_map = {c: c for c in sample_cols}  # each column is its own condition
+            state["label_map"]        = label_map
+            state["is_pooled_design"] = True
+            state["omic_type"]        = "proteomics_pooled"
+            state["messages"].append({
+                "role": "assistant",
+                "content": (
+                    f"Each group in your data has only **n=1** sample — Welch t-tests "
+                    f"need replicates and would return NaN for every protein. "
+                    f"Switching to **pooled-design log₂ fold-change analysis** across "
+                    f"all **{n} samples** ({n * (n-1) // 2} pairwise contrasts). "
+                    f"Proteins are ranked by a rescue score that captures "
+                    f"consistent up/down-regulation across contrasts."
+                ),
+            })
+            return self._specialist("biomarker").run(state)
 
         if len(groups) < 2:
             state["messages"].append({
                 "role": "assistant",
                 "content": (
-                    "I couldn't automatically detect groups from your column names. "
-                    "Please tell me which groups to compare, e.g.: "
-                    "*'compare Control_1, Control_2, Control_3 vs Disease_1, Disease_2, Disease_3'*."
+                    "I couldn't automatically detect biological groups from your column "
+                    "names. Please tell me which groups to compare using the EXACT "
+                    "column names, e.g. *'compare A_1, A_2, A_3 vs B_1, B_2, B_3'*."
                 ),
             })
             return state

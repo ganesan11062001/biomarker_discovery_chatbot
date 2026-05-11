@@ -54,6 +54,13 @@ export function useChat(): UseChatResult {
 
   const sendMessage = useCallback((text: string) => {
     if (!activeSessionId || !text.trim()) return;
+    // Guard against rapid double-submits while a stream is in flight.
+    // Without this, dev-mode HMR / double-tap can fire the same long-running
+    // workflow multiple times against the same session.
+    if (streamingRef.current) {
+      console.warn("sendMessage ignored — a stream is already in flight");
+      return;
+    }
     const sid = activeSessionId;
     const now = () => new Date().toISOString();
 

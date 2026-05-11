@@ -157,7 +157,20 @@ def _run_workflow_turn(request: ChatRequest) -> dict:
 
 
 def _stream_chat_response(request: ChatRequest) -> Iterator[str]:
-    """Generator that yields SSE frames for a single chat turn."""
+    """Generator that yields SSE frames for a single chat turn.
+
+    Emits an immediate ``: connected`` comment frame BEFORE starting the
+    (potentially long-running) LangGraph workflow. Without this prelude the
+    browser sees an idle TCP connection for 10–30 seconds while the LLM /
+    analysis runs, and intermediate proxies (or the browser's own retry
+    logic during HMR / Fast Refresh in dev) can re-fire the request,
+    causing the workflow to run repeatedly on the same session.
+    """
+    # 1. Immediate heartbeat — keeps the SSE channel open while the workflow runs
+    yield ": connected\n\n"
+    yield _sse("token", {"delta": ""})  # a token event keeps client parsers happy
+
+    # 2. Synchronous workflow (blocks until LangGraph completes)
     try:
         result = _run_workflow_turn(request)
     except HTTPException as exc:
