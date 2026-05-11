@@ -4,7 +4,7 @@ Master Orchestrator — LLM-driven reasoning over full session state.
 
 Replaces keyword routing entirely. On every message the LearningAgent:
   1. Sends a structured context block to the LLM and receives a JSON decision
-  2. Extracts comparison groups from natural language ("compare WT vs mdx")
+  2. Extracts comparison groups from natural language ("compare GroupA vs GroupB")
   3. Routes to the correct specialist agent with the right parameters
   4. Runs ALL pairwise group comparisons when no specific groups are named
   5. Answers any question — on-topic or off-topic — with full session context
@@ -18,7 +18,7 @@ import json
 import logging
 import re
 from itertools import combinations
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, field_validator
 
@@ -52,6 +52,7 @@ _VALID_ACTIONS = {
     "load_data", "run_analysis", "run_all_comparisons",
     "run_enrichment", "run_visualization",
     "show_code", "modify_code", "query_database",
+    "query_data",
     "ask_clarification",
     "answer",
 }
@@ -177,6 +178,20 @@ that drives the pipeline. Choose exactly one action:
   "show_code"           — user wants to see the reproducible analysis code
   "modify_code"         — user wants to change, alter, or extend the analysis code
   "query_database"      — look up protein info, gene names, UniProt annotation, or convert IDs
+  "query_data"          — answer cell-level / aggregation questions about the user's FILE itself.
+                           Use whenever the answer requires reading specific values, cells, rows,
+                           sheet structure, or counts directly from the uploaded data. Examples
+                           (with generic placeholders — substitute the user's actual tokens):
+                             • "what is the <metric> for <protein X> in sample <Y>?"
+                             • "how many sheets does this file have?"
+                             • "what are the column headers in the <sheet name> sheet?"
+                             • "which proteins have a value of 0 in sample <Y>?"
+                             • "is <protein X> detected in the <group> group?"
+                             • "what is the molecular weight of <protein X>?"
+                             • "how many contaminant proteins (CON__) are in the dataset?"
+                             • "what is the largest / smallest / highest-MW protein in the file?"
+                           DO NOT use for general explanations or for biomarker results from a
+                           completed analysis — those go through "answer".
   "ask_clarification"   — ask the user a focused, professional question before proceeding
   "answer"              — answer a question, explain something, or have a conversation
 
@@ -215,10 +230,21 @@ Decision rules (in priority order):
 1.  Questions ("what is X", "explain X", "how does Y work", "what did the analysis find") → "answer"
 2.  Off-topic messages → "answer"
 3.  No data loaded yet → "answer" (tell user to upload a file first)
-4.  "show code" / "give me the code" / "what code was used" → "show_code"
+4.  "show code" / "give me the code" / "what code was used" / "show me the query" /
+    "what query did you run" / "how did you get that answer" / "show the SQL" → "show_code"
+    (The handler picks between the analysis script and the most recent
+    data-query snippet based on the user's phrasing.)
 5.  Re-run with new parameter values (see below) → "run_analysis" + fill parameter fields
 6.  "change the code to use X method" / "add a step to the script" → "modify_code"
 7.  "look up proteins" / "get gene names" / "annotate" / "UniProt" / "convert IDs" → "query_database"
+7b. Specific values, sheet structure, cell content, accession lookups, MW, intensity counts,
+    or detection-of-X-in-sample-Y questions about the uploaded FILE → "query_data"
+    (Distinguish from "answer": if the question is about a concrete value in the file
+    rather than a concept, definition, or analysis result, prefer "query_data".)
+7c. MULTI-QUESTION MESSAGES: Note — when the user pastes 2+ questions in one message,
+    the orchestrator splits them automatically and routes each question through this
+    same decision step. So just answer for the SINGLE question you receive; do not
+    worry about "the rest".
 8.  Pathway / enrichment / KEGG / GO → "run_enrichment"
 9.  Plot / visualize / chart / heatmap / volcano / report → "run_visualization"
 10. Pooled design AND "run analysis" with no specific group pair → "run_all_comparisons"
@@ -380,6 +406,12 @@ RULE 2 — GROUNDED RESULTS ONLY:
   When referencing analysis results (proteins, fold-change values, p-values, pathways),
   ONLY cite values explicitly listed in the grounded data sections of the session context.
   If a specific value is not in the session data, say "that value is not in the current results."
+  NOTE: Cell-level questions about the uploaded file (spectral counts, intensities, accessions,
+  sheet contents, MW, "is X detected in sample Y") are handled by a separate `query_data`
+  action that runs pandas against the file directly. If you receive such a question in this
+  `answer` flow, it has already been routed here for a reason — you should describe what the
+  session context DOES contain (sheet names, columns, row counts) and tell the user the value
+  itself can be retrieved by re-asking the question explicitly.
 
 RULE 3 — GENERAL SCIENCE QUESTIONS ARE FREE:
   For questions that are clearly general / off-topic (not about the user's specific file
@@ -400,8 +432,10 @@ _GROUP_INFERENCE_PROMPT = """\
 You are a bioinformatics data analyst.
 Below are sample column names from a proteomics dataset.
 Identify biological groups by looking for common naming patterns:
-  - Explicit group names (WT, KO, Disease, Control, mdx, uDys5, etc.)
-  - Numeric suffixes indicating replicates (_1, _2, _3 or .1 .2 .3)
+  - Repeated tokens or shared substrings across columns (these usually mark a
+    biological condition — accept whatever tokens the data actually contains;
+    don't assume the names of strains, treatments, or tissues)
+  - Numeric suffixes indicating replicates (_1, _2, _3 or .1 .2 .3 or trailing digits)
   - Common prefixes
 
 Return a JSON object mapping group name → list of column names.
@@ -417,6 +451,54 @@ def _truncate(text: str, max_len: int = 600) -> str:
     """Truncate a string to max_len characters with ellipsis indicator."""
     text = str(text)
     return text if len(text) <= max_len else text[:max_len] + "…[truncated]"
+
+
+_QUESTION_TAG_RE = re.compile(
+    r"\s*(?:Counts?\s*&\s*values?|Zeros?\s*&\s*nulls?|Edge\s*cases?|Metadata)\s*[⌄▾▼v]?\s*$",
+    re.IGNORECASE,
+)
+_LIST_PREFIX_RE = re.compile(r"^\s*[\d]+[\.\)]\s*|^\s*[•▪●\-\*]\s*")
+
+
+def _extract_questions(text: str) -> List[str]:
+    """
+    Split a (potentially long) user message into individual questions.
+
+    Heuristics:
+    - Split on newlines first.
+    - Strip leading list markers ("1.", "•", "-", "*", "2)") and trailing
+      categorisation tags ("Counts & values ⌄") that came from a UI.
+    - A line is treated as a question if it ends with "?" (or "？").
+    - If newline-split yields nothing useful, fall back to splitting the
+      whole text on "?" so a paragraph like
+        "What is X? What is Y? How many Z?"
+      is broken into three.
+
+    Returns the cleaned question strings; empty list when none are found.
+    """
+    if not text:
+        return []
+
+    questions: List[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = _LIST_PREFIX_RE.sub("", line)
+        line = _QUESTION_TAG_RE.sub("", line)
+        line = line.strip()
+        if not line:
+            continue
+        if line.endswith("?") or line.endswith("？"):
+            questions.append(line)
+
+    # Fallback: paragraph with multiple "?" on a single line
+    if len(questions) < 2 and text.count("?") >= 2:
+        parts = [p.strip() for p in re.split(r"(?<=\?)\s+", text) if p.strip()]
+        questions = [_QUESTION_TAG_RE.sub("", p).strip()
+                     for p in parts if p.endswith("?")]
+
+    return questions
 
 
 def _recent_messages(
@@ -722,22 +804,55 @@ class LearningAgent(BaseAgent):
     # ── Code display & modification ──────────────────────────────────────────
 
     def _show_code(self, state: BiomarkerState) -> BiomarkerState:
-        code = state.get("analysis_code")
-        if not code:
+        """
+        Surface stored code on demand. Two kinds of code may be available:
+          - state['analysis_code']    — full reproducible analysis script
+          - state['last_query_code']  — the SQL or pandas snippet that
+                                        answered the user's most recent
+                                        data question.
+
+        We pick which to show based on the recency: prefer the data-query
+        code when it's the most recently set (typical case: user just got
+        a data answer and asks "show me the code"). Otherwise show the
+        full analysis script.
+        """
+        analysis_code = state.get("analysis_code")
+        query_code    = state.get("last_query_code")
+        query_engine  = (state.get("last_query_engine") or "sql").lower()
+        user_query    = (state.get("user_query") or "").lower()
+
+        # Heuristic: words like "query", "this", "that" → likely about the
+        # last data answer, not the full analysis script.
+        prefers_query = any(
+            w in user_query
+            for w in ("query", "that answer", "the answer", "how did you", "how do you", "this result")
+        )
+
+        if query_code and (prefers_query or not analysis_code):
+            lang = "sql" if query_engine == "sql" else "python"
             state["messages"].append({
                 "role": "assistant",
                 "content": (
-                    "No analysis code available yet. Run an analysis first and the "
-                    "reproducible Python script will be generated automatically."
+                    f"Here's the {query_engine.upper()} query I used to answer that:\n\n"
+                    f"```{lang}\n" + query_code + "\n```"
+                ),
+            })
+        elif analysis_code:
+            state["messages"].append({
+                "role": "assistant",
+                "content": (
+                    "Here is the reproducible Python script used for this analysis:\n\n"
+                    "```python\n" + analysis_code + "\n```\n\n"
+                    "_You can run this script directly or ask me to modify it._"
                 ),
             })
         else:
             state["messages"].append({
                 "role": "assistant",
                 "content": (
-                    "Here is the reproducible Python script used for this analysis:\n\n"
-                    "```python\n" + code + "\n```\n\n"
-                    "_You can run this script directly or ask me to modify it._"
+                    "No code to show yet. Run an analysis (for the reproducible "
+                    "Python script) or ask a data question (for the SQL/pandas "
+                    "query I used)."
                 ),
             })
         state["status"] = "answered"
@@ -768,17 +883,58 @@ class LearningAgent(BaseAgent):
             {"role": "system", "content": "You are an expert Python bioinformatician."},
             {"role": "user",   "content": prompt},
         ]
+        # ── Generate → Review loop ────────────────────────────────────────────
+        # Inspired by GenoMAS: the modified script gets reviewed by a separate
+        # critic LLM before being returned to the user. If the reviewer flags
+        # issues, we feed the critique back and ask for one revision.
+        from agents.code_reviewer import CodeReviewerAgent
+        if not hasattr(self, "_code_reviewer") or self._code_reviewer is None:
+            self._code_reviewer = CodeReviewerAgent()
+
+        def _generate_modification(extra_instruction: Optional[str]) -> str:
+            full_prompt = prompt
+            if extra_instruction:
+                full_prompt += f"\n\nREVISION GUIDANCE FROM REVIEWER:\n{extra_instruction}\n"
+            raw = self._call_llm(
+                [{"role": "system", "content": "You are an expert Python bioinformatician."},
+                 {"role": "user",   "content": full_prompt}],
+                max_tokens=2000, temperature=0.0,
+            ).strip()
+            raw = re.sub(r"^```(?:python)?\s*", "", raw, flags=re.MULTILINE)
+            return re.sub(r"\s*```$", "", raw, flags=re.MULTILINE).strip()
+
+        last_review = None
+        modified: str = ""
         try:
-            modified = self._call_llm(messages, max_tokens=2000, temperature=0.0).strip()
-            # Strip markdown fences if the LLM added them (Python 3.8-compatible)
-            modified = re.sub(r"^```(?:python)?\s*", "", modified, flags=re.MULTILINE)
-            modified = re.sub(r"\s*```$", "", modified, flags=re.MULTILINE).strip()
+            for attempt in range(2):
+                extra = None
+                if last_review and not last_review.approved:
+                    extra = (
+                        f"Issues: {last_review.issues}\n"
+                        f"Suggestion: {last_review.suggestion}"
+                    )
+                modified = _generate_modification(extra)
+
+                last_review = self._code_reviewer.review(
+                    user_question  = f"Modify the analysis: {user_request}",
+                    schema_context = "(modified Python analysis script)",
+                    candidate_code = modified,
+                )
+                if last_review.approved or last_review.severity == "minor":
+                    break
+
             state["analysis_code"] = modified
+            review_note = ""
+            if last_review and last_review.issues and not last_review.approved:
+                review_note = (
+                    "\n\n_⚠ Code reviewer flagged: "
+                    + "; ".join(last_review.issues[:3]) + "_"
+                )
             state["messages"].append({
                 "role": "assistant",
                 "content": (
                     "Here is the modified analysis script:\n\n"
-                    "```python\n" + modified + "\n```"
+                    "```python\n" + modified + "\n```" + review_note
                 ),
             })
         except Exception as exc:
@@ -866,6 +1022,835 @@ class LearningAgent(BaseAgent):
         state["status"] = "answered"
         return state
 
+    # ── Raw-data query (LLM-generated pandas) ─────────────────────────────────
+
+    @_traceable(run_type="chain", name="orchestrator.query_data",
+                tags=["biomarker-discovery", "query_data"])
+    def _query_data(self, state: BiomarkerState) -> BiomarkerState:
+        """
+        Answer cell-level / aggregation questions by executing LLM-generated
+        pandas code against the user's uploaded sheets.
+        """
+        import pandas as pd
+        import numpy as np
+        from core.safe_exec import safe_exec, UnsafeCodeError, CodeTimeoutError
+
+        user_query = state.get("user_query", "") or ""
+        data_path  = state.get("data_path") or state.get("raw_data_path")
+
+        if not data_path:
+            state["messages"].append({
+                "role": "assistant",
+                "content": (
+                    "I don't have a data file to query yet. Please upload your "
+                    "proteomics CSV or Excel file first, then ask the question again."
+                ),
+            })
+            state["status"] = "answered"
+            return state
+
+        sheets = self._load_sheets_for_query(state, data_path)
+        if not sheets:
+            state["messages"].append({
+                "role": "assistant",
+                "content": (
+                    f"I couldn't read the data file at `{data_path}` to look up that "
+                    "value. The file may be corrupted or in an unexpected format."
+                ),
+            })
+            state["status"] = "answered"
+            return state
+
+        # Pick primary sheet (largest by row count, falling back to first)
+        df_candidates = [(n, s) for n, s in sheets.items() if isinstance(s, pd.DataFrame)]
+        if not df_candidates:
+            state["messages"].append({
+                "role": "assistant",
+                "content": "The file is loaded but contains no readable sheets.",
+            })
+            state["status"] = "answered"
+            return state
+        primary_name, primary_df = max(df_candidates, key=lambda kv: kv[1].shape[0])
+
+        # ── Ensure DuckDB tables are registered for this session ─────────────
+        # IngestionAgent registers on upload, but after a server restart the
+        # DuckDB connection is gone while the JSON checkpoint survives —
+        # re-register here on first query so the SQL path always works.
+        try:
+            from core import data_store as _ds
+            if _ds.is_available():
+                if _ds.get_store(state.get("session_id", "")) is None:
+                    _ds.register_sheets(state.get("session_id", ""), sheets)
+        except Exception as exc:
+            self.logger.debug("DuckDB lazy-register failed: %s", exc)
+
+        # ── Tool-calling path (ExcelWorker pattern) ───────────────────────────
+        # OpenAI function-call loop: the LLM picks tools and emits structured
+        # arguments instead of raw SQL/pandas. We dispatch by tool name.
+        # Falls through to the SQL-first path (and pandas review-revise) on
+        # any failure so we never lose the previously working behavior.
+        tools_record = self._query_data_via_tools(
+            state, user_query, df_candidates, primary_df, primary_name,
+        )
+        if tools_record is not None and tools_record["ok"]:
+            self._render_tool_result(state, tools_record, user_query)
+            return state
+
+        # ── SQL-first attempt via DuckDB ──────────────────────────────────────
+        # SQL handles spaces / mixed-case column names cleanly, joins across
+        # sheets naturally, and gives the LLM a stable schema to ground on.
+        # We try SQL first; if it fails or produces an empty result the
+        # downstream pandas fallback still runs.
+        sql_record = self._try_sql_query(state, user_query, df_candidates)
+        if sql_record is not None and sql_record.ok:
+            self._render_sql_result(state, sql_record, user_query)
+            return state
+
+        # ── Build sheet-context block for code-generation prompt ──────────────
+        sheet_blocks: List[str] = []
+        for name, sheet in df_candidates:
+            cols     = list(sheet.columns)
+            preview  = sheet.head(3).to_csv(index=False)
+            if len(preview) > 800:
+                preview = preview[:800] + "\n…[truncated]"
+            sheet_blocks.append(
+                f"### Sheet: {name!r}\n"
+                f"Shape: {sheet.shape[0]} rows × {sheet.shape[1]} cols\n"
+                f"Columns: {cols[:40]}{' …(+more)' if len(cols) > 40 else ''}\n"
+                f"First 3 rows:\n{preview}"
+            )
+        sheets_ctx = "\n\n".join(sheet_blocks)
+
+        base_prompt = (
+            "You write safe pandas code to answer a question about a proteomics dataset.\n\n"
+            "VARIABLES ALREADY DEFINED IN YOUR EXECUTION NAMESPACE:\n"
+            f"- `df`           — primary dataframe (sheet {primary_name!r}, all columns)\n"
+            "- `df_spc`        — identifier columns + spectral-count columns ONLY\n"
+            "- `df_intensity`  — identifier columns + intensity columns ONLY\n"
+            "- `sheets`        — dict mapping sheet name → DataFrame for ALL sheets\n"
+            "- `sample_map`    — dict mapping sample code → {client_id, strain,\n"
+            "                    treatment, mouse_id, …} (built from the identifier sheet)\n"
+            "- `pd`            — pandas\n"
+            "- `np`            — numpy\n"
+            "\n"
+            "DETERMINISTIC HELPER FUNCTIONS YOU MUST USE WHEN APPROPRIATE:\n"
+            "- `safe_fold_change(num, denom, sample_num='?', sample_den='?')`\n"
+            "    Returns float OR a clear 'undefined — …' string for /0 cases.\n"
+            "- `get_gene_symbol(protein_name)` — returns the value of `GN=…`\n"
+            "    in a UniProt-style description, else 'Unknown'.\n"
+            "- `get_short_name(protein_name)`  — bare description before ' OS='\n"
+            "- `format_protein_row(name, accession, value, unit='')`\n"
+            "    Returns a 'GeneSymbol (Accession) — Value Unit' string for any\n"
+            "    protein row, regardless of which gene / accession it carries.\n"
+            "- `get_nonstandard_protein(df, accession_or_name, metric='spc')`\n"
+            "    Look up a protein robustly; returns dict of per-sample values.\n"
+            "- `top_n_by_metric(df, metric_col, n=10)`\n"
+            "    Sort by a metric column, keeping identifier columns.\n"
+            "- `detect_metric_columns(df)` → {'identifier', 'spc', 'intensity', …}\n"
+            "\n"
+            "SHEETS DESCRIPTION:\n"
+            f"{sheets_ctx}\n\n"
+            f"USER QUESTION: {user_query!r}\n\n"
+            "STRICT RULES — read carefully:\n"
+            "\n"
+            "[OUTPUT FORMAT]\n"
+            "- Use ONLY pandas/numpy on these in-memory dataframes.\n"
+            "- NO file I/O, NO network, NO os/sys/subprocess imports, NO open(), NO to_csv/to_excel.\n"
+            "- Assign your final answer to a variable named `answer`.\n"
+            "- `answer` may be: a scalar, list, dict, Series, or DataFrame.\n"
+            "- Keep code under 20 lines. No markdown fences, no prose.\n"
+            "\n"
+            "[METRIC-TYPE DISCIPLINE — never mix metrics]\n"
+            "Use `df_spc` for spectral-count questions and `df_intensity` for\n"
+            "intensity questions. NEVER query `df` directly for these — the\n"
+            "pre-split dataframes guarantee you can't accidentally sum SpC with\n"
+            "Intensity columns.\n"
+            "\n"
+            "[IDENTIFIERS — always return them with values]\n"
+            "When returning protein rows, use `format_protein_row(name, acc, val)`\n"
+            "or include the protein name + accession columns directly. Never\n"
+            "return a bare accession or a bare metric value.\n"
+            "\n"
+            "[SAMPLE-METADATA LOOKUPS — use sample_map first]\n"
+            "When asked what a sample corresponds to (strain, treatment, client ID,\n"
+            "group), look it up in `sample_map[code]` first — that dict was built\n"
+            "from the identifier sheet, filtered to MaxQuant codes only. Return\n"
+            "all fields of the entry, not just one.\n"
+            "\n"
+            "[PRESENCE / DETECTION — return the value, not a boolean]\n"
+            "For 'is X detected in sample Y' style questions, return the actual\n"
+            "SpC / Intensity value. The NL layer will phrase yes/no.\n"
+            "\n"
+            "[SAFE DIVISION — always use safe_fold_change for fold changes]\n"
+            "Call `safe_fold_change(numer, denom, sample_num=..., sample_den=...)`.\n"
+            "It returns a float when both samples have signal and a clear\n"
+            "'undefined — protein absent in sample X' string when either is zero.\n"
+            "NEVER do raw division on SpC / Intensity values.\n"
+            "\n"
+            "[NON-STANDARD ENTRIES — use the dedicated helper]\n"
+            "For proteins with unusual identifiers (no GN= field, no UniProt-style\n"
+            "accession, contaminants), call `get_nonstandard_protein(df_spc, name)`\n"
+            "or `get_nonstandard_protein(df_intensity, name, metric='intensity')`.\n"
+            "\n"
+            "[CONTAMINANT FLAG — filter or count, never silently include]\n"
+            "If the sheet has an `is_contaminant` column (added by the MaxQuant\n"
+            "cleanup pipeline), filter `df = df[~df['is_contaminant']]` for\n"
+            "biological analyses. For questions like 'how many CON__ proteins?'\n"
+            "DO query `df['is_contaminant'].sum()` directly — the flag is there\n"
+            "specifically to make contaminants countable without inspecting\n"
+            "accession prefixes manually.\n"
+            "\n"
+            "[ROBUSTNESS]\n"
+            "- Case-insensitive partial matching for protein/gene/accession lookups.\n"
+            "- Try multiple candidate identifier columns if uncertain.\n"
+            "- Wrap risky lookups in try/except and set the value to 'NOT FOUND' on error."
+        )
+
+        # ── Review-revise loop (GenoMAS-style) ────────────────────────────────
+        # Generator writes code, Reviewer critiques, Executor runs in sandbox.
+        # On reviewer rejection OR runtime error, the generator gets the
+        # feedback and produces a corrected version. Up to 2 revision rounds.
+        from agents.code_reviewer import (
+            CodeReviewerAgent, ExecutionRecord, review_and_revise,
+        )
+        if not hasattr(self, "_code_reviewer") or self._code_reviewer is None:
+            self._code_reviewer = CodeReviewerAgent()
+
+        def _generate(extra_instruction: Optional[str]) -> str:
+            prompt = base_prompt
+            if extra_instruction:
+                prompt += f"\n\nREVISION GUIDANCE:\n{extra_instruction}\n"
+            raw = self._call_llm(
+                [{"role": "system", "content": "You generate safe pandas code."},
+                 {"role": "user",   "content": prompt}],
+                max_tokens=600, temperature=0.0,
+            )
+            return re.sub(r"^```(?:python)?\s*|\s*```$", "", raw.strip(),
+                          flags=re.MULTILINE).strip()
+
+        # ── Pre-split the primary protein sheet into SpC vs Intensity (BUG-1) ──
+        # The LLM never has to choose between mixed metric columns: df_spc only
+        # contains identifier + SpC columns, df_intensity only intensity.
+        from core import proteomics_tools as _pt
+        df_spc, df_intensity = _pt.split_spc_intensity(primary_df)
+
+        def _execute(code_str: str):
+            namespace = {
+                "df":           primary_df,
+                "df_spc":       df_spc,
+                "df_intensity": df_intensity,
+                "sheets":       {n: s for n, s in df_candidates},
+                "sample_map":   state.get("sample_map") or {},
+                "pd":           pd,
+                "np":           np,
+                # Deterministic helpers (BUG 2, 4, 6 fixes)
+                "safe_fold_change":       _pt.safe_fold_change,
+                "get_gene_symbol":        _pt.get_gene_symbol,
+                "get_short_name":         _pt.get_short_name,
+                "format_protein_row":     _pt.format_protein_row,
+                "get_nonstandard_protein": _pt.get_nonstandard_protein,
+                "top_n_by_metric":        _pt.top_n_by_metric,
+                "detect_metric_columns":  _pt.detect_metric_columns,
+            }
+            try:
+                safe_exec(code_str, namespace, timeout=15)
+                return namespace.get("answer", "(no `answer` variable set)"), None
+            except UnsafeCodeError as exc:
+                return None, f"Unsafe code rejected by sandbox: {exc}"
+            except CodeTimeoutError as exc:
+                return None, str(exc)
+            except Exception as exc:
+                return None, f"{type(exc).__name__}: {exc}"
+
+        try:
+            record: ExecutionRecord = review_and_revise(
+                generator      = _generate,
+                executor       = _execute,
+                reviewer       = self._code_reviewer,
+                user_question  = user_query,
+                schema_context = sheets_ctx,
+                max_rounds     = 2,
+            )
+        except Exception as exc:
+            self.logger.warning("Review-revise loop failed: %s", exc)
+            state["messages"].append({
+                "role": "assistant",
+                "content": "I couldn't generate a query for that — please rephrase.",
+            })
+            state["status"] = "answered"
+            return state
+
+        code       = record.code
+        result     = record.result
+        exec_error = record.error
+        self.logger.info(
+            "query_data review-revise: rounds=%d, ok=%s, final_error=%s",
+            record.rounds_used, record.ok, exec_error,
+        )
+
+        # ── Format result for the user ────────────────────────────────────────
+        if exec_error:
+            formatted_result = f"(query failed: {exec_error})"
+        elif isinstance(result, pd.DataFrame):
+            # CSV avoids the tabulate dependency to_markdown requires
+            formatted_result = result.head(30).to_csv(index=False)
+        elif isinstance(result, pd.Series):
+            formatted_result = result.head(50).to_string()
+        elif isinstance(result, (list, tuple)):
+            preview = list(result)[:60]
+            formatted_result = "\n".join(f"- {x}" for x in preview)
+            if len(result) > 60:
+                formatted_result += f"\n…(+{len(result) - 60} more)"
+        elif isinstance(result, dict):
+            # Q&A dict from multi-question mode renders as a markdown list
+            keys = list(result.keys())[:60]
+            lines = []
+            for k in keys:
+                v = result[k]
+                # Render lists / Series inline up to 8 items
+                if isinstance(v, (list, tuple)):
+                    v_str = ", ".join(str(x) for x in list(v)[:8])
+                    if len(v) > 8:
+                        v_str += f" …(+{len(v)-8} more)"
+                elif isinstance(v, pd.Series):
+                    v_str = ", ".join(str(x) for x in v.head(8).tolist())
+                else:
+                    v_str = str(v)
+                # Trim very long single values
+                if len(v_str) > 220:
+                    v_str = v_str[:220] + "…"
+                lines.append(f"- **{k}**: {v_str}")
+            formatted_result = "\n".join(lines)
+            if len(result) > 60:
+                formatted_result += f"\n…(+{len(result) - 60} more keys)"
+        else:
+            formatted_result = str(result)
+
+        # Cap the formatted-result size to avoid token blow-up.
+        if len(formatted_result) > 6000:
+            formatted_result = formatted_result[:6000] + "\n…[truncated]"
+
+        # ── Ask LLM to write a clear natural-language answer ──────────────────
+        nl_prompt = (
+            f"The user asked: {user_query!r}\n\n"
+            f"I ran a pandas query against their data and got this result:\n"
+            f"```\n{formatted_result}\n```\n\n"
+            "Write a clear, concise natural-language answer (2–5 sentences). "
+            "Quote the exact numbers/values from the result. If the result is a "
+            "table, summarise it. If it's empty or failed, say so plainly."
+        )
+        nl_max_tokens = 500
+        try:
+            nl_response = self._call_llm(
+                [{"role": "system", "content":
+                    "You translate pandas query results into clear answers. "
+                    "Do not fabricate values that aren't in the result."},
+                 {"role": "user", "content": nl_prompt}],
+                max_tokens=nl_max_tokens,
+            )
+        except Exception as exc:
+            self.logger.warning("Data-query NL response LLM failed: %s", exc)
+            nl_response = f"Result:\n\n{formatted_result}"
+
+        # Store the pandas query quietly — surfaced only when the user asks.
+        state["last_query_code"]   = code
+        state["last_query_engine"] = "pandas"
+        state["messages"].append({"role": "assistant", "content": nl_response.strip()})
+        state["intent"]       = "query_data"
+        state["active_agent"] = "learning_agent"
+        state["status"]       = "answered"
+        return state
+
+    # ── Multi-question split + per-question routing ───────────────────────────
+
+    @_traceable(run_type="chain", name="orchestrator.multi_question",
+                tags=["biomarker-discovery", "multi_question"])
+    def _handle_multi_question(
+        self, state: BiomarkerState, questions: List[str],
+    ) -> BiomarkerState:
+        """
+        When the user pastes multiple questions in one message, split them and
+        route each through the normal decision flow. Each question gets its own
+        routing decision (query_data / answer / query_database / show_code etc.)
+        and its own response. Responses are combined into a single numbered
+        markdown block.
+        """
+        n = len(questions)
+        parts: List[str] = [f"You asked **{n} questions** — answering each below.\n"]
+
+        for i, q in enumerate(questions, 1):
+            self.logger.info("Multi-q [%d/%d]: %s", i, n, q[:80])
+
+            # Build a sub-state for this single question only. Critical:
+            # `messages` is reset so per-question handlers don't append to the
+            # main thread; we capture each sub-response separately.
+            sub_state: BiomarkerState = {**state, "user_query": q, "messages": []}
+
+            try:
+                sub_decision = self._make_decision(sub_state)
+                sub_action   = sub_decision.get("action", "answer")
+                sub_state["intent"]       = sub_action
+                sub_state["active_agent"] = "learning_agent"
+
+                if sub_action == "query_data":
+                    sub_state = self._query_data(sub_state)
+                elif sub_action == "query_database":
+                    sub_state = self._query_database(sub_state)
+                elif sub_action == "show_code":
+                    sub_state = self._show_code(sub_state)
+                elif sub_action == "modify_code":
+                    sub_state = self._modify_code(sub_state)
+                else:
+                    # answer, ask_clarification, run_*, load_data — all fall through
+                    # to the conversational answer path for sub-questions, since we
+                    # don't want side-effects like re-running analysis 30 times.
+                    sub_state = self._answer(sub_state)
+
+                last = next(
+                    (m["content"] for m in reversed(sub_state.get("messages") or [])
+                     if m.get("role") == "assistant"),
+                    "_(no response generated)_",
+                )
+            except Exception as exc:
+                self.logger.warning("Multi-q sub-question %d failed: %s", i, exc)
+                last = f"_(internal error: {exc})_"
+
+            parts.append(f"### {i}. {q}\n\n{last}\n")
+
+        combined = "\n".join(parts)
+        state["messages"].append({"role": "assistant", "content": combined})
+        state["intent"]       = "multi_question"
+        state["active_agent"] = "learning_agent"
+        state["status"]       = "answered"
+        return state
+
+    # ── Tool-calling query path (ExcelWorker pattern) ─────────────────────────
+
+    @_traceable(run_type="chain", name="orchestrator.query_data.tools",
+                tags=["biomarker-discovery", "query_data", "tools"])
+    def _query_data_via_tools(
+        self,
+        state:         BiomarkerState,
+        user_query:    str,
+        df_candidates: List[Tuple[str, Any]],
+        primary_df:    Any,
+        primary_name:  str,
+        max_iterations: int = 7,
+    ):
+        """
+        Drive the OpenAI tool-call loop. The LLM picks among:
+          - load_preview_data
+          - complex_duckdb_query
+          - simple_dataframe_query
+        and emits structured arguments. We dispatch, append a tool message,
+        loop until the model returns a final text message (no more tool_calls)
+        or hits `max_iterations`.
+
+        Returns a dict ``{ok, final_text, tool_calls_history, error}`` or
+        ``None`` when the path can't run (no tools available).
+        """
+        try:
+            from core import data_store as _ds
+            from core import llm_tools as _lt
+            from core import proteomics_tools as _pt
+        except ImportError:
+            return None
+        if not _ds.is_available():
+            return None
+        session_id = state.get("session_id", "")
+        if _ds.get_store(session_id) is None:
+            return None
+
+        # ── Build the pandas execution namespace once and reuse it ────────────
+        import pandas as pd
+        import numpy as np
+        df_spc, df_intensity = _pt.split_spc_intensity(primary_df)
+        pandas_namespace: Dict[str, Any] = {
+            "df":           primary_df,
+            "df_spc":       df_spc,
+            "df_intensity": df_intensity,
+            "sheets":       {n: s for n, s in df_candidates},
+            "sample_map":   state.get("sample_map") or {},
+            "pd":           pd,
+            "np":           np,
+            "safe_fold_change":       _pt.safe_fold_change,
+            "get_gene_symbol":        _pt.get_gene_symbol,
+            "get_short_name":         _pt.get_short_name,
+            "format_protein_row":     _pt.format_protein_row,
+            "get_nonstandard_protein": _pt.get_nonstandard_protein,
+            "top_n_by_metric":        _pt.top_n_by_metric,
+            "detect_metric_columns":  _pt.detect_metric_columns,
+        }
+
+        # ── System prompt for the tool-calling LLM ────────────────────────────
+        system_prompt = (
+            "You answer questions about a proteomics workbook by calling the "
+            "provided tools. Workflow:\n"
+            "  1. ALWAYS call `load_preview_data` first to see the exact table\n"
+            "     and column names available — never guess column names.\n"
+            "  2. For most data questions, call `complex_duckdb_query` with a\n"
+            "     SQL query. ALWAYS double-quote identifiers containing spaces\n"
+            "     or mixed case. Use ILIKE for partial text matches. Include\n"
+            "     identifier columns (protein name, gene, accession) in every\n"
+            "     SELECT that returns protein rows.\n"
+            "  3. For operations awkward in SQL (custom regex, multi-step\n"
+            "     transforms, calls to safe_fold_change / get_gene_symbol /\n"
+            "     format_protein_row / get_nonstandard_protein), call\n"
+            "     `simple_dataframe_query` with a pandas snippet that assigns\n"
+            "     to `answer`. Use `df_spc` for SpC questions and\n"
+            "     `df_intensity` for intensity questions — never mix.\n"
+            "  4. If a sheet has an `is_contaminant` boolean column, filter\n"
+            "     `WHERE NOT is_contaminant` for biology questions but use\n"
+            "     it directly for 'how many contaminants?' counts.\n"
+            "  5. For fold changes, use safe_fold_change (handles /0).\n"
+            "  6. After you have the answer, return a clear natural-language\n"
+            "     response WITHOUT calling another tool. Quote exact values\n"
+            "     from the tool result; never fabricate.\n"
+            "\n"
+            f"Active session: {session_id[:8]}.\n"
+            f"Primary table name in DuckDB: {_ds.get_store(session_id).table_names.get(primary_name, primary_name)}.\n"
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_query},
+        ]
+        tool_specs = _lt.get_openai_tool_specs()
+        history: List[Dict[str, Any]] = []
+        final_text: Optional[str] = None
+        error: Optional[str] = None
+
+        for it in range(max_iterations):
+            try:
+                resp = self._call_llm_with_tools(
+                    messages, tools=tool_specs,
+                    max_tokens=900, temperature=0.0,
+                )
+            except Exception as exc:
+                self.logger.warning("Tool-call LLM step %d failed: %s", it, exc)
+                error = f"LLM tool-call error: {exc}"
+                break
+
+            tool_calls = resp.get("tool_calls")
+            if not tool_calls:
+                # Final text answer — exit the loop
+                final_text = (resp.get("content") or "").strip()
+                break
+
+            # Append the assistant message with tool_calls so the model can
+            # see its own previous tool requests in subsequent turns.
+            messages.append({
+                "role":       "assistant",
+                "content":    resp.get("content"),
+                "tool_calls": [
+                    {
+                        "id":   tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name":      tc["name"],
+                            "arguments": tc["arguments"],
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
+
+            # Dispatch every tool call requested in this turn
+            for tc in tool_calls:
+                context = {"session_id": session_id}
+                if tc["name"] == "simple_dataframe_query":
+                    # Each pandas call gets a FRESH namespace clone so previous
+                    # `answer` bindings don't bleed across iterations.
+                    context["namespace"] = dict(pandas_namespace)
+                tool_result_json = _lt.execute_tool_call(
+                    tc["name"], tc["arguments"], context,
+                )
+                history.append({
+                    "iteration":  it,
+                    "tool":       tc["name"],
+                    "arguments":  tc["arguments"],
+                    "result_preview": tool_result_json[:300],
+                })
+                messages.append({
+                    "role":         "tool",
+                    "tool_call_id": tc["id"],
+                    "content":      tool_result_json,
+                })
+
+        if final_text is None:
+            error = error or f"tool-call loop hit {max_iterations}-iteration cap"
+
+        ok = (final_text is not None) and bool(final_text.strip()) and (error is None)
+        return {
+            "ok":         ok,
+            "final_text": final_text,
+            "history":    history,
+            "error":      error,
+        }
+
+    def _render_tool_result(
+        self,
+        state:        BiomarkerState,
+        record:       dict,
+        user_query:   str,
+    ) -> None:
+        """Append the tool-loop final answer to state and stash the last
+        tool call's args as `last_query_code` so 'show me the code' still works."""
+        state["messages"].append({
+            "role":    "assistant",
+            "content": record["final_text"],
+        })
+        # Save the last tool call code for the show_code action
+        last_query = None
+        last_engine = "sql"
+        for h in reversed(record.get("history") or []):
+            if h["tool"] in ("complex_duckdb_query", "simple_dataframe_query"):
+                try:
+                    args = json.loads(h.get("arguments") or "{}")
+                    last_query = args.get("query")
+                    last_engine = ("sql" if h["tool"] == "complex_duckdb_query"
+                                   else "pandas")
+                except Exception:
+                    pass
+                if last_query:
+                    break
+        if last_query:
+            state["last_query_code"]   = last_query
+            state["last_query_engine"] = last_engine
+        state["intent"]       = "query_data"
+        state["active_agent"] = "learning_agent"
+        state["status"]       = "answered"
+
+    # ── DuckDB / SQL query path ───────────────────────────────────────────────
+
+    def _try_sql_query(
+        self,
+        state: BiomarkerState,
+        user_query: str,
+        df_candidates: List[Tuple[str, Any]],
+    ):
+        """
+        SQL-first attempt: build a schema block from DuckDB DESCRIBE, ask the
+        LLM to generate a SQL query, review it, execute via DuckDB. Returns
+        an `ExecutionRecord`-compatible object (with .ok / .result / .error /
+        .code) or None when DuckDB is unavailable.
+
+        Falls through to the pandas path (in `_query_data`) when SQL fails.
+        """
+        try:
+            from core import data_store as _ds
+        except ImportError:
+            return None
+        if not _ds.is_available():
+            return None
+
+        session_id = state.get("session_id", "")
+        store = _ds.get_store(session_id)
+        if store is None or not store.table_names:
+            return None
+
+        schema_block = _ds.schema_text(session_id)
+        if not schema_block.strip():
+            return None
+
+        # ── Build SQL-generation prompt ───────────────────────────────────────
+        sql_base_prompt = (
+            "You write SQL queries (DuckDB dialect) to answer questions about a "
+            "proteomics workbook. Every sheet is registered as a DuckDB table — "
+            "use the EXACT table names and column names shown in the schema below.\n\n"
+            "SCHEMA (DuckDB tables, exactly as available):\n"
+            f"{schema_block}\n\n"
+            f"USER QUESTION: {user_query!r}\n\n"
+            "STRICT RULES — read carefully:\n"
+            "\n"
+            "[OUTPUT FORMAT]\n"
+            "- Output a SINGLE SQL statement (no semicolons mid-query).\n"
+            "- ALWAYS double-quote table names and column names that contain spaces,\n"
+            "  punctuation, or mixed case: SELECT \"some col\" FROM \"sheet name\".\n"
+            "- Return ONLY the SQL — no markdown fences, no prose, no explanation.\n"
+            "- LIMIT results to 200 rows when returning a multi-row table.\n"
+            "- If the question cannot be answered with SQL (e.g. concept question,\n"
+            "  file structure not in tables), output the literal string 'NOT_SQL'.\n"
+            "\n"
+            "[METRIC-TYPE DISCIPLINE — never mix metrics]\n"
+            "Proteomics workbooks usually have several PARALLEL column families that\n"
+            "share the same per-sample prefix but encode different metrics — e.g.\n"
+            "<S> SpC (spectral count), <S> Intensity, <S> Ratio H/L, <S> LFQ, MW, etc.\n"
+            "- When the user asks for a specific metric (spectral count, intensity,\n"
+            "  ratio, MW, concentration, log2FC), ONLY select columns whose name\n"
+            "  matches that metric for the relevant sample(s).\n"
+            "- Never sum, average, or filter across DIFFERENT metric types.\n"
+            "- If the requested metric isn't in the schema, say so via NOT_SQL\n"
+            "  rather than substituting a different metric.\n"
+            "\n"
+            "[IDENTIFIERS — always return them with values]\n"
+            "When the question asks about proteins, ALWAYS include the protein\n"
+            "identifier columns alongside the requested value:\n"
+            "  - Protein name / description column (if present)\n"
+            "  - Gene symbol column (if present)\n"
+            "  - Accession / UniProt ID column (if present)\n"
+            "This holds even if the user only asked for the value — the answer\n"
+            "is incomplete without the row's identity.\n"
+            "\n"
+            "[SAMPLE-METADATA LOOKUPS — always join the metadata sheet]\n"
+            "When the user asks what a SAMPLE corresponds to (its strain, treatment,\n"
+            "client ID, group, etc.), look up the sample in the IDENTIFIER / METADATA\n"
+            "sheet (typically the smallest sheet with one row per sample). Return\n"
+            "ALL columns of that sheet for the matching sample row, not just one.\n"
+            "Do NOT pick rows from the primary protein sheet for sample-level info.\n"
+            "\n"
+            "[PRESENCE / DETECTION QUESTIONS — return the value, not a boolean]\n"
+            "When asked 'is X detected in sample Y' or 'does X appear in Y', return\n"
+            "the actual quantitative value(s) — SpC, Intensity, whatever metric is\n"
+            "appropriate. Do NOT return a bare TRUE/FALSE; the natural-language\n"
+            "layer will phrase 'yes/no' from the value.\n"
+            "\n"
+            "[SAFE DIVISION — never divide by zero]\n"
+            "Fold changes, ratios, and any division MUST use a safe-divide pattern:\n"
+            "  CASE WHEN denom = 0 OR denom IS NULL THEN NULL ELSE numer / denom END\n"
+            "Treat 0 as 'absent / not detected' — never silently produce 0 or inf.\n"
+            "If a ratio is undefined for that pair, return NULL and let the NL\n"
+            "layer explain 'undefined — protein absent in the denominator sample'.\n"
+            "\n"
+            "[TEXT MATCHING]\n"
+            "- Use ILIKE '%pattern%' for case-insensitive partial matches on text\n"
+            "  columns (protein name, gene, accession).\n"
+            "- Search across multiple candidate identifier columns when uncertain\n"
+            "  which column actually contains the user's reference.\n"
+            "\n"
+            "[AGGREGATIONS]\n"
+            "- Use COUNT, SUM, AVG, MIN, MAX as appropriate.\n"
+            "- For 'top N by X' use ORDER BY X DESC LIMIT N — include the\n"
+            "  identifier columns in the SELECT (see [IDENTIFIERS] rule).\n"
+            "\n"
+            "[CONTAMINANT FLAG]\n"
+            "If a table has an `is_contaminant` BOOLEAN column (added by the\n"
+            "MaxQuant cleanup pipeline), add `WHERE is_contaminant = FALSE` to\n"
+            "biological queries. For counting questions like 'how many CON__\n"
+            "proteins?' DO use `WHERE is_contaminant = TRUE` — the flag exists\n"
+            "specifically so counts work without scanning accession prefixes.\n"
+        )
+
+        from agents.code_reviewer import (
+            CodeReviewerAgent, ExecutionRecord, review_and_revise,
+        )
+        if not hasattr(self, "_code_reviewer") or self._code_reviewer is None:
+            self._code_reviewer = CodeReviewerAgent()
+
+        def _generate_sql(extra: Optional[str]) -> str:
+            prompt = sql_base_prompt
+            if extra:
+                prompt += f"\n\nREVISION GUIDANCE:\n{extra}\n"
+            raw = self._call_llm(
+                [{"role": "system", "content":
+                    "You write DuckDB SQL queries — exact column names, no prose."},
+                 {"role": "user", "content": prompt}],
+                max_tokens=500, temperature=0.0,
+            )
+            # Strip code fences if the LLM added them
+            cleaned = re.sub(r"^```(?:sql)?\s*|\s*```$", "", raw.strip(),
+                             flags=re.MULTILINE).strip()
+            return cleaned
+
+        def _execute_sql(sql_str: str):
+            # Sentinel: LLM punted because the question isn't SQL-shaped
+            if sql_str.strip().upper().startswith("NOT_SQL"):
+                return None, "LLM declined SQL — falling back to pandas."
+            df_result, err = _ds.query(session_id, sql_str, max_rows=200)
+            if err is not None:
+                return None, err
+            return df_result, None
+
+        try:
+            record: ExecutionRecord = review_and_revise(
+                generator      = _generate_sql,
+                executor       = _execute_sql,
+                reviewer       = self._code_reviewer,
+                user_question  = user_query,
+                schema_context = schema_block,
+                max_rounds     = 1,  # SQL is precise; one revision is usually enough
+            )
+        except Exception as exc:
+            self.logger.debug("SQL review-revise crashed: %s", exc)
+            return None
+
+        return record
+
+    def _render_sql_result(
+        self,
+        state:       BiomarkerState,
+        record,
+        user_query:  str,
+    ) -> None:
+        """Format a successful SQL ExecutionRecord into a chat message."""
+        import pandas as pd
+        result = record.result
+
+        if isinstance(result, pd.DataFrame):
+            if len(result) == 0:
+                formatted = "_(query returned no rows)_"
+            elif result.shape == (1, 1):
+                # Scalar answer
+                formatted = str(result.iloc[0, 0])
+            else:
+                # CSV avoids the tabulate dependency to_markdown requires
+                formatted = result.head(30).to_csv(index=False)
+        else:
+            formatted = str(result)
+
+        if len(formatted) > 4000:
+            formatted = formatted[:4000] + "\n…[truncated]"
+
+        nl_prompt = (
+            f"The user asked: {user_query!r}\n\n"
+            f"A DuckDB SQL query produced this result:\n```\n{formatted}\n```\n\n"
+            "Write a clear, concise natural-language answer (2–5 sentences). "
+            "Quote exact numbers/values. If the result is a table, summarise it. "
+            "If it's empty, say so plainly."
+        )
+        try:
+            nl_response = self._call_llm(
+                [{"role": "system", "content":
+                    "You translate SQL query results into clear answers. "
+                    "Never fabricate values not in the result."},
+                 {"role": "user", "content": nl_prompt}],
+                max_tokens=500,
+            )
+        except Exception as exc:
+            self.logger.warning("SQL NL response LLM failed: %s", exc)
+            nl_response = f"Result:\n\n{formatted}"
+
+        # Store the query quietly so the user can retrieve it via "show the code"
+        # — by default we never include code in the chat message.
+        state["last_query_code"]   = record.code
+        state["last_query_engine"] = "sql"
+        state["messages"].append({"role": "assistant", "content": nl_response.strip()})
+        state["intent"]       = "query_data"
+        state["active_agent"] = "learning_agent"
+        state["status"]       = "answered"
+
+    def _load_sheets_for_query(
+        self, state: BiomarkerState, data_path: str,
+    ) -> Dict[str, Any]:
+        """Return {sheet_name: DataFrame}. Prefer cached state, fall back to disk."""
+        import pandas as pd
+
+        cached = state.get("all_sheets")
+        if cached and isinstance(cached, dict):
+            sheets = {}
+            for k, v in cached.items():
+                if isinstance(v, pd.DataFrame):
+                    sheets[k] = v
+            if sheets:
+                return sheets
+
+        try:
+            if str(data_path).lower().endswith((".xlsx", ".xls")):
+                return pd.read_excel(data_path, sheet_name=None)
+            return {"data": pd.read_csv(data_path)}
+        except Exception as exc:
+            self.logger.warning("Sheet reload failed: %s", exc)
+            return {}
+
     # ── General answer ────────────────────────────────────────────────────────
 
     @_traceable(run_type="chain", name="orchestrator.answer",
@@ -881,15 +1866,19 @@ class LearningAgent(BaseAgent):
         """
         ctx = ["## Session context (ONLY use this when answering questions about the user's data)"]
         if state.get("data_type"):
-            sample_cols = state.get("sample_columns") or []
-            label_map   = state.get("label_map") or {}
-            g1          = state.get("group1_label")
-            g2          = state.get("group2_label")
-            g1_samps    = state.get("group1_samples") or []
-            g2_samps    = state.get("group2_samples") or []
+            sample_cols  = state.get("sample_columns") or []
+            meta_cols    = state.get("metadata_columns") or []
+            label_map    = state.get("label_map") or {}
+            g1           = state.get("group1_label")
+            g2           = state.get("group2_label")
+            g1_samps     = state.get("group1_samples") or []
+            g2_samps     = state.get("group2_samples") or []
+            all_sheets   = state.get("all_sheets") or {}
+            data_path    = state.get("data_path") or state.get("raw_data_path") or "?"
 
             ctx += [
                 f"- Data loaded: YES",
+                f"- File path: {data_path}",
                 f"- Proteins: {state.get('n_proteins','?')}",
                 f"- Samples: {state.get('n_samples','?')}",
                 f"- Data type: {state.get('data_type','?')}",
@@ -897,8 +1886,26 @@ class LearningAgent(BaseAgent):
                 f"- Pooled design: {state.get('is_pooled_design', False)}",
                 f"- Organism: {state.get('organism', 'not set')}",
                 f"- Disease program: {state.get('disease_program', 'General')}",
-                f"- Sample columns (first 20): {sample_cols[:20]}",
+                f"- Sample columns ({len(sample_cols)}): {sample_cols[:30]}",
+                f"- Metadata columns ({len(meta_cols)}): {meta_cols[:20]}",
             ]
+            if all_sheets:
+                sheet_names = list(all_sheets.keys())
+                ctx.append(f"- Number of sheets: {len(sheet_names)}")
+                ctx.append(f"- Sheet names: {sheet_names}")
+                # Show shape + a few columns from each sheet so factual questions
+                # about file structure can be answered without query_data.
+                try:
+                    import pandas as _pd  # local import to keep top-level lean
+                    for sname, sdf in list(all_sheets.items())[:8]:
+                        if isinstance(sdf, _pd.DataFrame):
+                            scols = list(sdf.columns)[:15]
+                            ctx.append(
+                                f"  · {sname!r}: shape={sdf.shape}, "
+                                f"cols={scols}{' …' if len(sdf.columns) > 15 else ''}"
+                            )
+                except Exception:
+                    pass
             if label_map:
                 ctx.append(f"- Pooled groups (label map): { {k: v for k, v in label_map.items()} }")
             elif g1 and g2:
@@ -987,6 +1994,16 @@ class LearningAgent(BaseAgent):
 
         user_query = state.get("user_query", "")
         state["messages"].append({"role": "user", "content": user_query})
+
+        # ── Multi-question split ──────────────────────────────────────────────
+        # If the user pasted ≥2 questions, split them and answer each one
+        # individually — each question gets its own routing decision and
+        # its own response. Better-quality answers than batching everything
+        # into a single LLM call.
+        qs = _extract_questions(user_query)
+        if len(qs) >= 2:
+            self.logger.info("Multi-question detected (%d) — splitting and routing each.", len(qs))
+            return self._handle_multi_question(state, qs)
 
         decision = self._make_decision(state)
         action   = decision.get("action", "answer")
@@ -1111,6 +2128,10 @@ class LearningAgent(BaseAgent):
         # ── Database query (UniProt) ───────────────────────────────────────────
         if action == "query_database":
             return self._query_database(state)
+
+        # ── Raw-data query (pandas on uploaded sheets) ─────────────────────────
+        if action == "query_data":
+            return self._query_data(state)
 
         # ── Answer (default) ──────────────────────────────────────────────────
         return self._answer(state)

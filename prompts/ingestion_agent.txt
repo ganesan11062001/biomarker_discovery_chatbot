@@ -8,7 +8,9 @@ You will receive dataset metadata including:
 - sample_columns: the actual column names detected as samples
 - metadata_columns: non-numeric columns (may contain group labels, patient IDs, etc.)
 - is_pooled_design: whether each group is a single pooled sample (n=1 per group)
-- label_map: for pooled designs, maps labels to group names (e.g. A→WT, B→mdx)
+- label_map: for pooled designs, maps short codes (A, B, C, …) to whatever
+  group names the dataset itself defined (do NOT assume the labels — read
+  them from the provided label_map)
 - inferred_groups: groups auto-detected from column naming patterns
 
 Your response should:

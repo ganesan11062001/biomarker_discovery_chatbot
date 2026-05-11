@@ -1,0 +1,83 @@
+{
+  "$schema": "GenoMAS-style action units — each unit is a named, parameterised step the BiomarkerAgent performs.",
+
+  "units": [
+    {
+      "name": "qc_filter",
+      "instruction": "Filter proteins with more than `missing_threshold` fraction of missing values across all samples. Drop contaminant rows (CON__, REV__ prefixes).",
+      "parameters": ["missing_threshold"],
+      "fail_severity": "fatal",
+      "code_template": "df = df.loc[df.isna().mean(axis=1) <= missing_threshold]"
+    },
+    {
+      "name": "log2_transform",
+      "instruction": "Apply log2(x + pseudocount) transform to the sample intensity columns. Skip if data appears already log-transformed (negative values present or range < 30).",
+      "parameters": ["pseudocount"],
+      "fail_severity": "major",
+      "code_template": "import numpy as np\ndf[sample_cols] = np.log2(df[sample_cols].clip(lower=0) + pseudocount)"
+    },
+    {
+      "name": "median_normalize",
+      "instruction": "Median-normalise each sample column to the global median, equalising loading across samples.",
+      "parameters": [],
+      "fail_severity": "minor",
+      "code_template": "global_median = df[sample_cols].median().median()\nfor c in sample_cols:\n    df[c] = df[c] - df[c].median() + global_median"
+    },
+    {
+      "name": "group_filter",
+      "instruction": "For supervised analysis, keep proteins with at least `min_valid_per_group` valid values in BOTH groups.",
+      "parameters": ["min_valid_per_group"],
+      "fail_severity": "major",
+      "code_template": "valid_g1 = df[g1_samples].notna().sum(axis=1)\nvalid_g2 = df[g2_samples].notna().sum(axis=1)\ndf = df[(valid_g1 >= min_valid_per_group) & (valid_g2 >= min_valid_per_group)]"
+    },
+    {
+      "name": "impute_missing",
+      "instruction": "Half-min imputation: replace remaining NaN with half of the minimum non-NaN value of the row.",
+      "parameters": [],
+      "fail_severity": "minor",
+      "code_template": "row_min = df[sample_cols].min(axis=1, skipna=True)\ndf[sample_cols] = df[sample_cols].apply(lambda row: row.fillna(row.dropna().min() / 2 if row.dropna().size else 0), axis=1)"
+    },
+    {
+      "name": "select_test_method",
+      "instruction": "Auto-select statistical test: limma eBayes when each group has n <= 4 replicates, otherwise Welch t-test. Override with explicit user request (paired_t, anova).",
+      "parameters": ["test_method", "is_paired", "n_per_group"],
+      "fail_severity": "fatal",
+      "code_template": "if test_method == 'auto': test_method = 'limma' if min(n_per_group) <= 4 else 'welch'"
+    },
+    {
+      "name": "differential_expression",
+      "instruction": "Run the selected test for each protein; compute log2 fold change (group1 mean - group2 mean) and p-value.",
+      "parameters": ["test_method", "is_paired"],
+      "fail_severity": "fatal",
+      "code_template": "# dispatched in ProteomicsAnalysisSkill — see analysis_code field"
+    },
+    {
+      "name": "fdr_correction",
+      "instruction": "Apply Benjamini-Hochberg FDR correction to all p-values to control family-wise error.",
+      "parameters": [],
+      "fail_severity": "major",
+      "code_template": "from statsmodels.stats.multitest import multipletests\nadj_p = multipletests(p_values, method='fdr_bh')[1]"
+    },
+    {
+      "name": "rank_biomarkers",
+      "instruction": "Rank proteins by adj_p (ascending) then by |log2FC| (descending). Annotate significance tiers: *** adj_p<0.001, ** adj_p<0.01, * adj_p<0.05, ns otherwise.",
+      "parameters": ["adj_pval_cutoff", "log2fc_cutoff"],
+      "fail_severity": "minor",
+      "code_template": "results = results.sort_values(['adj_p_value', 'abs_log2fc'], ascending=[True, False])"
+    },
+    {
+      "name": "export_excel",
+      "instruction": "Write multi-sheet Excel report: top biomarkers, full results, QC summary, analysis parameters.",
+      "parameters": ["output_dir", "file_name"],
+      "fail_severity": "minor",
+      "code_template": "results.to_excel(output_path, sheet_name='Top Biomarkers', index=False)"
+    },
+    {
+      "name": "biological_interpretation",
+      "instruction": "Domain expert LLM pass: generate a markdown interpretation grounded only in the top biomarker list. No hallucinated proteins or pathways.",
+      "parameters": [],
+      "fail_severity": "ok",
+      "code_template": "# delegated to DomainExpertAgent.interpret(state)"
+    }
+  ]
+}

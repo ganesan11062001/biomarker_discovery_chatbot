@@ -11,11 +11,16 @@ class Settings(BaseSettings):
     azure_openai_api_version: str = "2024-08-01-preview"
 
     # ── Model deployments ─────────────────────────────────────────────────────
-    azure_deployment_chat: str = "gpt-4o"
-    azure_deployment_ingestion: str = "gpt-4o"
-    azure_deployment_biomarker: str = "gpt-4o"
-    azure_deployment_enrichment: str = "gpt-4o"
-    azure_deployment_visualization: str = "gpt-4o"
+    # Heterogeneous-LLM support: set each to a different deployment to route
+    # specific agent types to different models (e.g. small/fast for routing,
+    # larger/smart for code review and biological interpretation).
+    azure_deployment_chat:           str = "gpt-4o"
+    azure_deployment_ingestion:      str = "gpt-4o"
+    azure_deployment_biomarker:      str = "gpt-4o"
+    azure_deployment_enrichment:     str = "gpt-4o"
+    azure_deployment_visualization:  str = "gpt-4o"
+    azure_deployment_code_reviewer:  str = "gpt-4o"   # critic — small+sharp recommended
+    azure_deployment_domain_expert:  str = "gpt-4o"   # biology — larger model recommended
 
     # ── Directories ───────────────────────────────────────────────────────────
     data_raw_dir: str = "data/raw"

@@ -379,11 +379,19 @@ st.markdown("""
 # API helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _api_create_session(disease_program: str = "General", organism: str = "human") -> str | None:
+def _api_create_session(
+    disease_program: str | None = None,
+    organism: str | None = None,
+) -> str | None:
     try:
+        params = {}
+        if disease_program:
+            params["disease_program"] = disease_program
+        if organism:
+            params["organism"] = organism
         r = requests.post(
             f"{API_BASE}/chat/session",
-            params={"disease_program": disease_program, "organism": organism},
+            params=params,
             timeout=10,
         )
         if r.status_code == 201:
@@ -408,9 +416,12 @@ def _api_send_message(session_id: str, message: str) -> dict | None:
     payload: dict[str, Any] = {
         "session_id":      session_id,
         "message":         message,
-        "disease_program": st.session_state.get("disease_program", "General"),
-        "organism":        st.session_state.get("organism", "human"),
     }
+    # Only forward user-set values; never default to a fixed disease/organism
+    if st.session_state.get("disease_program"):
+        payload["disease_program"] = st.session_state["disease_program"]
+    if st.session_state.get("organism"):
+        payload["organism"] = st.session_state["organism"]
     try:
         r = requests.post(f"{API_BASE}/chat/", json=payload, timeout=300)
         if r.status_code == 200:
@@ -429,14 +440,15 @@ def _api_upload_file(
     file_bytes: bytes, filename: str, file_type: str, session_id: str,
 ) -> dict | None:
     try:
+        data = {"session_id": session_id}
+        if st.session_state.get("disease_program"):
+            data["disease_program"] = st.session_state["disease_program"]
+        if st.session_state.get("organism"):
+            data["organism"] = st.session_state["organism"]
         r = requests.post(
             f"{API_BASE}/upload/",
             files={"file": (filename, file_bytes, file_type)},
-            data={
-                "session_id":      session_id,
-                "disease_program": st.session_state.get("disease_program", "General"),
-                "organism":        st.session_state.get("organism", "human"),
-            },
+            data=data,
             timeout=120,
         )
     except requests.exceptions.ConnectionError:
@@ -457,15 +469,18 @@ def _api_upload_file(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _init_session() -> None:
+    # disease_program and organism intentionally start as None — they get
+    # populated from the file at upload time (organism detected from OS=
+    # suffixes) or by the user explicitly setting them in chat.
     defaults: dict[str, Any] = {
-        "session_id":     None,
-        "messages":       [],
-        "analysis_state": {},
-        "upload_result":  None,
-        "disease_program": "General",
-        "organism":        "human",
-        "api_error":       None,
-        "_attach_ver":     0,
+        "session_id":        None,
+        "messages":          [],
+        "analysis_state":    {},
+        "upload_result":     None,
+        "disease_program":   None,
+        "organism":          None,
+        "api_error":         None,
+        "_attach_ver":       0,
         "_last_attach_name": None,
     }
     for k, v in defaults.items():
@@ -477,8 +492,8 @@ def _ensure_session() -> str | None:
     if st.session_state.get("session_id"):
         return st.session_state["session_id"]
     sid = _api_create_session(
-        st.session_state.get("disease_program", "General"),
-        st.session_state.get("organism", "human"),
+        st.session_state.get("disease_program"),
+        st.session_state.get("organism"),
     )
     if sid:
         st.session_state["session_id"] = sid
@@ -584,7 +599,8 @@ def _build_upload_message(result: dict) -> str:
     dtype     = result.get("data_type", "unknown")
     is_pooled = result.get("is_pooled_design", False)
     label_map = result.get("label_map") or {}
-    sample_cols = result.get("sample_columns") or []
+    sample_cols     = result.get("sample_columns") or []
+    inferred_groups = result.get("inferred_groups") or {}
 
     lines = [f"**Data loaded** — {n_p} proteins · {n_s} samples · `{dtype}`"]
 
@@ -594,15 +610,36 @@ def _build_upload_message(result: dict) -> str:
             f"\nPooled design detected: {groups}",
             "\nType **run analysis** to compute log₂ fold-changes across all groups.",
         ]
+        return "\n".join(lines)
+
+    # Non-pooled: show inferred groups (if any) and ALL sample columns.
+    if inferred_groups:
+        lines.append("\n**Auto-detected groups:**")
+        for gname, gsamples in inferred_groups.items():
+            cols_str = ", ".join(f"`{c}`" for c in gsamples)
+            lines.append(f"- **{gname}** ({len(gsamples)}): {cols_str}")
+        lines.append(
+            "\nType **run analysis** to compare the first two groups, or name the "
+            "specific groups you'd like to compare (e.g. *'compare {} vs {}'*)."
+            .format(*list(inferred_groups.keys())[:2])
+        )
     else:
         if sample_cols:
-            preview = ", ".join(f"`{c}`" for c in sample_cols[:8])
-            more    = f" … (+{len(sample_cols)-8} more)" if len(sample_cols) > 8 else ""
-            lines.append(f"\nSample columns: {preview}{more}")
+            # Show ALL sample columns so the user can choose; chunk into lines
+            # of 6 for readability.
+            chunks = [sample_cols[i:i + 6] for i in range(0, len(sample_cols), 6)]
+            cols_block = "\n".join(
+                "  " + ", ".join(f"`{c}`" for c in chunk) for chunk in chunks
+            )
+            lines.append(f"\n**All sample columns ({len(sample_cols)}):**\n{cols_block}")
         lines.append(
-            "\nTell me which groups to compare — for example:\n"
-            "> *\"Compare Control_1, Control_2, Control_3 vs Disease_1, Disease_2, Disease_3\"*\n\n"
+            "\nTell me which groups to compare using the column names above, e.g.:\n"
+            "> *\"compare {first} vs {second}\"*\n\n"
             "Or type **run all comparisons** to auto-detect groups and analyse everything."
+            .format(
+                first=sample_cols[0] if sample_cols else "GroupA",
+                second=sample_cols[1] if len(sample_cols) > 1 else "GroupB",
+            )
         )
     return "\n".join(lines)
 
@@ -697,16 +734,24 @@ def _render_inline_plots(session_id: str, plot_paths: list[str]) -> None:
     for row_paths in rows:
         cols = st.columns(len(row_paths))
         for col, path in zip(cols, row_paths):
-            label = (
-                Path(path).stem
-                .split("_", 1)[-1]          # strip "stem_" prefix
-                .replace("_", " ")
-                .title()
-            )
+            label = Path(path).stem.split("_", 1)[-1].replace("_", " ").title()
             img_bytes = _fetch_file(session_id, path)
-            if img_bytes:
-                with col:
+            with col:
+                # Defensive rendering: only call st.image when the bytes look like
+                # a real PNG (PNG magic = 89 50 4E 47). Empty / non-PNG payloads
+                # used to render as a stray "0" before this guard.
+                if img_bytes and len(img_bytes) > 8 and img_bytes[:4] == b"\x89PNG":
                     st.image(img_bytes, caption=label, use_container_width=True)
+                else:
+                    st.markdown(
+                        f"<div style='border:1px dashed rgba(255,255,255,0.1);"
+                        f"border-radius:10px;padding:24px 14px;text-align:center;"
+                        f"color:#64748b;font-size:0.78rem;'>"
+                        f"⚠ Could not load <b>{label}</b><br>"
+                        f"<code style='font-size:0.7rem;color:#94a3b8;'>{path}</code>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
 
 
 def _render_interactive_plots(session_id: str, plot_paths: list[str]) -> None:

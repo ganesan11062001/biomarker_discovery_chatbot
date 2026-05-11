@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Theme tokens — every colour value is exposed as an `r g b` triplet so
+ * Tailwind's `<color> / <alpha-value>` syntax works (e.g. bg-surface/80).
+ *
+ * Light = airy white with navy text; dark = deep navy with light teal accents.
+ */
+:root {
+  --background:    255 255 255;
+  --foreground:    13 30 51;     /* navy-900 */
+  --surface:       248 250 252;  /* slate-50 */
+  --surface-2:     241 245 249;  /* slate-100 */
+  --border:        226 232 240;  /* slate-200 */
+  --muted:         100 116 139;  /* slate-500 */
+  --accent:        27 160 168;   /* teal-500 */
+  --accent-hover:  20 127 136;   /* teal-600 */
+}
+
+.dark {
+  --background:    6 18 31;      /* navy-950 */
+  --foreground:    226 232 240;  /* slate-200 */
+  --surface:       13 30 51;     /* navy-900 */
+  --surface-2:     21 44 72;     /* navy-800 */
+  --border:        29 61 99;     /* navy-700 */
+  --muted:         148 163 184;  /* slate-400 */
+  --accent:        95 217 216;   /* teal-300 */
+  --accent-hover:  46 190 193;   /* teal-400 */
+}
+
+html, body {
+  height: 100%;
+}
+
+body {
+  color: rgb(var(--foreground));
+  background: rgb(var(--background));
+  font-family: Inter, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar — subtle, theme-aware */
+::-webkit-scrollbar          { width: 10px; height: 10px; }
+::-webkit-scrollbar-track    { background: transparent; }
+::-webkit-scrollbar-thumb    { background: rgb(var(--border)); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: rgb(var(--muted)); }
+
+@layer utilities {
+  .text-balance { text-wrap: balance; }
+}

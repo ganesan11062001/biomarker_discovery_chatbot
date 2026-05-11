@@ -14,6 +14,7 @@ import pytest
 from agents.learning_agent import (
     DecisionSchema,
     LearningAgent,
+    _extract_questions,
     _recent_messages,
     _truncate,
     _VALID_ACTIONS,
@@ -312,6 +313,64 @@ class TestRecentMessages:
 
 
 # ── _truncate helper ──────────────────────────────────────────────────────────
+
+class TestExtractQuestions:
+
+    def test_single_question_returns_one(self):
+        assert _extract_questions("What is a t-test?") == ["What is a t-test?"]
+
+    def test_no_question_mark_returns_empty(self):
+        assert _extract_questions("run the analysis") == []
+
+    def test_numbered_list_of_questions(self):
+        text = (
+            "1. What is the spectral count for Myh4 in sample A?\n"
+            "2. How many sheets does this file have?\n"
+            "3. Which proteins have value 0 in sample B?"
+        )
+        qs = _extract_questions(text)
+        assert len(qs) == 3
+        assert all(q.endswith("?") for q in qs)
+        # Numbering should be stripped
+        assert not qs[0].startswith("1.")
+
+    def test_bulleted_list(self):
+        text = (
+            "- What is the MW of Titin?\n"
+            "- Is Dystrophin detected in sample B?\n"
+            "- How many contaminants are there?"
+        )
+        qs = _extract_questions(text)
+        assert len(qs) == 3
+
+    def test_trailing_ui_tag_stripped(self):
+        text = (
+            "What is the spectral count for Myh4 in sample A? Counts & values ⌄\n"
+            "Is Dystrophin detected in sample B? Zeros & nulls ⌄"
+        )
+        qs = _extract_questions(text)
+        assert len(qs) == 2
+        assert "⌄" not in qs[0]
+        assert "Counts" not in qs[0]
+
+    def test_paragraph_fallback(self):
+        text = "What is X? What is Y? How many Z?"
+        qs = _extract_questions(text)
+        assert len(qs) == 3
+
+    def test_empty_string(self):
+        assert _extract_questions("") == []
+
+    def test_mixed_content(self):
+        text = (
+            "Please answer the following:\n"
+            "1. What is the spectral count for protein X? Counts & values ⌄\n"
+            "Some random text without a question.\n"
+            "2. How many proteins are contaminants?"
+        )
+        qs = _extract_questions(text)
+        assert len(qs) == 2
+
 
 class TestTruncate:
 

@@ -10,11 +10,15 @@ __pycache__/
 dist/
 build/
 
-# Data and outputs (too large for git)
+# Data and outputs (too large or per-user for git)
 data/raw/
 data/processed/
+data/sessions/
 outputs/
 logs/
+
+# Claude Code per-user settings
+.claude/settings.local.json
 
 # R
 .Rhistory

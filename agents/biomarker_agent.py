@@ -262,6 +262,24 @@ class BiomarkerAgent(BaseAgent):
             "has_plots": bool(result.get("plot_paths")),
         })
 
+        # ── Domain Expert biological interpretation pass ──────────────────────
+        # Inspired by GenoMAS — a separate, focused LLM call grounded ONLY in
+        # the computed biomarker list produces a tighter biological interpretation
+        # than baking it into the analysis summary prompt.
+        try:
+            from agents.domain_expert import DomainExpertAgent
+            if not hasattr(self, "_domain_expert"):
+                self._domain_expert = DomainExpertAgent()
+            interpretation = self._domain_expert.interpret(state)
+            if interpretation:
+                state["messages"].append({
+                    "role": "assistant",
+                    "content": interpretation,
+                })
+                state["biological_interpretation"] = interpretation
+        except Exception as exc:
+            logger.warning("Domain expert interpretation failed: %s", exc)
+
         logger.info(
             "Analysis complete | session=%s omic=%s significant=%d",
             state.get("session_id"), omic_type, result["n_significant"],

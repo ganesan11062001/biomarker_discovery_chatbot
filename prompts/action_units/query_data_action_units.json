@@ -1,0 +1,48 @@
+{
+  "$schema": "Named steps the query_data flow performs to answer cell-level questions.",
+
+  "units": [
+    {
+      "name": "load_sheets",
+      "instruction": "Load all sheets from the user's uploaded workbook (cache via state.all_sheets when possible).",
+      "parameters": ["data_path"],
+      "fail_severity": "fatal"
+    },
+    {
+      "name": "build_schema_context",
+      "instruction": "Build a compact schema description: sheet names + columns + 3-row preview, capped to ~800 chars per sheet.",
+      "parameters": [],
+      "fail_severity": "minor"
+    },
+    {
+      "name": "generate_pandas",
+      "instruction": "Ask the code-generation LLM to write a pandas/numpy snippet that answers the user's question. Final answer must be assigned to `answer`. No file I/O, no imports beyond pd/np.",
+      "parameters": ["user_question"],
+      "fail_severity": "major"
+    },
+    {
+      "name": "review_code",
+      "instruction": "CodeReviewerAgent critiques the candidate code (correctness, schema match, robustness). Returns {approved, severity, issues, suggestion}.",
+      "parameters": [],
+      "fail_severity": "minor"
+    },
+    {
+      "name": "safe_execute",
+      "instruction": "Execute the approved code in the safe_exec sandbox (restricted builtins, thread-based 15s timeout).",
+      "parameters": ["timeout"],
+      "fail_severity": "major"
+    },
+    {
+      "name": "revise_on_failure",
+      "instruction": "If code review rejects (major/fatal) OR sandbox raises, feed the error/critique back to the generator LLM and retry. Up to 2 revisions before giving up.",
+      "parameters": ["max_rounds"],
+      "fail_severity": "ok"
+    },
+    {
+      "name": "natural_language_response",
+      "instruction": "Translate the pandas result into a clear 2-5 sentence answer. Quote exact numbers, never fabricate.",
+      "parameters": [],
+      "fail_severity": "minor"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(python3 scripts/verify_pipeline.py \"data/raw/7b448e33-5a01-4c44-a84a-08e9b19cb11d/754d98934e514f709c06ce9a10e40107.xlsx\")",
+      "Bash(uvicorn api.main:app --port 8000)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s http://localhost:8000/docs)",
+      "Bash(python3 -m uvicorn --version)",
+      "Bash(python3 -m streamlit --version)",
+      "Bash(lsof -ti:8501)",
+      "Bash(streamlit run *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:8501/healthz)",
+      "Read(//tmp/**)"
+    ]
+  }
+}

@@ -40,6 +40,8 @@ class UploadResponse(BaseModel):
     metadata_columns: Optional[List[str]]       = None
     is_pooled_design: bool                      = False
     label_map:        Optional[dict]            = None
+    inferred_groups:  Optional[dict]            = None
+    message:          Optional[str]             = None
     status:           str
 
 
@@ -49,8 +51,8 @@ class UploadResponse(BaseModel):
 async def upload_proteomics_file(
     file:             UploadFile       = File(...),
     session_id:       Optional[str]    = Form(None),
-    disease_program:  Optional[str]    = Form("FA"),
-    organism:         Optional[str]    = Form("human"),
+    disease_program:  Optional[str]    = Form(None),
+    organism:         Optional[str]    = Form(None),
 ):
     """
     Upload a proteomics matrix (CSV / Excel).
@@ -106,6 +108,27 @@ async def upload_proteomics_file(
     if updated.get("status") == "error":
         raise HTTPException(422, updated.get("error_message", "Ingestion failed."))
 
+    # Pluck the last assistant message — IngestionAgent appended a rich,
+    # context-aware message; we surface it to the UI so it replaces the
+    # generic upload-success template.
+    msgs = updated.get("messages") or []
+    last_assistant_msg = next(
+        (m.get("content") for m in reversed(msgs)
+         if isinstance(m, dict) and m.get("role") == "assistant"),
+        None,
+    )
+
+    # Build a compact inferred_groups dict suitable for JSON serialisation
+    # (state's inferred_groups uses real DataFrames sometimes — keep dicts only).
+    g1_label = updated.get("group1_label")
+    g2_label = updated.get("group2_label")
+    inferred_groups: Optional[dict] = None
+    if g1_label and g2_label:
+        inferred_groups = {
+            g1_label: updated.get("group1_samples") or [],
+            g2_label: updated.get("group2_samples") or [],
+        }
+
     return UploadResponse(
         session_id       = session_id,
         file_id          = file_id,
@@ -118,5 +141,7 @@ async def upload_proteomics_file(
         metadata_columns = updated.get("metadata_columns"),
         is_pooled_design = bool(updated.get("is_pooled_design", False)),
         label_map        = updated.get("label_map"),
+        inferred_groups  = inferred_groups,
+        message          = last_assistant_msg,
         status           = updated.get("status", "data_loaded"),
     )

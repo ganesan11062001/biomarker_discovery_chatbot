@@ -55,13 +55,15 @@ class BiomarkerState(TypedDict, total=False):
     metadata_columns: Optional[List[str]] # non-numeric (group labels, IDs, etc.)
 
     # Pooled design support (multi-sheet MaxQuant / Olink Excel)
-    label_map:        Optional[Dict[str, str]]  # e.g. {"A": "WT", "B": "mdx", …}
+    label_map:        Optional[Dict[str, str]]  # short_code → condition_name, read from the file
+    sample_map:       Optional[Dict[str, Dict]]  # MaxQuant code → {client_id, strain, treatment, mouse_id}
+    software:         Optional[str]               # detected vendor: 'MaxQuant', 'FragPipe', etc.
     is_pooled_design: Optional[bool]            # True when n=1 per group
     identifier_info:  Optional[Any]             # full parsed Identifier Info DataFrame (all mice)
     all_sheets:       Optional[Dict[str, Any]]  # every sheet parsed from the workbook
 
     # ── Analysis configuration ────────────────────────────────────────────────
-    disease_program: Optional[str]        # e.g. "FA", "DMD"
+    disease_program: Optional[str]        # free-form label provided by the user
     organism:        Optional[str]        # "human" | "mouse" | "rat"
 
     # Direct group assignment (used by all supervised omic skills)
@@ -110,6 +112,9 @@ class BiomarkerState(TypedDict, total=False):
     excel_path:       Optional[str]                  # formatted Excel report
     analysis_summary: Optional[str]                  # LLM plain-language summary
     analysis_code:    Optional[str]                  # reproducible Python script
+    biological_interpretation: Optional[str]         # DomainExpertAgent output
+    last_query_code:   Optional[str]                 # most recent SQL/pandas snippet
+    last_query_engine: Optional[str]                 # "sql" | "pandas"
 
     # Legacy alias (used by enrichment & visualization agents)
     top_proteins:    Optional[List[Dict]]   # mirrors top_biomarkers

@@ -1,0 +1,48 @@
+{
+  "$schema": "Named steps the IngestionAgent + DataLoadingSkill perform during file upload.",
+
+  "units": [
+    {
+      "name": "load_workbook",
+      "instruction": "Read a CSV or multi-sheet Excel workbook. For Excel, load all sheets into a dict.",
+      "parameters": ["data_path", "data_format"],
+      "fail_severity": "fatal"
+    },
+    {
+      "name": "detect_data_type",
+      "instruction": "Classify the dataset: olink_npx | ms_lfq | ms_tmt | ms_silac | generic. Use column heuristics and metadata sheet hints.",
+      "parameters": [],
+      "fail_severity": "minor"
+    },
+    {
+      "name": "detect_orientation",
+      "instruction": "Determine whether rows are proteins or samples; transpose if needed so proteins are rows.",
+      "parameters": [],
+      "fail_severity": "major"
+    },
+    {
+      "name": "detect_pooled_design",
+      "instruction": "Detect MaxQuant-style pooled designs by looking for an Identifier Info sheet mapping single-letter codes (A,B,C…) to group names.",
+      "parameters": [],
+      "fail_severity": "ok"
+    },
+    {
+      "name": "extract_sample_columns",
+      "instruction": "Identify numeric sample columns (intensities, SpC, ratios). Separate from metadata (gene names, accessions, MW).",
+      "parameters": [],
+      "fail_severity": "fatal"
+    },
+    {
+      "name": "infer_groups",
+      "instruction": "Call the group-inference LLM to aggregate sample columns into biological groups. Reject single-sample groups (a group MUST have >=2 columns).",
+      "parameters": [],
+      "fail_severity": "minor"
+    },
+    {
+      "name": "persist_state",
+      "instruction": "Write detected metadata (n_proteins, n_samples, sample_columns, label_map, all_sheets, inferred_groups) to BiomarkerState.",
+      "parameters": [],
+      "fail_severity": "fatal"
+    }
+  ]
+}

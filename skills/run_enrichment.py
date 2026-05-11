@@ -56,10 +56,10 @@ def _extract_gene_symbols(protein_names: List[str]) -> List[str]:
     Extract HGNC / MGI gene symbols from a list of protein name strings.
 
     Handles:
-      - UniProt long names  "Myosin-6 OS=Mus musculus GN=Myh6 PE=1 SV=2"
-      - MaxQuant entries    "sp|P12345|MYH6_HUMAN"
-      - MaxQuant groups     "sp|P12345|MYH6_HUMAN;sp|P67890|ACTB_HUMAN" (first entry used)
-      - Short names         "ACTB", "Dystrophin"
+      - UniProt long names  "<description> OS=<species> GN=<symbol> PE=<n> SV=<n>"
+      - MaxQuant entries    "sp|<accession>|<symbol>_<organism>"
+      - MaxQuant groups     "sp|<acc1>|<sym1>_…;sp|<acc2>|<sym2>_…"  (first entry used)
+      - Short names / aliases passed through if no parse rule matches.
     """
     symbols: list[str] = []
 

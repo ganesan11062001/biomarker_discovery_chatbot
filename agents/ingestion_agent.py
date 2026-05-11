@@ -42,16 +42,58 @@ PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 _GROUP_INFERENCE_PROMPT = """\
 You are a bioinformatics data analyst.
-Below are sample column names from a proteomics dataset.
-Identify biological groups by looking for common naming patterns:
-  - Explicit group names (WT, KO, Disease, Control, mdx, uDys5, etc.)
-  - Numeric suffixes indicating replicates (_1, _2, _3 or .1 .2 .3)
-  - Common prefixes or shared substrings
 
-Return a JSON object mapping group name → list of column names.
-Example: {"WT": ["WT_1","WT_2","WT_3"], "KO": ["KO_1","KO_2","KO_3"]}
-If you cannot detect groups, return {}.
-Output ONLY the JSON object, nothing else.
+Below are the sample column names from a proteomics dataset. Identify biological
+groups by AGGREGATING columns that share a biological condition.
+
+CRITICAL RULE — A GROUP IS NEVER A SINGLE COLUMN:
+  • A group must contain AT LEAST 2 columns. Never return a group with one
+    sample. If the data has unique column names with no obvious replicates,
+    aggregate by shared substring (strain, tissue, treatment) — do NOT
+    return one group per column.
+  • The number of groups is ALWAYS smaller than the number of columns. If you
+    end up with one group per column, you've done it wrong — re-examine the
+    column names for shared prefixes, suffixes, or substrings and merge.
+
+Look for common naming patterns WITHOUT assuming any specific biology:
+  - Repeated tokens or shared substrings indicate a category
+  - Numeric suffixes (_1, _2, _3 or .1 .2 .3 or trailing digits) indicate replicates
+  - When column names look like "<TOKEN_A> <TOKEN_B>" (space- or underscore-
+    separated), treat each token as a candidate factor
+  - Multi-factor designs ({factor_X} × {factor_Y}): aggregate by EACH factor
+    separately — produce one set of groups for the first factor, another set
+    for the second factor, and optionally a combined factor — NEVER produce
+    one group per individual column.
+
+Return a JSON object mapping group_name → list of EXACT column names from
+the input (preserve original casing and spacing). The group_name is whatever
+shared token you used to aggregate.
+
+GENERIC examples (the tokens here are placeholders — derive yours from the
+actual column names you receive):
+
+  • Replicated single factor (3 reps per group):
+      input:  ["A_1","A_2","A_3","B_1","B_2","B_3"]
+      output: {"A": ["A_1","A_2","A_3"], "B": ["B_1","B_2","B_3"]}
+
+  • Two factors ({factorX} × {factorY}), 1 sample per cell — AGGREGATE BY FACTOR:
+      input:  ["X1 Y1","X2 Y1","X3 Y1",
+               "X1 Y2","X2 Y2","X3 Y2"]
+      output: {
+        "X1": ["X1 Y1","X1 Y2"],
+        "X2": ["X2 Y1","X2 Y2"],
+        "X3": ["X3 Y1","X3 Y2"],
+        "Y1": ["X1 Y1","X2 Y1","X3 Y1"],
+        "Y2": ["X1 Y2","X2 Y2","X3 Y2"]
+      }
+      (Every group has ≥2 columns — never one-per-column.)
+
+If you cannot detect any aggregating pattern, return {} (empty).
+Do NOT make up groups. Do NOT return single-column groups.
+Do NOT assume biology-specific tokens (genotypes, tissues, treatments) — use
+whatever tokens actually appear in the input columns.
+
+Output ONLY the JSON object, no markdown fences, no explanation.
 """
 
 
@@ -143,12 +185,103 @@ class IngestionAgent(BaseAgent):
         identifier_info = result.get("identifier_info")
         all_sheets      = result.get("all_sheets", {})
 
+        # ── MaxQuant-style cleanup on every sheet (pymaxquant + mspypeline +
+        # alphapeptstats pattern) ─────────────────────────────────────────────
+        # - normalise_column_names: every header is a stripped str (avoids
+        #   weird NaN / bytes columns from xlsx)
+        # - fix_locale_decimals: European exports use ',' instead of '.'
+        # - flag_maxquant_contaminants: add is_reverse, is_potential_contaminant,
+        #   is_only_identified_by_site, is_contaminant_accession, is_contaminant
+        #   columns so downstream code can filter by ~is_contaminant while
+        #   ad-hoc queries can still count or inspect contaminants explicitly.
+        try:
+            from core.maxquant_filters import apply_standard_cleanup
+            if all_sheets:
+                cleaned: Dict[str, "pd.DataFrame"] = {}    # type: ignore
+                for sname, sdf in all_sheets.items():
+                    try:
+                        cleaned[sname] = apply_standard_cleanup(
+                            sdf, drop_contaminants=False, fix_decimals=True,
+                            flag_contaminants=True,
+                        )
+                    except Exception as exc:
+                        logger.debug("Cleanup skipped for sheet %r: %s", sname, exc)
+                        cleaned[sname] = sdf
+                all_sheets = cleaned
+                # Also re-point identifier_info / primary df at the cleaned copy
+                if identifier_info is not None:
+                    iname = None
+                    for sn, sdf in cleaned.items():
+                        if sdf is identifier_info or (
+                            sdf.shape == identifier_info.shape
+                            and list(sdf.columns) == list(identifier_info.columns)
+                        ):
+                            iname = sn
+                            break
+                    if iname is not None:
+                        identifier_info = cleaned[iname]
+        except Exception as exc:
+            logger.debug("Standard cleanup pipeline failed (non-fatal): %s", exc)
+
         if label_map:
             state["label_map"] = label_map
         if identifier_info is not None:
             state["identifier_info"] = identifier_info
         if all_sheets:
             state["all_sheets"] = all_sheets
+
+        # ── Build sample_map from the identifier sheet (BUG-3 FIX) ────────────
+        # Filters rows in the metadata sheet to those carrying the MaxQuant
+        # short codes (A, B, C, …) — avoids accidentally returning per-mouse
+        # rows when the user asks "what is sample B?".
+        try:
+            from core.proteomics_tools import build_sample_map
+            sample_map = build_sample_map(identifier_info)
+            if sample_map:
+                state["sample_map"] = sample_map
+                logger.info("Built sample_map with %d entries", len(sample_map))
+        except Exception as exc:
+            logger.debug("sample_map construction failed (non-fatal): %s", exc)
+
+        # ── Dynamic metadata detection (organism / software / disease) ────────
+        # All three functions live in core.proteomics_tools and read from the
+        # actual file at runtime — no hardcoded defaults. Detected values are
+        # written to state ONLY when the user hasn't already supplied one.
+        from core.proteomics_tools import (
+            detect_disease, detect_organism, detect_software,
+        )
+
+        if not state.get("organism"):
+            org = detect_organism(all_sheets)
+            if org:
+                state["organism"] = org
+                logger.info("Auto-detected organism: %s", org)
+
+        software = detect_software(all_sheets)
+        if software:
+            state["software"] = software
+            logger.info("Auto-detected software: %s", software)
+
+        if not state.get("disease_program"):
+            sample_map = state.get("sample_map") or {}
+            disease    = detect_disease(sample_map, all_sheets, state.get("organism"))
+            if disease:
+                state["disease_program"] = disease
+                logger.info("Auto-detected disease program: %s", disease)
+
+        # ── Register sheets in DuckDB so the LLM can SQL them ─────────────────
+        # Inspired by ExcelWorkerLLMToolCallAgent — gives the LLM a stable,
+        # schema-introspectable layer over the workbook instead of forcing it
+        # to guess pandas column names.
+        try:
+            from core import data_store as _ds
+            if _ds.is_available() and all_sheets:
+                _ds.register_sheets(
+                    state.get("session_id", "unknown"),
+                    all_sheets,
+                )
+        except Exception as exc:
+            logger.debug("DuckDB registration failed (non-fatal): %s", exc)
 
         # ── TMT batch structure ───────────────────────────────────────────────
         tmt_batches = result.get("tmt_batches")
@@ -176,6 +309,11 @@ class IngestionAgent(BaseAgent):
                 state["group2_label"]   = group_names[1]
                 state["group2_samples"] = inferred_groups[group_names[1]]
                 logger.info("Auto-detected groups: %s", {k: len(v) for k, v in inferred_groups.items()})
+            # Persist the FULL inferred map so multi-factor designs can be
+            # explored later (e.g. by tissue, by strain) without re-running
+            # the LLM inference call.
+            if inferred_groups:
+                state["all_groups"] = inferred_groups
 
         # ── LLM message ────────────────────────────────────────────────────────
         msg = self._llm_load_message(result, is_pooled, label_map, inferred_groups)
@@ -210,14 +348,46 @@ class IngestionAgent(BaseAgent):
             {"role": "user",   "content": prompt},
         ]
         try:
-            raw = self._call_llm(messages, max_tokens=400, temperature=0.0).strip()
+            raw = self._call_llm(messages, max_tokens=600, temperature=0.0).strip()
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
             groups = json.loads(raw)
             if isinstance(groups, dict) and groups:
-                return groups
+                return self._sanitize_groups(groups, sample_columns)
         except Exception as exc:
             logger.warning("Group inference in IngestionAgent failed: %s", exc)
         return {}
+
+    @staticmethod
+    def _sanitize_groups(
+        groups: Dict[str, List[str]], sample_columns: List[str],
+    ) -> Dict[str, List[str]]:
+        """
+        Drop single-sample groups (a group must have ≥2 columns to be a group).
+        If, after filtering, the surviving groups still cover ≈one-per-column
+        (i.e. the LLM tried to fake aggregation), reject the entire inference.
+        """
+        valid_cols = set(sample_columns)
+        cleaned: Dict[str, List[str]] = {}
+        for name, samples in groups.items():
+            if not isinstance(samples, list):
+                continue
+            # Keep only columns that actually exist in the dataset
+            real = [c for c in samples if c in valid_cols]
+            if len(real) >= 2:
+                cleaned[str(name)] = real
+
+        if not cleaned:
+            return {}
+
+        # Sanity check: total grouped samples should aggregate, not enumerate.
+        # If the largest group is size 1 we already filtered above; if every
+        # group has size 1 the cleaned dict is empty. So here we just guard
+        # against degenerate cases where the LLM returned an overlapping
+        # "one big group" that's just every column.
+        if len(cleaned) < 2:
+            return {}
+
+        return cleaned
 
     # ── LLM message builders ──────────────────────────────────────────────────
 
@@ -228,29 +398,51 @@ class IngestionAgent(BaseAgent):
         label_map: dict | None,
         inferred_groups: Dict[str, List[str]],
     ) -> str:
-        sample_preview = result["sample_columns"][:10]
-        meta_cols      = result["metadata_columns"][:6]
+        # Show ALL sample columns to the LLM — truncated columns previously hid
+        # multi-factor designs like {strain × tissue} from the model.
+        sample_cols    = result.get("sample_columns") or []
+        meta_cols      = (result.get("metadata_columns") or [])[:12]
+        all_sheets     = result.get("all_sheets") or {}
+        sheet_names    = list(all_sheets.keys()) if all_sheets else []
 
         ctx  = f"DATA LOADED SUCCESSFULLY\n\n"
         ctx += f"n_proteins: {result['n_proteins']}\n"
         ctx += f"n_samples: {result['n_samples']}\n"
         ctx += f"data_type: {result['data_type']}\n"
         ctx += f"is_pooled_design: {is_pooled}\n"
-        ctx += f"sample_columns (first 10): {sample_preview}\n"
+        ctx += f"sample_columns (ALL {len(sample_cols)}):\n  {sample_cols}\n"
         ctx += f"metadata_columns: {meta_cols}\n"
+        if sheet_names:
+            ctx += f"sheet_names: {sheet_names}\n"
         if label_map:
             ctx += f"label_map (pooled groups): {label_map}\n"
         if inferred_groups:
-            ctx += f"inferred_groups: {{{', '.join(f'{k}: {len(v)} samples' for k, v in inferred_groups.items())}}}\n"
+            # Show groups with FULL sample lists (not just counts) so the
+            # model can explain what was detected accurately.
+            ctx += "inferred_groups:\n"
+            for gname, gsamples in inferred_groups.items():
+                ctx += f"  - {gname}: {gsamples}\n"
         else:
             ctx += "inferred_groups: none detected\n"
+        ctx += (
+            "\nINSTRUCTIONS:\n"
+            "- Acknowledge the upload with key numbers (proteins, samples, data type).\n"
+            "- If inferred_groups contains 2+ keys, SHOW THEM AS A BULLET LIST so the\n"
+            "  user can see exactly what was detected, including sample membership.\n"
+            "- If the design appears multi-factor (e.g. strain × tissue), call that out\n"
+            "  explicitly and suggest a primary comparison the user might want.\n"
+            "- If no groups were detected, ask the user to specify a comparison using\n"
+            "  the ACTUAL column names from the list above (do NOT invent fake examples).\n"
+            "- End by suggesting the next action: \"run all comparisons\", a specific pair,\n"
+            "  or \"show me the data\" for inspection.\n"
+        )
 
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user",   "content": ctx},
         ]
         try:
-            return self._call_llm(messages, max_tokens=350)
+            return self._call_llm(messages, max_tokens=600)
         except Exception as exc:
             logger.warning("IngestionAgent LLM message failed: %s — using fallback.", exc)
             return self._fallback_load_message(result, is_pooled, label_map, inferred_groups)

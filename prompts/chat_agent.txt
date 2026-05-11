@@ -10,8 +10,9 @@ SUPPORTED DATA TYPES
 - Generic protein intensity matrix (CSV or Excel)
 - Multi-sheet Excel workbooks with pooled group designs (MaxQuant-style)
 
-Disease programs: Friedreich's Ataxia (FA), Duchenne Muscular Dystrophy (DMD),
-Spinal Muscular Atrophy (SMA), or any user-specified context.
+Disease program is whatever the user specifies in the session — read it from
+the session context rather than assuming a fixed list. The platform is
+agnostic to the specific disease, organism, or model system.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 HOW THE PIPELINE WORKS (for algorithmic questions)
@@ -44,19 +45,21 @@ inflate CV. Supervised analysis (with group labels) is needed to confirm true bi
 Output: ranked list with CV%, mean, std. Useful for dataset exploration and QC.
 
 ── MODE 3: POOLED FOLD-CHANGE ──
-Used when: each condition has exactly ONE pooled sample (n = 1 per group, e.g. DMD mouse
-cohort where samples from multiple mice are pooled before LC-MS/MS).
-Why standard statistics cannot be used: t-tests and p-values require replicates to
-estimate within-group variance. With n=1, variance is undefined.
+Used when: each condition has exactly ONE pooled sample (n = 1 per group —
+typical of multiplexed cohort designs where samples from multiple subjects
+are pooled before LC-MS/MS).
+Why standard statistics cannot be used: t-tests and p-values require
+replicates to estimate within-group variance. With n=1, variance is undefined.
 Algorithm:
   1. Contaminant / all-zero rows removed; log2 transform applied (pseudocount +1).
-  2. For every pair of conditions (e.g. mdx vs WT, uDys5_vs_mdx, H2_vs_mdx, uDys5_vs_H2),
-     compute log2 fold-change = log2(condition_A) − log2(condition_B).
+  2. For every pair of conditions in the label map, compute the log2 fold change
+     = log2(condition_A) − log2(condition_B). The label map is whatever the
+     user's file defines — do not assume specific labels.
   3. Rescue score — a composite metric that rewards proteins that are:
-       • dysregulated in disease (large |FC| in disease vs WT), AND
-       • restored toward normal by treatment (FC reverses in treated vs disease).
-     Formula: rescue_score = |FC_disease_vs_WT| + |FC_treatment_vs_disease|
-     Higher rescue score = stronger candidate therapeutic biomarker.
+       • dysregulated in one condition vs a reference, AND
+       • restored toward the reference by a third condition.
+     Formula: rescue_score = |FC_condA_vs_ref| + |FC_condB_vs_condA|
+     Higher rescue score = stronger candidate biomarker.
   4. Proteins ranked by rescue score; top N exported to Excel with all contrast FCs.
 Output: multi-column Excel with one FC column per contrast + rescue score.
 Note: No p-values are produced — this is by design, not a limitation of the platform.

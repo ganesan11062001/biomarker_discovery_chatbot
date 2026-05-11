@@ -138,6 +138,69 @@ class BaseAgent(ABC):
             self.logger.error("LLM API error: %s", exc)
             raise
 
+    # ── LLM call with tool/function calling (ExcelWorker pattern) ─────────────
+
+    @retry(
+        retry=retry_if_exception_type(_RETRY_EXCEPTIONS),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        stop=stop_after_attempt(4),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    def _call_llm_with_tools(
+        self,
+        messages:    list,
+        tools:       list,
+        max_tokens:  int   = 1024,
+        temperature: float = 0.0,
+        tool_choice: str   = "auto",
+    ) -> dict:
+        """
+        Call the LLM with a list of OpenAI tool/function specs.
+
+        Returns a dict ``{'content': str|None, 'tool_calls': list|None,
+        'finish_reason': str, 'raw_message': obj}`` so callers can dispatch
+        any tool_calls and loop until the model produces a final text
+        message.
+
+        The schema of ``tools`` is OpenAI's function-call format — see
+        ``core.llm_tools.get_openai_tool_specs()``.
+        """
+        self.logger.debug(
+            "LLM tool call | model=%s | messages=%d | tools=%d",
+            self.deployment_name, len(messages), len(tools),
+        )
+        try:
+            response = self.client.chat.completions.create(
+                model       = self.deployment_name,
+                messages    = messages,
+                tools       = tools,
+                tool_choice = tool_choice,
+                max_tokens  = max_tokens,
+                temperature = temperature,
+            )
+        except APIError as exc:
+            self.logger.error("LLM tool-call API error: %s", exc)
+            raise
+
+        msg = response.choices[0].message
+        tool_calls_payload = None
+        if getattr(msg, "tool_calls", None):
+            tool_calls_payload = [
+                {
+                    "id":   tc.id,
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments or "{}",
+                }
+                for tc in msg.tool_calls
+            ]
+        return {
+            "content":       msg.content,
+            "tool_calls":    tool_calls_payload,
+            "finish_reason": response.choices[0].finish_reason,
+            "raw_message":   msg,
+        }
+
     # ── Pipeline entry point (each subclass implements) ───────────────────────
 
     @abstractmethod

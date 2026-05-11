@@ -273,24 +273,30 @@ def _plot_barchart(
 
 
 def _plot_scatter(
-    spc_df: pd.DataFrame, wt_col: str, mdx_col: str, output_path: str
+    spc_df: pd.DataFrame, g1_col: str, g2_col: str, output_path: str
 ) -> str:
-    """Scatter plot WT vs mdx SpC (log scale)."""
+    """Scatter plot of one group vs another in log2 space.
+
+    Parameters
+    ----------
+    g1_col, g2_col  Column names for the two groups being compared. The plot
+                    is fully agnostic to what biological condition each holds.
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        x = np.log2(spc_df[wt_col].clip(lower=0) + _PSEUDOCOUNT)
-        y = np.log2(spc_df[mdx_col].clip(lower=0) + _PSEUDOCOUNT)
+        x = np.log2(spc_df[g1_col].clip(lower=0) + _PSEUDOCOUNT)
+        y = np.log2(spc_df[g2_col].clip(lower=0) + _PSEUDOCOUNT)
 
         fig, ax = plt.subplots(figsize=(7, 7))
         ax.scatter(x, y, alpha=0.5, s=20, color="#555555")
         lims = [min(x.min(), y.min()) - 0.5, max(x.max(), y.max()) + 0.5]
         ax.plot(lims, lims, "r--", linewidth=0.8, label="y = x")
-        ax.set_xlabel(f"log₂(SpC + 1)  {wt_col}")
-        ax.set_ylabel(f"log₂(SpC + 1)  {mdx_col}")
-        ax.set_title(f"{wt_col} vs {mdx_col}  SpC (log₂)")
+        ax.set_xlabel(f"log₂(SpC + 1)  {g1_col}")
+        ax.set_ylabel(f"log₂(SpC + 1)  {g2_col}")
+        ax.set_title(f"{g1_col} vs {g2_col}  SpC (log₂)")
         ax.legend(fontsize=9)
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -513,7 +519,8 @@ class PooledFoldChangeSkill(BaseOmicsSkill):
 
         for _, _, contrast_name in active_contrasts:
             if contrast_name in fc_df.columns:
-                bar_path = str(Path(output_dir) / f"{file_name}_barchart_{contrast_name}.png")
+                safe_contrast = re.sub(r"[^\w]", "_", str(contrast_name))
+                bar_path = str(Path(output_dir) / f"{file_name}_barchart_{safe_contrast}.png")
                 p = _plot_barchart(fc_df[contrast_name], contrast_name, bar_path)
                 if p:
                     plot_paths.append(p)
