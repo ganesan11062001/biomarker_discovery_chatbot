@@ -54,6 +54,66 @@ _METADATA_HINTS = {
     "subject", "donor", "cohort", "replicate",
 }
 
+# Tokens that suggest a row is the real column-header row in a proteomics sheet.
+# Includes identifier columns, metric prefixes, and platform-specific names.
+_HEADER_ROW_TOKENS = (
+    # Identifiers
+    "protein", "accession", "uniprot", "gene", "description", "fasta",
+    "name", "id", "ids",
+    # Metrics (MaxQuant / FragPipe / Spectronaut / DIA-NN / TMT / SILAC)
+    "intensity", "spc", "spectral", "lfq", "ibaq", "ratio", "abundance",
+    "quantity", "channel", "plex",
+    # Physical properties
+    "mw", "weight", "molecular", "pi",
+    # Platform-specific
+    "npx", "assay", "panel", "olink",
+    # Statistics
+    "fdr", "qvalue", "q-value", "pep", "score", "p-value", "p_value", "pvalue",
+    # Sample-axis tokens
+    "sample", "subject", "donor", "patient",
+)
+
+
+def _detect_header_row(
+    raw: pd.DataFrame,
+    max_scan: int = 12,
+    min_non_empty: int = 2,
+) -> int:
+    """Find the most-likely header row by scanning the first ``max_scan`` rows.
+
+    Many proteomics exports put a title row above the real headers
+    (e.g. ``Identified Proteins (1919)`` followed by ``Protein Name,
+    Accession Number, A SpC, ...``). pandas' default ``header=0`` then
+    treats the real headers as data.
+
+    Algorithm: for each candidate row, count cells whose lowercased text
+    contains one of ``_HEADER_ROW_TOKENS``. The row with the highest hit
+    count wins. Falls back to 0 when no row matches.
+    """
+    if raw is None or raw.empty:
+        return 0
+
+    best_idx, best_score = 0, 0
+    for i in range(min(max_scan, len(raw))):
+        row = raw.iloc[i]
+        non_empty = 0
+        score     = 0
+        for val in row.values:
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            s = str(val).strip().lower()
+            if not s:
+                continue
+            non_empty += 1
+            if any(tok in s for tok in _HEADER_ROW_TOKENS):
+                score += 1
+        # A header row must have at least 2 non-empty cells AND at least one
+        # header-token match. Title rows (e.g. "Identified Proteins (1919)")
+        # have non_empty == 1 and won't beat a multi-cell header row.
+        if non_empty >= min_non_empty and score > best_score:
+            best_idx, best_score = i, score
+    return best_idx
+
 # A sheet is EXPRESSION if it has ≥ this many rows
 _EXPRESSION_MIN_ROWS = 20
 # … and ≥ this fraction of its columns are numeric
@@ -506,9 +566,23 @@ class DataLoadingSkill:
         metadata_sheets:   List[Tuple[str, pd.DataFrame]] = []
 
         # ── Read and classify every sheet ─────────────────────────────────────
+        # Header detection: many proteomics exports put a title row (e.g.
+        # "Identified Proteins (1919)") above the real column names. We read
+        # the sheet with header=None first, find the row that matches the most
+        # proteomics-header tokens, then re-parse with the detected header row.
         for sheet_name in xl.sheet_names:
             try:
-                raw = xl.parse(sheet_name, header=0)
+                no_header = xl.parse(sheet_name, header=None)
+                header_idx = _detect_header_row(no_header)
+                if header_idx > 0:
+                    logger.info(
+                        "Sheet '%s': auto-detected header row at index %d "
+                        "(skipped %d title row(s))",
+                        sheet_name, header_idx, header_idx,
+                    )
+                # Re-parse with the correct header. xl.parse rewinds the file;
+                # this is the safe way to re-read.
+                raw = xl.parse(sheet_name, header=header_idx)
                 kind = _classify_sheet(raw)
                 logger.info(
                     "Sheet '%s': %d rows × %d cols → %s",
@@ -574,9 +648,25 @@ class DataLoadingSkill:
     # ── CSV loader ────────────────────────────────────────────────────────────
 
     def _load_csv(self, path: str) -> pd.DataFrame:
+        """Load a CSV, auto-detecting the header row to handle title rows.
+
+        First reads the file with ``header=None`` to find the most likely
+        header row (same heuristic as the Excel loader), then re-reads with
+        ``skiprows=header_idx``.
+        """
         for enc in ("utf-8", "latin-1", "cp1252"):
             try:
-                return pd.read_csv(path, index_col=0, encoding=enc)
+                # Peek at the first ~15 rows to detect the header
+                peek = pd.read_csv(path, header=None, encoding=enc, nrows=15)
+                header_idx = _detect_header_row(peek)
+                if header_idx > 0:
+                    logger.info(
+                        "CSV '%s': auto-detected header row at index %d "
+                        "(skipped %d title row(s))",
+                        path, header_idx, header_idx,
+                    )
+                return pd.read_csv(path, index_col=0, encoding=enc,
+                                    skiprows=header_idx)
             except UnicodeDecodeError:
                 continue
         return pd.read_csv(path, index_col=0)
