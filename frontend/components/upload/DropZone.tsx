@@ -3,6 +3,7 @@
 import { UploadCloud } from "lucide-react";
 import { useRef, useState } from "react";
 
+import { useChat } from "@/hooks/useChat";
 import { useFileUpload } from "@/hooks/useFileUpload";
 import { cn } from "@/lib/utils";
 
@@ -13,14 +14,30 @@ interface DropZoneProps {
 
 const ACCEPTED = [".csv", ".tsv", ".xlsx", ".xls", ".parquet"];
 
+/**
+ * Auto-message dispatched to the chat as soon as a file finishes uploading.
+ * Lands as a normal user turn → orchestrator routes it to run_full_pipeline
+ * (per the rules in agents/learning_agent.py).
+ */
+const AUTO_ANALYSIS_PROMPT =
+  "Run the full analysis pipeline on the uploaded dataset.";
+
 export function DropZone({ variant = "compact" }: DropZoneProps) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const { upload } = useFileUpload();
+  const { sendMessage } = useChat();
 
   const handleFiles = async (files: FileList | File[]) => {
-    for (const file of Array.from(files)) {
-      void upload(file);
+    // Upload files in parallel; on the first success, auto-trigger the
+    // full pipeline. The sendMessage guard inside useChat prevents double
+    // fires if the user attaches multiple files in one drop.
+    const results = await Promise.all(
+      Array.from(files).map((f) => upload(f)),
+    );
+    const firstOk = results.find((r) => r && !r.error);
+    if (firstOk) {
+      sendMessage(AUTO_ANALYSIS_PROMPT);
     }
   };
 

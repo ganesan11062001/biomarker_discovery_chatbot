@@ -86,8 +86,7 @@ export function useChat(): UseChatResult {
     };
     appendMessage(sid, placeholder);
 
-    // 3. Open SSE
-    streamingRef.current?.abort();
+    // 3. Open SSE — guard above guarantees no stream is in flight here
     streamingRef.current = streamChat(sid, text, (event) => {
       switch (event.type) {
         case "token": {
