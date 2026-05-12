@@ -49,7 +49,7 @@ except ImportError:
 # ── Pydantic schema for LLM decision output ──────────────────────────────────
 
 _VALID_ACTIONS = {
-    "load_data", "run_analysis", "run_all_comparisons",
+    "load_data", "run_analysis", "run_all_comparisons", "run_full_pipeline",
     "run_enrichment", "run_visualization",
     "show_code", "modify_code", "query_database",
     "query_data",
@@ -172,7 +172,17 @@ that drives the pipeline. Choose exactly one action:
 
   "load_data"           — user wants to upload / load a new data file
   "run_analysis"        — run biomarker analysis for a SPECIFIC comparison the user named
-  "run_all_comparisons" — run ALL pairwise group comparisons (user said "all" or didn't specify groups)
+                         (e.g. "compare DMD Quad vs BL6 Quad")
+  "run_all_comparisons" — run ALL pairwise group comparisons WITHOUT enrichment or viz
+                         (rarely used directly — most users want run_full_pipeline)
+  "run_full_pipeline"   — first-time auto-analysis: data summary + all pairwise
+                         comparisons (or pooled fold-change for n=1 designs) +
+                         pathway enrichment + plots, in one shot. Use this when
+                         the user asks for "the full analysis", "run analysis"
+                         (generic, no specific pair), "do everything", "give me
+                         a comprehensive analysis", "analyse the data", etc.
+                         After the pipeline runs, follow-up turns can use
+                         run_analysis for specific drill-downs.
   "run_enrichment"      — run KEGG / GO pathway enrichment on current biomarker results
   "run_visualization"   — generate plots, heatmaps, charts, or a report
   "show_code"           — user wants to see the reproducible analysis code
@@ -247,11 +257,18 @@ Decision rules (in priority order):
     worry about "the rest".
 8.  Pathway / enrichment / KEGG / GO → "run_enrichment"
 9.  Plot / visualize / chart / heatmap / volcano / report → "run_visualization"
-10. Pooled design AND "run analysis" with no specific group pair → "run_all_comparisons"
-11. "run analysis" / "analyze" / "find biomarkers" with NO specific group pair named → "run_all_comparisons"
-12. "run analysis" / "analyze" with SPECIFIC group names (e.g. "Disease vs Control") → "run_analysis"
+10. Data uploaded but NO analysis yet AND user says "run analysis", "analyse the
+    data", "do the analysis", "full analysis", "run all", "give me everything",
+    "comprehensive analysis" — anything generic without a named group pair →
+    "run_full_pipeline"
+11. After a full pipeline has already run, "run analysis" with no specific pair
+    repeats the pipeline (still "run_full_pipeline").
+12. "run analysis" / "analyze" with SPECIFIC group names (e.g. "Disease vs Control",
+    "DMD Quad vs BL6 Quad") → "run_analysis"
     - Set group1_label, group1_samples, group2_label, group2_samples from available_columns.
     - Leave sample lists empty if you cannot confidently match column names.
+13. "run all pairwise comparisons WITHOUT enrichment / plots" (explicit, rare) →
+    "run_all_comparisons"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CLARIFICATION PHILOSOPHY  —  ask the user rather than assume anything uncertain
@@ -740,6 +757,118 @@ class LearningAgent(BaseAgent):
             if len(real) >= 2:
                 cleaned[str(name)] = real
         return cleaned if len(cleaned) >= 2 else {}
+
+    # ── Full auto-pipeline ────────────────────────────────────────────────────
+
+    @_traceable(run_type="chain", name="orchestrator.run_full_pipeline",
+                tags=["biomarker-discovery", "full_pipeline"])
+    def _run_full_pipeline(self, state: BiomarkerState) -> BiomarkerState:
+        """End-to-end first-time analysis:
+              1. Emit a concise data summary so the user sees what's loaded.
+              2. Run all pairwise comparisons (Welch / limma when replicated,
+                 pooled log₂FC when n=1 per group — handled by
+                 ``_run_all_comparisons`` → BiomarkerAgent).
+              3. Pathway enrichment on the top biomarkers if any survived.
+              4. Visualisation suite (volcano / heatmap / PCA / etc.).
+              5. Final closing message inviting drill-downs.
+        Subsequent turns can run a single ``run_analysis`` for specific
+        pairs without re-doing this whole pipeline.
+        """
+        # ── 1. Data summary ──────────────────────────────────────────────────
+        summary = self._build_data_summary(state)
+        if summary:
+            state["messages"].append({"role": "assistant", "content": summary})
+
+        # ── 2. Analyses (this populates top_biomarkers / pathways path-of-data) ──
+        state = self._run_all_comparisons(state)
+
+        has_biomarkers = bool(
+            state.get("top_biomarkers") or state.get("top_proteins")
+        )
+
+        # ── 3. Enrichment (only when we have a biomarker list to query) ──────
+        if has_biomarkers:
+            try:
+                state = self._specialist("enrichment").run(state)
+            except Exception as exc:
+                self.logger.warning("Pipeline enrichment step failed: %s", exc)
+                state["messages"].append({
+                    "role": "assistant",
+                    "content": f"⚠ Pathway enrichment skipped: {exc}",
+                })
+        else:
+            state["messages"].append({
+                "role": "assistant",
+                "content": (
+                    "_Pathway enrichment skipped — no significant biomarkers "
+                    "were produced upstream._"
+                ),
+            })
+
+        # ── 4. Visualisation ─────────────────────────────────────────────────
+        if has_biomarkers or state.get("plot_paths"):
+            try:
+                state = self._specialist("visualization").run(state)
+            except Exception as exc:
+                self.logger.warning("Pipeline viz step failed: %s", exc)
+                state["messages"].append({
+                    "role": "assistant",
+                    "content": f"⚠ Visualisation skipped: {exc}",
+                })
+
+        # ── 5. Drill-down invite ─────────────────────────────────────────────
+        state["messages"].append({
+            "role": "assistant",
+            "content": (
+                "**Full analysis complete.** You can now ask follow-up "
+                "questions like:\n"
+                "- *Compare DMD Quad vs BL6 Quad in detail*\n"
+                "- *Show the top biomarkers for the Heart tissue group*\n"
+                "- *Why is pathway X enriched?*\n"
+                "- *Show me the volcano plot*"
+            ),
+        })
+        state["intent"]       = "run_full_pipeline"
+        state["active_agent"] = "learning_agent"
+        state["status"]       = "pipeline_complete"
+        return state
+
+    def _build_data_summary(self, state: BiomarkerState) -> str:
+        """Render a compact markdown recap of the loaded dataset for the
+        opening message of the full pipeline. Pulls everything from state
+        — no hardcoded values."""
+        n_proteins = state.get("n_proteins") or "?"
+        n_samples  = state.get("n_samples")  or "?"
+        lines = [f"## Dataset Summary\n",
+                 f"- **{n_proteins}** proteins · **{n_samples}** samples"]
+
+        details: List[str] = []
+        if state.get("data_type"):       details.append(f"`{state['data_type']}`")
+        if state.get("software"):        details.append(f"detected as **{state['software']}**")
+        if state.get("organism"):        details.append(f"organism: **{state['organism']}**")
+        if state.get("disease_program"): details.append(f"program: **{state['disease_program']}**")
+        if details:
+            lines.append("- " + " · ".join(details))
+
+        # Groups detected by IngestionAgent
+        sample_map = state.get("sample_map") or {}
+        if sample_map:
+            lines.append(f"- **{len(sample_map)}** pooled samples mapped: "
+                         + ", ".join(f"`{k}`→{v.get('client_id') or v.get('strain') or '?'}"
+                                      for k, v in list(sample_map.items())[:6]))
+        all_groups = state.get("all_groups") or {}
+        if all_groups:
+            lines.append(f"- **{len(all_groups)}** inferred group(s): "
+                         + ", ".join(f"`{k}` ({len(v)})"
+                                      for k, v in list(all_groups.items())[:8]))
+
+        # Files
+        if state.get("file_id"):
+            lines.append(f"- File: `{state.get('raw_data_path') or state.get('data_path') or ''}`")
+
+        lines.append("\n_Running data summary → all comparisons → "
+                     "pathway enrichment → plots…_")
+        return "\n".join(lines)
 
     # ── Multi-comparison ──────────────────────────────────────────────────────
 
@@ -2161,6 +2290,10 @@ class LearningAgent(BaseAgent):
         # ── All pairwise comparisons ───────────────────────────────────────────
         if action == "run_all_comparisons":
             return self._run_all_comparisons(state)
+
+        # ── Full auto-pipeline: summary + analyses + enrichment + viz ──────────
+        if action == "run_full_pipeline":
+            return self._run_full_pipeline(state)
 
         # ── Enrichment ────────────────────────────────────────────────────────
         if action == "run_enrichment":
