@@ -187,21 +187,31 @@ that drives the pipeline. Choose exactly one action:
   "run_visualization"   — generate plots, heatmaps, charts, or a report
   "show_code"           — user wants to see the reproducible analysis code
   "modify_code"         — user wants to change, alter, or extend the analysis code
-  "query_database"      — look up protein info, gene names, UniProt annotation, or convert IDs
-  "query_data"          — answer cell-level / aggregation questions about the user's FILE itself.
-                           Use whenever the answer requires reading specific values, cells, rows,
-                           sheet structure, or counts directly from the uploaded data. Examples
-                           (with generic placeholders — substitute the user's actual tokens):
+  "query_database"      — external UniProt lookup. ONLY use when the user explicitly
+                           asks to "annotate", "look up online", "convert IDs", or
+                           when the protein they ask about is NOT in the loaded file.
+                           When a file IS loaded, prefer "query_data" — the local
+                           file already has names, accessions, gene symbols, MW.
+  "query_data"          — answer cell-level / aggregation / ranking questions about
+                           the user's FILE itself. Whenever the answer can be computed
+                           from the uploaded data (lookups, counts, fold changes,
+                           top-N rankings, "most up/down in X vs Y", etc.) use this.
+                           Examples (with generic placeholders):
                              • "what is the <metric> for <protein X> in sample <Y>?"
-                             • "how many sheets does this file have?"
-                             • "what are the column headers in the <sheet name> sheet?"
+                             • "what is the accession number of <protein X>?"
                              • "which proteins have a value of 0 in sample <Y>?"
                              • "is <protein X> detected in the <group> group?"
                              • "what is the molecular weight of <protein X>?"
-                             • "how many contaminant proteins (CON__) are in the dataset?"
-                             • "what is the largest / smallest / highest-MW protein in the file?"
-                           DO NOT use for general explanations or for biomarker results from a
-                           completed analysis — those go through "answer".
+                             • "how many sheets does this file have?"
+                             • "what is the largest / smallest / highest-MW protein?"
+                             • "what is the most up/down-regulated protein in X vs Y?"
+                             • "what is the fold change of <X> in <group A> vs <group B>?"
+                             • "top N proteins by SpC in <group>?"
+                           For "most up/down in X vs Y" questions: this is a SQL
+                           fold-change computation, NOT a full analysis. Route here,
+                           NOT to run_analysis or run_full_pipeline. The bot writes
+                           SQL like SELECT protein, LOG2((A+1)/(B+1)) AS fc
+                           ORDER BY fc DESC LIMIT 1.
   "ask_clarification"   — ask the user a focused, professional question before proceeding
   "answer"              — answer a question, explain something, or have a conversation
 

@@ -79,6 +79,12 @@ def split_spc_intensity(df) -> Tuple[Any, Any]:
     columns, the other with identifier columns + intensity columns. Each
     caller must explicitly pick which to query; nothing mixes them.
 
+    Both DataFrames also carry any contaminant-flag columns (``is_*``) that
+    were added by the MaxQuant cleanup pipeline — so LLM-generated pandas
+    code can write ``df_spc[~df_spc['is_contaminant']]`` without hitting
+    KeyError. Without this, the flag columns get classified as "other"
+    and dropped from the split frames.
+
     If a metric family isn't present, the corresponding DataFrame is empty.
     """
     import pandas as pd
@@ -87,9 +93,23 @@ def split_spc_intensity(df) -> Tuple[Any, Any]:
     id_cols  = groups["identifier"]
     spc_cols = groups["spc"]
     int_cols = groups["intensity"]
+    # Contaminant / decoy flag columns added by maxquant_filters.flag_*
+    flag_cols = [c for c in df.columns
+                 if c.startswith("is_") and df[c].dtype == bool]
 
-    df_spc       = df[id_cols + spc_cols] if spc_cols else pd.DataFrame()
-    df_intensity = df[id_cols + int_cols] if int_cols else pd.DataFrame()
+    df_spc = df[id_cols + spc_cols + flag_cols].copy() if spc_cols else pd.DataFrame()
+    df_intensity = df[id_cols + int_cols + flag_cols].copy() if int_cols else pd.DataFrame()
+
+    # Coerce metric columns to numeric so LLM-generated sorts / fold changes
+    # don't fail with "TypeError: '<' not supported between instances of
+    # 'float' and 'str'" when stray strings (NaN, '?', '' ) sneak in.
+    for c in spc_cols:
+        if c in df_spc.columns:
+            df_spc[c] = pd.to_numeric(df_spc[c], errors="coerce")
+    for c in int_cols:
+        if c in df_intensity.columns:
+            df_intensity[c] = pd.to_numeric(df_intensity[c], errors="coerce")
+
     return df_spc, df_intensity
 
 
@@ -431,26 +451,49 @@ def detect_organism(all_sheets: Dict[str, Any]) -> Optional[str]:
 
     from collections import Counter
     counts: Counter = Counter()
+
+    def _scan_series(values_iter) -> None:
+        for v in values_iter:
+            m = _OS_RE.search(v)
+            if m:
+                counts[m.group(1).strip()] += 1
+
     for df in all_sheets.values():
         if not isinstance(df, pd.DataFrame) or df.empty:
             continue
+        # ── 1. Scan columns whose name looks descriptive ──────────────────
         for col in df.columns:
             cl = str(col).lower()
             if not any(t in cl for t in ("protein", "description", "fasta",
                                           "identifi", "name")):
                 continue
             try:
-                values = df[col].dropna().astype(str).head(200)
+                _scan_series(df[col].dropna().astype(str).head(200))
             except Exception:
                 continue
-            for v in values:
-                m = _OS_RE.search(v)
-                if m:
-                    counts[m.group(1).strip()] += 1
             if sum(counts.values()) > 50:
                 break
         if sum(counts.values()) > 50:
             break
+        # ── 2. Fallback: also scan the DataFrame INDEX. After ingestion
+        # the protein-description column is often promoted to the index by
+        # _parse_expression_sheet, so it's invisible to the column scan
+        # above. Trying the index catches that case. ───────────────────────
+        idx_name = (df.index.name or "").lower()
+        if idx_name and any(t in idx_name for t in
+                             ("protein", "description", "fasta", "identifi", "name")):
+            try:
+                _scan_series(df.index.dropna().astype(str)[:200])
+            except Exception:
+                pass
+        elif not isinstance(df.index, pd.RangeIndex):
+            # Anonymous non-trivial index — sample it anyway as a last resort
+            try:
+                idx_values = df.index.astype(str)[:50]
+                if any("OS=" in s for s in idx_values):
+                    _scan_series(df.index.astype(str)[:200])
+            except Exception:
+                pass
 
     if not counts:
         return None
