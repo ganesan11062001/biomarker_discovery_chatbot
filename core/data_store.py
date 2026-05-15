@@ -140,6 +140,20 @@ def register_sheets(
                 counter += 1
 
             try:
+                # Promote any meaningful DataFrame index to a regular column
+                # before DuckDB registration. DuckDB's `.register()` drops
+                # the pandas index silently — without this, identifier
+                # columns set as the index (e.g. "Protein Name") become
+                # unqueryable from SQL.
+                idx_name = df.index.name
+                if idx_name is not None and idx_name not in df.columns:
+                    df = df.reset_index(drop=False)
+                elif not isinstance(df.index, pd.RangeIndex):
+                    # Anonymous but non-trivial index — also promote so it's
+                    # not silently lost. We give it a generic name.
+                    df = df.reset_index(drop=False).rename(
+                        columns={"index": "id"}
+                    )
                 # Normalise: empty strings → NULL so SQL aggregates behave
                 df_clean = df.replace(r"^\s*$", None, regex=True)
                 store.con.register(f"_tmp_{sql_name}", df_clean)

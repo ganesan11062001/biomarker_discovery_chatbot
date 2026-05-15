@@ -74,6 +74,38 @@ _HEADER_ROW_TOKENS = (
 )
 
 
+def _extract_column_group_labels(
+    raw: pd.DataFrame, header_idx: int,
+) -> Dict[str, str]:
+    """When a proteomics sheet has group labels in the row ABOVE the real
+    header (e.g. row 0 = 'BL6 Quad', 'DMD Quad', ... above row 1 = 'SpC A',
+    'SpC B', ...), pair them up.
+
+    Returns {real_column_name: group_label} for every column where the
+    immediately-preceding row has a distinct non-empty label. Empty when no
+    such pattern exists (most files won't have it).
+    """
+    if header_idx <= 0 or header_idx >= len(raw):
+        return {}
+    label_row  = raw.iloc[header_idx - 1]
+    header_row = raw.iloc[header_idx]
+    mapping: Dict[str, str] = {}
+    for i, header_val in enumerate(header_row.values):
+        if header_val is None or (isinstance(header_val, float) and pd.isna(header_val)):
+            continue
+        label_val = label_row.iloc[i] if i < len(label_row) else None
+        if label_val is None or (isinstance(label_val, float) and pd.isna(label_val)):
+            continue
+        h, l = str(header_val).strip(), str(label_val).strip()
+        if not h or not l or h == l:
+            continue
+        # Skip identifier columns whose label is just a section heading (e.g.
+        # column "Accession Number" with no real "group" above it). We only
+        # care when both header and label look like distinct meaningful strings.
+        mapping[h] = l
+    return mapping
+
+
 def _detect_header_row(
     raw: pd.DataFrame,
     max_scan: int = 12,
@@ -132,6 +164,37 @@ def _classify_sheet(df: pd.DataFrame) -> str:
     )
     frac = numeric_cols / max(len(df.columns), 1)
     return "expression" if frac >= _EXPRESSION_MIN_NUMERIC_FRAC else "metadata"
+
+
+# ── Column-name normalisation ─────────────────────────────────────────────────
+
+_TITLE_COL_PATTERN = re.compile(r"^Identified\s+Proteins?\s*(\(\s*\d+\s*\))?\s*$",
+                                re.IGNORECASE)
+
+
+def _canonicalise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename / strip whitespace from columns so the LLM sees stable names.
+
+    - Trims leading/trailing whitespace on every column (`'Protein Name '` →
+      `'Protein Name'`).
+    - Renames title-style identifier columns (`Identified Proteins (2217)`)
+      to the canonical `'Protein Name'` so the LLM doesn't have to guess
+      which column holds the UniProt-style description.
+    """
+    new_columns: Dict[str, str] = {}
+    for c in df.columns:
+        if not isinstance(c, str):
+            continue
+        clean = c.strip()
+        if _TITLE_COL_PATTERN.match(clean):
+            clean = "Protein Name"
+        if clean != c:
+            new_columns[c] = clean
+    if new_columns:
+        df = df.rename(columns=new_columns)
+        logger.debug("Canonicalised %d column name(s): %s",
+                      len(new_columns), new_columns)
+    return df
 
 
 # ── Column helpers ─────────────────────────────────────────────────────────────
@@ -451,11 +514,12 @@ class DataLoadingSkill:
         identifier_info: Optional[pd.DataFrame]   = None
         all_sheets:      Dict[str, pd.DataFrame]  = {}
         is_pooled = False
+        column_group_labels: Dict[str, str] = {}
 
         # ── 1. Load ──────────────────────────────────────────────────────────
         if is_excel:
-            df, label_map, is_pooled, identifier_info, all_sheets = \
-                self._load_all_sheets(path, suffix)
+            (df, label_map, is_pooled, identifier_info,
+             all_sheets, column_group_labels) = self._load_all_sheets(path, suffix)
             data_format = "excel"
         else:
             df = self._load_csv(str(path))
@@ -505,15 +569,16 @@ class DataLoadingSkill:
         logger.info("Saved → %s", out_path)
 
         result: dict = {
-            "processed_path":   out_path,
-            "data_type":        data_type,
-            "data_format":      data_format,
-            "n_proteins":       len(df),
-            "n_samples":        len(sample_cols),
-            "sample_columns":   sample_cols,
-            "metadata_columns": metadata_cols,
-            "is_pooled_design": is_pooled,
-            "all_sheets":       all_sheets,
+            "processed_path":       out_path,
+            "data_type":            data_type,
+            "data_format":          data_format,
+            "n_proteins":           len(df),
+            "n_samples":            len(sample_cols),
+            "sample_columns":       sample_cols,
+            "metadata_columns":     metadata_cols,
+            "is_pooled_design":     is_pooled,
+            "all_sheets":           all_sheets,
+            "column_group_labels":  column_group_labels,
         }
         if label_map:
             result["label_map"] = label_map
@@ -570,6 +635,9 @@ class DataLoadingSkill:
         # "Identified Proteins (1919)") above the real column names. We read
         # the sheet with header=None first, find the row that matches the most
         # proteomics-header tokens, then re-parse with the detected header row.
+        # column_group_labels: real_column_name → group_label (e.g. "SpC J" → "DMD Soleus")
+        column_group_labels: Dict[str, str] = {}
+
         for sheet_name in xl.sheet_names:
             try:
                 no_header = xl.parse(sheet_name, header=None)
@@ -580,9 +648,31 @@ class DataLoadingSkill:
                         "(skipped %d title row(s))",
                         sheet_name, header_idx, header_idx,
                     )
-                # Re-parse with the correct header. xl.parse rewinds the file;
-                # this is the safe way to re-read.
+                # ── Extract group labels from the row above the header ──────
+                # If row 0 of the raw sheet is ["BL6 Quad", "DMD Quad", ...]
+                # above row 1 ["SpC A", "SpC B", ...], pair them so downstream
+                # query agents can resolve "DMD Soleus" to the "SpC J" column.
+                labels = _extract_column_group_labels(no_header, header_idx)
+                # Re-parse with the correct header. xl.parse rewinds the file.
                 raw = xl.parse(sheet_name, header=header_idx)
+                # ── Canonicalise column names (strip whitespace; rename
+                # "Identified Proteins (N)" → "Protein Name") so downstream
+                # queries hit stable identifiers across files.
+                raw = _canonicalise_columns(raw)
+                # Re-key the extracted labels under canonical column names
+                if labels:
+                    labels = {
+                        ("Protein Name" if _TITLE_COL_PATTERN.match(k.strip())
+                         else k.strip()): v
+                        for k, v in labels.items()
+                    }
+                    column_group_labels.update(labels)
+                    logger.info(
+                        "Sheet '%s': extracted %d column→group label pair(s); "
+                        "sample: %s",
+                        sheet_name, len(labels),
+                        {k: labels[k] for k in list(labels)[:3]},
+                    )
                 kind = _classify_sheet(raw)
                 logger.info(
                     "Sheet '%s': %d rows × %d cols → %s",
@@ -643,7 +733,8 @@ class DataLoadingSkill:
         # The old fallback to _FALLBACK_LABEL_MAP caused every Excel file to be
         # misclassified as a pooled DMD design and routed to PooledFoldChangeSkill.
         is_pooled = label_map is not None
-        return primary_df, label_map, is_pooled, identifier_info, all_sheets
+        return (primary_df, label_map, is_pooled, identifier_info,
+                all_sheets, column_group_labels)
 
     # ── CSV loader ────────────────────────────────────────────────────────────
 

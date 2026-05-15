@@ -629,6 +629,27 @@ class LearningAgent(BaseAgent):
         if label_map:
             ctx += f"  pooled_label_map: {label_map}\n"
 
+        # ── Column-friendly-label mapping (for the decision LLM) ───────────
+        # Without this, the decision LLM sees only raw column names ("SpC A",
+        # "SpC B", …) and routes any question mentioning a friendly group name
+        # ("DMD Soleus") to ask_clarification — even though the mapping IS
+        # known. With it, the LLM can confidently route to query_data.
+        column_groups_dec = state.get("column_group_labels") or {}
+        if column_groups_dec:
+            # Build a compact reverse map for the decision context
+            reverse_dec: Dict[str, List[str]] = {}
+            for col, label in column_groups_dec.items():
+                reverse_dec.setdefault(label, []).append(col)
+            ctx += "  column_group_labels (friendly_name → real_column(s)):\n"
+            for label, cols in reverse_dec.items():
+                ctx += f"    '{label}' → {cols}\n"
+            ctx += (
+                "  → IMPORTANT: questions that mention any of the friendly "
+                "names above ARE answerable via query_data. Do NOT ask the "
+                "user to clarify how friendly names map to columns — the "
+                "mapping is shown above.\n"
+            )
+
         # Current group assignments (from chat or ingestion auto-detection).
         if g1_samps or g2_samps:
             ctx += (
@@ -1304,8 +1325,33 @@ class LearningAgent(BaseAgent):
             )
         sheets_ctx = "\n\n".join(sheet_blocks)
 
+        # ── Friendly-name → real-column mapping block ───────────────────────
+        column_groups_pd = state.get("column_group_labels") or {}
+        if column_groups_pd:
+            reverse_pd = {}
+            for col, label in column_groups_pd.items():
+                reverse_pd.setdefault(label, []).append(col)
+            rev_lines_pd = "\n".join(
+                f"  '{label}'  →  use column(s) {cols}"
+                for label, cols in reverse_pd.items()
+            )
+            cg_pd_block = (
+                "\n══════════════════════════════════════════════════════════\n"
+                "GROUP-LABEL → REAL-COLUMN MAPPING (AUTHORITATIVE — DO NOT GUESS)\n"
+                "══════════════════════════════════════════════════════════\n"
+                "The workbook stores 'friendly' group labels in a separate row\n"
+                "from the real column names. When the user says 'DMD Soleus',\n"
+                "use the EXACT column on the right of the mapping below.\n"
+                "NEVER make up your own pairing.\n\n"
+                f"{rev_lines_pd}\n"
+                "══════════════════════════════════════════════════════════\n"
+            )
+        else:
+            cg_pd_block = ""
+
         base_prompt = (
-            "You write safe pandas code to answer a question about a proteomics dataset.\n\n"
+            "You write safe pandas code to answer a question about a proteomics dataset.\n"
+            f"{cg_pd_block}\n"
             "VARIABLES ALREADY DEFINED IN YOUR EXECUTION NAMESPACE:\n"
             f"- `df`           — primary dataframe (sheet {primary_name!r}, all columns)\n"
             "- `df_spc`        — identifier columns + spectral-count columns ONLY\n"
@@ -1665,6 +1711,29 @@ class LearningAgent(BaseAgent):
             "detect_metric_columns":  _pt.detect_metric_columns,
         }
 
+        # ── Column-friendly-label mapping (authoritative ground truth) ───────
+        column_groups_tools = state.get("column_group_labels") or {}
+        if column_groups_tools:
+            reverse_tools: Dict[str, List[str]] = {}
+            for col, label in column_groups_tools.items():
+                reverse_tools.setdefault(label, []).append(col)
+            cg_tools_block = (
+                "\n══════════════════════════════════════════════════════════\n"
+                "GROUP-LABEL → REAL-COLUMN MAPPING (AUTHORITATIVE — DO NOT GUESS)\n"
+                "══════════════════════════════════════════════════════════\n"
+                "The workbook stores friendly group labels (e.g. 'DMD Soleus')\n"
+                "in a separate row from the real DuckDB column names (e.g.\n"
+                "'SpC J'). When the user mentions a friendly name in their\n"
+                "question, use the EXACT column on the right of this table.\n"
+                "DO NOT make up your own pairing. DO NOT trust alphabetical\n"
+                "order — the labels are not ordered alphabetically.\n\n"
+                + "\n".join(f"  '{label}'  →  columns {cols}"
+                            for label, cols in reverse_tools.items())
+                + "\n══════════════════════════════════════════════════════════\n"
+            )
+        else:
+            cg_tools_block = ""
+
         # ── System prompt for the tool-calling LLM ────────────────────────────
         system_prompt = (
             "You answer questions about a proteomics workbook by calling the "
@@ -1686,10 +1755,15 @@ class LearningAgent(BaseAgent):
             "     `WHERE NOT is_contaminant` for biology questions but use\n"
             "     it directly for 'how many contaminants?' counts.\n"
             "  5. For fold changes, use safe_fold_change (handles /0).\n"
-            "  6. After you have the answer, return a clear natural-language\n"
+            "  6. For protein-name / gene lookups, search the PROTEIN NAME\n"
+            "     column (the long UniProt-style description), NOT the\n"
+            "     Accession Number column. Gene symbols appear in the\n"
+            "     description after 'GN='. Example: ILIKE '%dystrophin%' or\n"
+            "     ILIKE '%GN=Dmd %'.\n"
+            "  7. After you have the answer, return a clear natural-language\n"
             "     response WITHOUT calling another tool. Quote exact values\n"
             "     from the tool result; never fabricate.\n"
-            "\n"
+            f"{cg_tools_block}\n"
             f"Active session: {session_id[:8]}.\n"
             f"Primary table name in DuckDB: {_ds.get_store(session_id).table_names.get(primary_name, primary_name)}.\n"
         )
@@ -1835,11 +1909,49 @@ class LearningAgent(BaseAgent):
         if not schema_block.strip():
             return None
 
+        # ── Build the column-friendly-name mapping block ────────────────────
+        # When the workbook has group labels in a row above the headers (e.g.
+        # "DMD Soleus" above "SpC J"), the LLM otherwise has no way to map
+        # the user-friendly group name back to the real column name.
+        column_groups = state.get("column_group_labels") or {}
+        if column_groups:
+            # Render BOTH directions so the LLM never has to "infer" a pairing:
+            #   reverse: label  →  real column   (user types friendly name)
+            #   forward: column →  label         (verification table)
+            reverse = {}  # label → list of real columns
+            for col, label in column_groups.items():
+                reverse.setdefault(label, []).append(col)
+            reverse_lines = "\n".join(
+                f"  '{label}'  →  use column(s) {real_cols}"
+                for label, real_cols in reverse.items()
+            )
+            forward_lines = "\n".join(
+                f'  "{col}"  =  {label}'
+                for col, label in column_groups.items()
+            )
+            cg_block = (
+                "\n══════════════════════════════════════════════════════════\n"
+                "GROUP-LABEL → REAL-COLUMN MAPPING (AUTHORITATIVE — DO NOT GUESS)\n"
+                "══════════════════════════════════════════════════════════\n"
+                "The user's workbook stores 'friendly' group labels (e.g. "
+                "'DMD Soleus') in a separate row from the real column names "
+                "(e.g. 'SpC J'). The mapping below is the ground truth — when "
+                "the user mentions a friendly name, use the EXACT column on "
+                "the right. NEVER invent your own mapping.\n\n"
+                "Reverse lookup (friendly → real column):\n"
+                f"{reverse_lines}\n\n"
+                "Forward table (real column = friendly label):\n"
+                f"{forward_lines}\n"
+                "══════════════════════════════════════════════════════════\n"
+            )
+        else:
+            cg_block = ""
+
         # ── Build SQL-generation prompt ───────────────────────────────────────
         sql_base_prompt = (
             "You write SQL queries (DuckDB dialect) to answer questions about a "
-            "proteomics workbook. Every sheet is registered as a DuckDB table — "
-            "use the EXACT table names and column names shown in the schema below.\n\n"
+            "proteomics workbook. Every sheet is registered as a DuckDB table.\n"
+            f"{cg_block}\n"
             "SCHEMA (DuckDB tables, exactly as available):\n"
             f"{schema_block}\n\n"
             f"USER QUESTION: {user_query!r}\n\n"

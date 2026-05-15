@@ -229,6 +229,11 @@ class IngestionAgent(BaseAgent):
             state["identifier_info"] = identifier_info
         if all_sheets:
             state["all_sheets"] = all_sheets
+        if result.get("column_group_labels"):
+            # Real-column-name → group-label map extracted from the row ABOVE
+            # the header. Lets the LLM resolve user-friendly names ("DMD Soleus")
+            # back to the actual workbook column ("SpC J").
+            state["column_group_labels"] = result["column_group_labels"]
 
         # ── Build sample_map from the identifier sheet (BUG-3 FIX) ────────────
         # Filters rows in the metadata sheet to those carrying the MaxQuant

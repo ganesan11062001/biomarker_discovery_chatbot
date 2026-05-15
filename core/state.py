@@ -57,6 +57,7 @@ class BiomarkerState(TypedDict, total=False):
     # Pooled design support (multi-sheet MaxQuant / Olink Excel)
     label_map:        Optional[Dict[str, str]]  # short_code → condition_name, read from the file
     sample_map:       Optional[Dict[str, Dict]]  # MaxQuant code → {client_id, strain, treatment, mouse_id}
+    column_group_labels: Optional[Dict[str, str]] # real column name → friendly group label (e.g. "SpC J" → "DMD Soleus")
     software:         Optional[str]               # detected vendor: 'MaxQuant', 'FragPipe', etc.
     is_pooled_design: Optional[bool]            # True when n=1 per group
     identifier_info:  Optional[Any]             # full parsed Identifier Info DataFrame (all mice)
