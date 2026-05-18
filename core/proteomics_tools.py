@@ -41,15 +41,32 @@ def detect_metric_columns(df) -> Dict[str, List[str]]:
     Returns a dict like:
         {
             "identifier": ["Protein Name", "Accession Number", "Molecular Weight"],
-            "spc":        ["A SpC", "B SpC", "C SpC", "D SpC", "E SpC"],
+            "spc":        ["A SpC", "B SpC", ...],
             "intensity":  ["A Intensity", "B Intensity", ...],
             "ratio":      [...],
             "other":      [...],
         }
 
+    Two paths:
+
+    1. **Explicit token match** (legacy / MaxQuant-style files):
+       Columns whose name contains "SpC" / "Intensity" / "LFQ" / "iBAQ" /
+       "Ratio" / "NPX" are classified directly. Identifier-looking columns
+       go to "identifier".
+
+    2. **Canonical template** (our standardised single-sheet format):
+       If NO SpC / Intensity / Ratio columns are detected but the sheet
+       has 2+ identifier columns followed by numeric columns, those
+       numeric columns are treated as **intensity by default**. This
+       lets users hand us a clean template like
+           Protein Name | Accession | Gene | Sample_1 | Sample_2 | ...
+       without having to put "Intensity" in every sample header.
+
     The grouping is purely schema-driven — no hardcoded sample codes or
-    biology assumptions. Any column we can't classify ends up in "other".
+    biology assumptions.
     """
+    import pandas as pd
+
     out: Dict[str, List[str]] = {
         "identifier": [],
         "spc":        [],
@@ -57,9 +74,19 @@ def detect_metric_columns(df) -> Dict[str, List[str]]:
         "ratio":      [],
         "other":      [],
     }
+    unlabeled: List[str] = []          # columns with no metric token in the name
+
     for col in df.columns:
-        c = str(col)
+        c  = str(col)
         cl = c.lower()
+        # Skip flag columns added by maxquant_filters — they go to "other"
+        # but specifically as booleans, never as a metric.
+        if c.startswith("is_") and (cl in {"is_reverse", "is_potential_contaminant",
+                                              "is_only_identified_by_site",
+                                              "is_contaminant_accession",
+                                              "is_contaminant"}):
+            out["other"].append(c)
+            continue
         if _matches_any(c, _SPC_TOKENS):
             out["spc"].append(c)
         elif _matches_any(c, _INTENSITY_TOKENS):
@@ -69,8 +96,134 @@ def detect_metric_columns(df) -> Dict[str, List[str]]:
         elif any(t in cl for t in _IDENTIFIER_TOKENS):
             out["identifier"].append(c)
         else:
-            out["other"].append(c)
+            unlabeled.append(c)
+
+    # ── Canonical-template fallback ────────────────────────────────────────
+    # If we found no explicit metric tokens AND we have enough identifier
+    # context, treat all the remaining unlabeled NUMERIC columns as
+    # intensity samples.
+    no_explicit_metrics = (not out["spc"] and not out["intensity"]
+                           and not out["ratio"])
+    if no_explicit_metrics and len(out["identifier"]) >= 1:
+        for c in unlabeled:
+            try:
+                series = df[c]
+            except Exception:
+                out["other"].append(c)
+                continue
+            # Treat as intensity if the column is mostly numeric
+            try:
+                numeric = pd.to_numeric(series, errors="coerce")
+                non_null_frac = numeric.notna().mean() if len(numeric) else 0
+            except Exception:
+                non_null_frac = 0
+            if non_null_frac >= 0.5:
+                out["intensity"].append(c)
+            else:
+                out["other"].append(c)
+    else:
+        # We found explicit metric columns — any unlabeled cols stay in "other"
+        out["other"].extend(unlabeled)
+
     return out
+
+
+# Replicate suffixes to strip when computing the base group name.
+# Order matters: try longest / most specific first.
+_REPLICATE_SUFFIX_RE = re.compile(
+    r"(?:"
+    r"\.\d+"             # pandas auto-rename for duplicate headers: WT, WT.1, WT.2
+    r"|[_\-]\d+"         # underscore / dash + number:  WT_1, WT-1
+    r"|\s+\d+"           # whitespace + number:         'WT 1'
+    r"|\d+"              # trailing digits with no separator: WT1, WT12
+    r")$",
+)
+
+
+def infer_groups_from_column_names(
+    sample_columns: List[str],
+    *,
+    min_groups: int = 2,
+) -> Dict[str, List[str]]:
+    """
+    Deterministic group inference for the canonical single-sheet template
+    where the column header IS the group name and pandas auto-renames
+    duplicate headers as ``WT``, ``WT.1``, ``WT.2``.
+
+    Algorithm:
+      1. For each column, strip the replicate suffix (``.N``, ``_N``,
+         ``-N``, `` N``, or trailing digits) to get the *base group name*.
+      2. Group columns by base name.
+      3. Return the mapping only when at least ``min_groups`` distinct
+         base names exist; otherwise return ``{}`` so the caller falls
+         back to the LLM-based inference.
+
+    Examples (using the user's canonical-template convention):
+
+        >>> infer_groups_from_column_names(["WT", "WT.1", "DMD", "DMD.1"])
+        {"WT": ["WT", "WT.1"], "DMD": ["DMD", "DMD.1"]}
+
+        >>> infer_groups_from_column_names(["WT_1", "WT_2", "KO_1", "KO_2"])
+        {"WT": ["WT_1", "WT_2"], "KO": ["KO_1", "KO_2"]}
+
+        >>> infer_groups_from_column_names(["Sample_1", "Sample_2", "Sample_3"])
+        {}   # only one base name → caller falls back to LLM
+    """
+    if not sample_columns:
+        return {}
+
+    groups: Dict[str, List[str]] = {}
+    for col in sample_columns:
+        base = _REPLICATE_SUFFIX_RE.sub("", str(col)).strip()
+        if not base:
+            continue
+        groups.setdefault(base, []).append(col)
+
+    if len(groups) < min_groups:
+        return {}
+    # Sanity: every group must have at least 1 column (trivially true) and
+    # the grouping must not be 1:1 with columns (i.e. every column its own
+    # group means no aggregation actually happened).
+    if all(len(v) == 1 for v in groups.values()) and len(groups) == len(sample_columns):
+        return {}
+    return groups
+
+
+def infer_groups_from_row0(
+    sample_columns: List[str],
+    column_group_labels: Optional[Dict[str, str]],
+    *,
+    min_groups: int = 2,
+) -> Dict[str, List[str]]:
+    """Resolve sample groups from the row-0 labels extracted at ingest.
+
+    In the canonical sheet layout, row 0 of the workbook contains the
+    biological group name for each sample column (cols 4+). ``DataLoadingSkill``
+    pairs each real column with the row-0 cell above it and stores the result
+    as ``column_group_labels`` (``real_column → group_name``). This function
+    inverts that mapping, keeping only entries whose key is in
+    ``sample_columns``, and returns ``{group_name: [cols, ...]}``.
+
+    Returns ``{}`` when fewer than ``min_groups`` distinct groups can be
+    resolved — so the caller (IngestionAgent) can fall back to the LLM-based
+    column-name inference for files without row-0 labels.
+    """
+    if not column_group_labels or not sample_columns:
+        return {}
+    sample_set = set(sample_columns)
+    groups: Dict[str, List[str]] = {}
+    for col, label in column_group_labels.items():
+        if col not in sample_set:
+            continue
+        if label is None:
+            continue
+        name = str(label).strip()
+        if not name:
+            continue
+        groups.setdefault(name, []).append(col)
+    if len(groups) < min_groups:
+        return {}
+    return groups
 
 
 def split_spc_intensity(df) -> Tuple[Any, Any]:

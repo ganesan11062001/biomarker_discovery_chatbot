@@ -1369,6 +1369,12 @@ class LearningAgent(BaseAgent):
             "- `sheets`        — dict mapping sheet name → DataFrame for ALL sheets\n"
             "- `sample_map`    — dict mapping sample code → {client_id, strain,\n"
             "                    treatment, mouse_id, …} (built from the identifier sheet)\n"
+            "- `group_columns` — dict {group_name → [real_column_names]} resolved\n"
+            "                    from row 0 of the workbook. AUTHORITATIVE source\n"
+            "                    for 'group A vs group B' queries.\n"
+            "- `resolve_group(name)` — function returning the column list for a\n"
+            "                    group name (case-insensitive). Use this instead\n"
+            "                    of guessing sample columns from header text.\n"
             "- `pd`            — pandas\n"
             "- `np`            — numpy\n"
             "\n"
@@ -1473,6 +1479,27 @@ class LearningAgent(BaseAgent):
         from core import proteomics_tools as _pt
         df_spc, df_intensity = _pt.split_spc_intensity(primary_df)
 
+        _col_to_group_exec = state.get("column_group_labels") or {}
+        _group_to_cols_exec: Dict[str, List[str]] = {}
+        for _c, _g in _col_to_group_exec.items():
+            if _g is None:
+                continue
+            _name = str(_g).strip()
+            if _name:
+                _group_to_cols_exec.setdefault(_name, []).append(_c)
+
+        def _resolve_group(name: str) -> List[str]:
+            if not name:
+                return []
+            target = str(name).strip().lower()
+            for label, cols in _group_to_cols_exec.items():
+                if label.lower() == target:
+                    return list(cols)
+            for label, cols in _group_to_cols_exec.items():
+                if target in label.lower():
+                    return list(cols)
+            return []
+
         def _execute(code_str: str):
             namespace = {
                 "df":           primary_df,
@@ -1480,6 +1507,8 @@ class LearningAgent(BaseAgent):
                 "df_intensity": df_intensity,
                 "sheets":       {n: s for n, s in df_candidates},
                 "sample_map":   state.get("sample_map") or {},
+                "group_columns": _group_to_cols_exec,
+                "resolve_group": _resolve_group,
                 "pd":           pd,
                 "np":           np,
                 # Deterministic helpers (BUG 2, 4, 6 fixes)
@@ -1704,12 +1733,40 @@ class LearningAgent(BaseAgent):
         import pandas as pd
         import numpy as np
         df_spc, df_intensity = _pt.split_spc_intensity(primary_df)
+
+        _col_to_group = state.get("column_group_labels") or {}
+        _group_to_cols: Dict[str, List[str]] = {}
+        for _c, _g in _col_to_group.items():
+            if _g is None:
+                continue
+            _name = str(_g).strip()
+            if _name:
+                _group_to_cols.setdefault(_name, []).append(_c)
+
+        def resolve_group(name: str) -> List[str]:
+            """Return the real column names belonging to a group as defined by
+            row 0 of the workbook. Case-insensitive; returns ``[]`` when the
+            name is not found so the LLM gets a clear empty result rather than
+            a KeyError."""
+            if not name:
+                return []
+            target = str(name).strip().lower()
+            for label, cols in _group_to_cols.items():
+                if label.lower() == target:
+                    return list(cols)
+            for label, cols in _group_to_cols.items():
+                if target in label.lower():
+                    return list(cols)
+            return []
+
         pandas_namespace: Dict[str, Any] = {
             "df":           primary_df,
             "df_spc":       df_spc,
             "df_intensity": df_intensity,
             "sheets":       {n: s for n, s in df_candidates},
             "sample_map":   state.get("sample_map") or {},
+            "group_columns": _group_to_cols,
+            "resolve_group": resolve_group,
             "pd":           pd,
             "np":           np,
             "safe_fold_change":       _pt.safe_fold_change,
@@ -2362,21 +2419,39 @@ class LearningAgent(BaseAgent):
             g2_label   = decision.get("group2_label")
             g2_samples = decision.get("group2_samples") or []
             all_cols   = state.get("sample_columns") or []
+            all_groups = state.get("all_groups") or {}
 
-            # Fallback: LLM gave group labels but couldn't match column names →
-            # try pattern-matching the label against actual column names.
-            if g1_label and not g1_samples:
-                g1_samples = self._match_columns_by_label(g1_label, all_cols)
-                if g1_samples:
-                    self.logger.info(
-                        "Pattern-matched '%s' → %s", g1_label, g1_samples
-                    )
-            if g2_label and not g2_samples:
-                g2_samples = self._match_columns_by_label(g2_label, all_cols)
-                if g2_samples:
-                    self.logger.info(
-                        "Pattern-matched '%s' → %s", g2_label, g2_samples
-                    )
+            def _expand(label: Optional[str], current: List[str]) -> List[str]:
+                """Resolve a group label to its full replicate column list.
+
+                Required because the LLM sometimes returns the exact-match
+                column for a label (e.g. `["uDys5"]`) without enumerating its
+                pandas-renamed siblings (`uDys5.1`, `uDys5.2`), which leaves
+                Limma/Welch with n=1 per group.
+                """
+                if not label:
+                    return current
+                # 1. Authoritative: groups already resolved at ingest
+                #    (row-0 labels or replicate-suffix stripping).
+                if label in all_groups and len(all_groups[label]) >= len(current):
+                    return list(all_groups[label])
+                for known, cols in all_groups.items():
+                    if known.lower() == label.lower() and len(cols) >= len(current):
+                        return list(cols)
+                # 2. If the current sample list still looks short, widen via
+                #    prefix/substring match against actual columns.
+                if len(current) < 2:
+                    matched = self._match_columns_by_label(label, all_cols)
+                    if len(matched) > len(current):
+                        return matched
+                return current
+
+            g1_samples = _expand(g1_label, g1_samples)
+            g2_samples = _expand(g2_label, g2_samples)
+            if g1_label:
+                self.logger.info("Resolved group1 '%s' → %s", g1_label, g1_samples)
+            if g2_label:
+                self.logger.info("Resolved group2 '%s' → %s", g2_label, g2_samples)
 
             if g1_samples and g2_samples:
                 # Successfully identified both groups — update state and run
@@ -2384,6 +2459,29 @@ class LearningAgent(BaseAgent):
                 state["group1_samples"] = g1_samples
                 state["group2_label"]   = g2_label or "Group2"
                 state["group2_samples"] = g2_samples
+
+                # n=1-per-group design — Limma/Welch need replicates and will
+                # error out. Route this single contrast through the pooled
+                # fold-change skill (same fallback as _run_all_comparisons).
+                if len(g1_samples) < 2 and len(g2_samples) < 2:
+                    g1_name = state["group1_label"]
+                    g2_name = state["group2_label"]
+                    state["label_map"]        = {
+                        g1_samples[0]: g1_name,
+                        g2_samples[0]: g2_name,
+                    }
+                    state["is_pooled_design"] = True
+                    state["omic_type"]        = "proteomics_pooled"
+                    state["messages"].append({
+                        "role": "assistant",
+                        "content": (
+                            f"Only one sample per group ({g1_name}, {g2_name}) — "
+                            f"Welch / Limma require replicates. Switching to "
+                            f"**log₂ fold-change analysis (no p-values)** for this "
+                            f"contrast."
+                        ),
+                    })
+                    return self._specialist("biomarker").run(state)
 
             elif (g1_label or g2_label) and not (
                 (state.get("group1_samples") or []) and (state.get("group2_samples") or [])

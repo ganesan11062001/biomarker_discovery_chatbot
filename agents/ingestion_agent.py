@@ -304,9 +304,27 @@ class IngestionAgent(BaseAgent):
             logger.info("omic_type set from DataLoadingSkill hint: '%s'", result["omic_type"])
 
         # ── Auto-detect groups from column names (non-pooled) ─────────────────
+        # Strategy:
+        #   1. Row-0 labels (canonical sheet layout) — deterministic, no LLM.
+        #      `column_group_labels` is the row above the header paired with
+        #      each sample column; it's the user-stated source of truth for
+        #      "group A vs group B" queries.
+        #   2. Fall back to LLM column-name inference only when no row-0 labels
+        #      were present.
         inferred_groups: Dict[str, List[str]] = {}
         if not is_pooled and result["sample_columns"]:
-            inferred_groups = self._infer_groups(result["sample_columns"])
+            from core.proteomics_tools import infer_groups_from_row0
+            inferred_groups = infer_groups_from_row0(
+                result["sample_columns"],
+                result.get("column_group_labels"),
+            )
+            if inferred_groups:
+                logger.info(
+                    "Groups resolved from row-0 labels: %s",
+                    {k: len(v) for k, v in inferred_groups.items()},
+                )
+            else:
+                inferred_groups = self._infer_groups(result["sample_columns"])
             if len(inferred_groups) >= 2:
                 group_names = list(inferred_groups.keys())
                 state["group1_label"]   = group_names[0]

@@ -339,14 +339,27 @@ def _detect_tmt_batches(
 
 
 def _separate_columns(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    """Split columns into sample-value columns and metadata columns.
+
+    Order of checks:
+      1. Numeric content first — a column with ≥70% numeric values is a
+         sample column regardless of its name. This is critical for the
+         canonical single-sheet template where users name columns
+         ``Sample_1``, ``Sample_2``, etc. ("sample" matches the metadata
+         hint list but the column is clearly a sample-value column).
+      2. Otherwise, metadata-hint name match → metadata.
+      3. Otherwise, low-numeric → metadata.
+    """
     sample_cols, metadata_cols = [], []
     for col in df.columns:
         col_lower = str(col).lower()
-        if any(hint in col_lower for hint in _METADATA_HINTS):
-            metadata_cols.append(col)
-            continue
         frac = pd.to_numeric(df[col], errors="coerce").notna().sum() / max(len(df), 1)
-        (sample_cols if frac >= 0.7 else metadata_cols).append(col)
+        if frac >= 0.7:
+            sample_cols.append(col)
+        elif any(hint in col_lower for hint in _METADATA_HINTS):
+            metadata_cols.append(col)
+        else:
+            metadata_cols.append(col)
     return sample_cols, metadata_cols
 
 
