@@ -38,11 +38,17 @@ except ImportError:
 
 def _get_log2fc(protein_dict: dict) -> float:
     """Retrieve log2 fold-change from any of the field names used across skills."""
-    for field in ("log2fc", "log2_ratio", "log2_fold_change", "max_pairwise_log2fc"):
+    for field in (
+        "log2_fold_change",         # canonical (set by every skill + dual_engine)
+        "mean_log2fc", "log2fc_python", "log2fc_r",   # dual-engine aliases
+        "log2fc", "log2_ratio", "max_log2fc", "max_pairwise_log2fc",
+    ):
         val = protein_dict.get(field)
         if val is not None:
             try:
-                return float(val)
+                fv = float(val)
+                if fv == fv:        # NaN check
+                    return fv
             except (ValueError, TypeError):
                 pass
     return 0.0
@@ -202,23 +208,28 @@ class EnrichmentAgent(BaseAgent):
             f"  {p['protein']} (log2FC={_get_log2fc(p):+.2f})" for p in top_fc
         )
 
+        # log2FC convention: log2(group2 / group1) — positive = up in group2
+        contam = result.get("contaminants_excluded") or []
         ctx = (
             f"PATHWAY ENRICHMENT ANALYSIS COMPLETE\n\n"
             f"Comparison: {g1} vs {g2}\n"
             f"Omic type: {omic} | Organism: {organism}\n\n"
             f"Proteins submitted for enrichment: {len(sig_proteins)} significant proteins\n"
-            f"  - Up-regulated ({g1} > {g2}): {len(up_proteins)}\n"
-            f"  - Down-regulated ({g1} < {g2}): {len(down_proteins)}\n"
-            f"Background gene set: {bg_size} measured proteins\n\n"
-            f"Results:\n"
+            f"  - Up-regulated (higher in {g2}):   {len(up_proteins)}\n"
+            f"  - Down-regulated (higher in {g1}): {len(down_proteins)}\n"
+            f"Background gene set: {bg_size} measured proteins\n"
+            + (f"Blood / prep contaminants excluded before submission: "
+               f"{', '.join(contam[:8])}{'…' if len(contam) > 8 else ''}\n"
+               if contam else "")
+            + f"\nResults:\n"
             f"  KEGG pathways significant: {result.get('n_kegg_significant', 0)}\n"
             f"  GO terms significant:      {result.get('n_go_significant', 0)}\n\n"
         )
 
         if up_lines:
-            ctx += f"Top UP-regulated pathways (activated in {g1}):\n{up_lines}\n\n"
+            ctx += f"Top UP-regulated pathways (higher in {g2} than {g1}):\n{up_lines}\n\n"
         if down_lines:
-            ctx += f"Top DOWN-regulated pathways (suppressed in {g1}):\n{down_lines}\n\n"
+            ctx += f"Top DOWN-regulated pathways (lower in {g2} than {g1}):\n{down_lines}\n\n"
         if not up_lines and not down_lines and all_top:
             ctx += f"Top enriched pathways:\n{all_top}\n\n"
 

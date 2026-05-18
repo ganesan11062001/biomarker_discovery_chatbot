@@ -742,9 +742,9 @@ class DataLoadingSkill:
         if label_map is None and metadata_sheets:
             identifier_info = all_sheets[metadata_sheets[0][0]]
 
-        # is_pooled only when a real label_map was extracted from the file.
-        # The old fallback to _FALLBACK_LABEL_MAP caused every Excel file to be
-        # misclassified as a pooled DMD design and routed to PooledFoldChangeSkill.
+        # is_pooled is retained on state for legacy callers but the canonical
+        # template never sets it — downstream analysis is always run by the
+        # dual-engine intensity pipeline regardless of this flag.
         is_pooled = label_map is not None
         return (primary_df, label_map, is_pooled, identifier_info,
                 all_sheets, column_group_labels)

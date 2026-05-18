@@ -84,7 +84,7 @@ class DecisionSchema(BaseModel):
     test_method:  Optional[str]                     = None  # "welch"|"limma"|"paired_t"|"anova"
     is_paired:    Optional[bool]                    = None  # True for matched/before-after designs
     all_groups:   Optional[Dict[str, List[str]]]    = None  # ANOVA: {group: [cols], ...}
-    omic_type:    Optional[str]                     = None  # "proteomics_silac" etc.
+    omic_type:    Optional[str]                     = None  # "proteomics" (intensity-only canonical)
 
     # Clarification question — only used when action == "ask_clarification".
     # Write a complete, kind, professional question the user sees verbatim.
@@ -157,7 +157,7 @@ class DecisionSchema(BaseModel):
     def _validate_omic_type(cls, v) -> Optional[str]:
         if v is None:
             return None
-        valid = {"proteomics", "proteomics_pooled", "proteomics_silac"}
+        valid = {"proteomics"}
         s = str(v).lower().strip()
         return s if s in valid else None
 
@@ -176,8 +176,7 @@ that drives the pipeline. Choose exactly one action:
   "run_all_comparisons" — run ALL pairwise group comparisons WITHOUT enrichment or viz
                          (rarely used directly — most users want run_full_pipeline)
   "run_full_pipeline"   — first-time auto-analysis: data summary + all pairwise
-                         comparisons (or pooled fold-change for n=1 designs) +
-                         pathway enrichment + plots, in one shot. Use this when
+                         comparisons + pathway enrichment + plots, in one shot. Use this when
                          the user asks for "the full analysis", "run analysis"
                          (generic, no specific pair), "do everything", "give me
                          a comprehensive analysis", "analyse the data", etc.
@@ -206,7 +205,7 @@ that drives the pipeline. Choose exactly one action:
                              • "what is the largest / smallest / highest-MW protein?"
                              • "what is the most up/down-regulated protein in X vs Y?"
                              • "what is the fold change of <X> in <group A> vs <group B>?"
-                             • "top N proteins by SpC in <group>?"
+                             • "top N proteins by intensity in <group>?"
                            For "most up/down in X vs Y" questions: this is a SQL
                            fold-change computation, NOT a full analysis. Route here,
                            NOT to run_analysis or run_full_pipeline. The bot writes
@@ -215,15 +214,14 @@ that drives the pipeline. Choose exactly one action:
   "ask_clarification"   — ask the user a focused, professional question before proceeding
   "answer"              — answer a question, explain something, or have a conversation
 
-Analysis routing — the pipeline automatically selects the right method:
-  • Regular proteomics (CSV or standard Excel, any number of replicates) →
-      Test method auto-selected: limma eBayes for n≤4 per group, Welch t-test for n≥5.
-      If ≥2 samples per group: supervised differential expression (log₂FC, Cohen's d, adj. p-value).
-      If no group labels given: unsupervised CV/MAD/IQR variability ranking.
-  • Pooled n=1 design (MaxQuant Excel with Identifier Info label sheet, one sample per label) →
-      log₂ fold-change across all pairwise contrasts (no p-values, by design).
-  • SILAC data (H/L or H/M ratios detected) → SilacAnalysisSkill (omic_type="proteomics_silac").
-  • DIA/Spectronaut output → automatically reshaped, then ProteomicsAnalysisSkill.
+Analysis routing — the canonical template is intensity-only proteomics:
+  • Two-sheet template (Sheet 1 metadata: Sample ID | Group; Sheet 2 proteins:
+    Protein Name | Accession | Gene | sample columns) is the supported format.
+  • Test method auto-selected: limma eBayes for n≤4 per group, Welch t-test for n≥5.
+    ≥2 samples per group → supervised differential expression (log₂FC, Cohen's d, adj. p-value).
+    No group labels → unsupervised CV/MAD/IQR variability ranking.
+  • The Python pipeline is paired with an R + limma engine; the dual-engine
+    combiner intersects significant proteins from both to produce the final list.
   • Multi-batch TMT with IRS → IRS normalisation applied automatically when plex structure detected.
 
 TEST METHOD EXTRACTION (populate "test_method" when user explicitly requests one):
@@ -242,9 +240,6 @@ MULTI-GROUP ANOVA (populate "all_groups" when user has >2 groups for ANOVA):
 PAIRED DESIGN (set is_paired = true when user describes matched samples):
   "compare before and after treatment for each patient" → is_paired = true
   "paired t-test with samples matched by patient ID" → is_paired = true, test_method = "paired_t"
-
-SILAC (set omic_type when user specifies data type):
-  "my data is SILAC" / "heavy/light ratios" → omic_type = "proteomics_silac"
 
 Decision rules (in priority order):
 1.  Questions ("what is X", "explain X", "how does Y work", "what did the analysis find") → "answer"
@@ -295,8 +290,8 @@ USE "ask_clarification" whenever you are genuinely uncertain about:
   • Which statistical method is most appropriate given the context
   • How many groups should be analysed and whether simultaneously or pairwise
   • What a column, label, or parameter means in the user's experiment
-  • Whether a detected data feature (SILAC ratios, TMT batches, pooled design,
-    Spectronaut output) matches the user's actual experiment
+  • Whether a detected data feature (TMT batches, Spectronaut output) matches
+    the user's actual experiment
   • What the user wants to do next when their message is ambiguous
   • Any detail where guessing wrong would produce misleading biological results
 
@@ -330,7 +325,6 @@ COMMON SITUATIONS THAT WARRANT CLARIFICATION (non-exhaustive — use judgement)
 • Sample names suggest a paired/longitudinal design (e.g. `Pat1_Pre`, `Pat1_Post`)
   but the user hasn't confirmed it
 • Three or more groups detected — should analysis be ANOVA or pairwise?
-• SILAC ratio data — single-condition (H/L vs 1) or two-condition (comparing ratios)?
 • Multi-batch TMT detected but no reference channel column can be identified
 • User requests a specific comparison but some named columns don't exist in the data
 • User asks to "re-run with different thresholds" but doesn't specify which thresholds
@@ -601,7 +595,6 @@ class LearningAgent(BaseAgent):
           3. Confidence < 0.7 is demoted to "answer" to prevent misrouted actions
         """
         sample_cols = state.get("sample_columns") or []
-        label_map   = state.get("label_map") or {}
         top_bm      = state.get("top_biomarkers") or []
         g1_samps    = state.get("group1_samples") or []
         g2_samps    = state.get("group2_samples") or []
@@ -613,7 +606,6 @@ class LearningAgent(BaseAgent):
         ctx += f"  data_type: {state.get('data_type', 'none')}\n"
         ctx += f"  n_proteins: {state.get('n_proteins', 0)}\n"
         ctx += f"  n_samples: {state.get('n_samples', 0)}\n"
-        ctx += f"  is_pooled_design: {state.get('is_pooled_design', False)}\n"
         ctx += f"  omic_type: {state.get('omic_type', 'none')}\n"
         ctx += f"  data_type: {state.get('data_type', 'none')}\n"
         ctx += f"  analysis_complete: {state.get('n_significant') is not None}\n"
@@ -636,8 +628,6 @@ class LearningAgent(BaseAgent):
 
         # ALL sample columns — the LLM must see these to populate group_samples correctly.
         ctx += f"  all_sample_columns ({len(sample_cols)} total): {sample_cols[:100]}\n"
-        if label_map:
-            ctx += f"  pooled_label_map: {label_map}\n"
 
         # ── Column-friendly-label mapping (for the decision LLM) ───────────
         # Without this, the decision LLM sees only raw column names ("SpC A",
@@ -815,9 +805,8 @@ class LearningAgent(BaseAgent):
     def _run_full_pipeline(self, state: BiomarkerState) -> BiomarkerState:
         """End-to-end first-time analysis:
               1. Emit a concise data summary so the user sees what's loaded.
-              2. Run all pairwise comparisons (Welch / limma when replicated,
-                 pooled log₂FC when n=1 per group — handled by
-                 ``_run_all_comparisons`` → BiomarkerAgent).
+              2. Run all pairwise comparisons via the dual-engine pipeline
+                 (Welch/limma in Python, limma in R → intersection).
               3. Pathway enrichment on the top biomarkers if any survived.
               4. Visualisation suite (volcano / heatmap / PCA / etc.).
               5. Final closing message inviting drill-downs.
@@ -901,11 +890,6 @@ class LearningAgent(BaseAgent):
             lines.append("- " + " · ".join(details))
 
         # Groups detected by IngestionAgent
-        sample_map = state.get("sample_map") or {}
-        if sample_map:
-            lines.append(f"- **{len(sample_map)}** pooled samples mapped: "
-                         + ", ".join(f"`{k}`→{v.get('client_id') or v.get('strain') or '?'}"
-                                      for k, v in list(sample_map.items())[:6]))
         all_groups = state.get("all_groups") or {}
         if all_groups:
             lines.append(f"- **{len(all_groups)}** inferred group(s): "
@@ -924,65 +908,14 @@ class LearningAgent(BaseAgent):
 
     def _run_all_comparisons(self, state: BiomarkerState) -> BiomarkerState:
         """
-        Route to the appropriate analysis for the loaded data:
-
-        • Pooled n=1 design (is_pooled_design=True, no replicates):
-          Delegate entirely to BiomarkerAgent → PooledFoldChangeSkill.
-          That skill computes all pairwise log₂FC contrasts in a single pass.
-
-        • Standard proteomics (replicated groups):
-          Infer groups from column names, then run Welch t-test + BH FDR for
-          every pairwise combination via ProteomicsAnalysisSkill.
+        Standard proteomics — infer groups from the canonical sample→group map
+        (built at ingestion time), then run differential expression for every
+        pairwise group combination via ProteomicsAnalysisSkill.
         """
-        is_pooled = state.get("is_pooled_design") or state.get("omic_type") == "proteomics_pooled"
-
-        # For truly pooled n=1 designs, PooledFoldChangeSkill handles everything
-        if is_pooled:
-            label_map = state.get("label_map") or {}
-            groups = list(label_map.values()) if label_map else ["all groups"]
-            state["messages"].append({
-                "role": "assistant",
-                "content": (
-                    f"Pooled n=1 design detected. Running log₂ fold-change analysis "
-                    f"across all pairwise contrasts for groups: **{', '.join(groups)}** …"
-                ),
-            })
-            return self._specialist("biomarker").run(state)
-
-        # Standard replicated proteomics — prefer the sanitised group map built
-        # at ingestion time; only re-infer if it's missing.
         sample_cols = state.get("sample_columns") or []
         groups: Dict[str, List[str]] = state.get("all_groups") or {}
         if not groups:
             groups = self._infer_groups(sample_cols)
-
-        # ── n=1 design fallback ───────────────────────────────────────────────
-        # If every plausible group has just one sample (e.g. {strain × tissue}
-        # with one mouse per cell), Welch / limma are undefined. Route to the
-        # pooled-design skill which computes pairwise log₂FC + rescue scores
-        # without requiring replicates.
-        all_singleton = (
-            bool(sample_cols)
-            and (not groups or all(len(v) <= 1 for v in groups.values()))
-        )
-        if all_singleton:
-            n = len(sample_cols)
-            label_map = {c: c for c in sample_cols}  # each column is its own condition
-            state["label_map"]        = label_map
-            state["is_pooled_design"] = True
-            state["omic_type"]        = "proteomics_pooled"
-            state["messages"].append({
-                "role": "assistant",
-                "content": (
-                    f"Each group in your data has only **n=1** sample — Welch t-tests "
-                    f"need replicates and would return NaN for every protein. "
-                    f"Switching to **pooled-design log₂ fold-change analysis** across "
-                    f"all **{n} samples** ({n * (n-1) // 2} pairwise contrasts). "
-                    f"Proteins are ranked by a rescue score that captures "
-                    f"consistent up/down-regulation across contrasts."
-                ),
-            })
-            return self._specialist("biomarker").run(state)
 
         if len(groups) < 2:
             state["messages"].append({
@@ -2249,7 +2182,6 @@ class LearningAgent(BaseAgent):
         if state.get("data_type"):
             sample_cols  = state.get("sample_columns") or []
             meta_cols    = state.get("metadata_columns") or []
-            label_map    = state.get("label_map") or {}
             g1           = state.get("group1_label")
             g2           = state.get("group2_label")
             g1_samps     = state.get("group1_samples") or []
@@ -2264,7 +2196,6 @@ class LearningAgent(BaseAgent):
                 f"- Samples: {state.get('n_samples','?')}",
                 f"- Data type: {state.get('data_type','?')}",
                 f"- Omic type: {state.get('omic_type','proteomics')}",
-                f"- Pooled design: {state.get('is_pooled_design', False)}",
                 f"- Organism: {state.get('organism', 'not set')}",
                 f"- Disease program: {state.get('disease_program', 'General')}",
                 f"- Sample columns ({len(sample_cols)}): {sample_cols[:30]}",
@@ -2287,9 +2218,7 @@ class LearningAgent(BaseAgent):
                             )
                 except Exception:
                     pass
-            if label_map:
-                ctx.append(f"- Pooled groups (label map): { {k: v for k, v in label_map.items()} }")
-            elif g1 and g2:
+            if g1 and g2:
                 ctx += [
                     f"- Group 1: {g1} — {len(g1_samps)} samples: {g1_samps}",
                     f"- Group 2: {g2} — {len(g2_samps)} samples: {g2_samps}",
@@ -2479,29 +2408,9 @@ class LearningAgent(BaseAgent):
                 state["group2_label"]   = g2_label or "Group2"
                 state["group2_samples"] = g2_samples
 
-                # n=1-per-group design — Limma/Welch need replicates and will
-                # error out. Route this single contrast through the pooled
-                # fold-change skill (same fallback as _run_all_comparisons).
-                if len(g1_samples) < 2 and len(g2_samples) < 2:
-                    g1_name = state["group1_label"]
-                    g2_name = state["group2_label"]
-                    state["label_map"]        = {
-                        g1_samples[0]: g1_name,
-                        g2_samples[0]: g2_name,
-                    }
-                    state["is_pooled_design"] = True
-                    state["omic_type"]        = "proteomics_pooled"
-                    state["messages"].append({
-                        "role": "assistant",
-                        "content": (
-                            f"Only one sample per group ({g1_name}, {g2_name}) — "
-                            f"Welch / Limma require replicates. Switching to "
-                            f"**log₂ fold-change analysis (no p-values)** for this "
-                            f"contrast."
-                        ),
-                    })
-                    return self._specialist("biomarker").run(state)
-
+                # n=1-per-group designs are accepted; ProteomicsAnalysisSkill
+                # falls back to log₂ fold-change reporting when replicates
+                # aren't available.
             elif (g1_label or g2_label) and not (
                 (state.get("group1_samples") or []) and (state.get("group2_samples") or [])
             ):

@@ -37,12 +37,19 @@ except ImportError:
 _DOMAIN_EXPERT_SYSTEM_PROMPT = """\
 You are a domain expert in proteomics, cell biology, and disease mechanisms.
 
-You have been given the FINISHED results of a differential-expression or
-pooled-fold-change analysis — including a small list of top biomarkers with
-their fold-changes and (where applicable) adjusted p-values. Your task is to
-write a SHORT biological interpretation (≤250 words, markdown).
+You have been given the FINISHED results of a differential-expression
+analysis — a small list of top biomarkers with their fold-changes and
+(where applicable) adjusted p-values. Your task is to write a SHORT
+biological interpretation (≤250 words, markdown).
 
 STRICT RULES:
+
+0. PROTEIN IDENTITY IS PROVIDED — DO NOT RE-DERIVE IT.
+   Every biomarker row gives you `accession`, `gene` and `name` straight
+   from the user's file. Use those values verbatim. NEVER look up or guess
+   a protein's identity from its accession number alone — your training
+   data for UniProt IDs is unreliable and will produce wrong identities.
+   If a row's gene or name is "?" or empty, say so — do not invent one.
 
 1. Only discuss proteins, genes, and pathways that appear in the provided
    biomarker list. Do NOT invent additional proteins, GO terms, or pathways.
@@ -58,9 +65,13 @@ STRICT RULES:
 4. Call out conflicting or counterintuitive results explicitly. If two markers
    move in opposite directions on the same pathway, say so.
 
-5. If the comparison labels suggest a well-known disease model (the user
-   tells you the labels — never assume), anchor your interpretation in that
-   disease context. Otherwise stay neutral.
+5. NEVER assume a specific disease (e.g. Duchenne muscular dystrophy, ALS,
+   Alzheimer's) from sample or group names alone. Tokens like "DMD", "mdx",
+   "dys" in column headers do NOT license a DMD-framed interpretation — they
+   may simply be sample IDs. Stay disease-agnostic unless the user has
+   explicitly told you what disease the experiment is about, and even then
+   only anchor lightly. Default framing: "in group X relative to group Y,
+   <protein> is up/down …" — describe the biology, not the disease.
 
 6. End with one concrete follow-up suggestion — typically either a
    validation experiment (Western blot, qPCR, IHC) of the top hit, or a
@@ -103,31 +114,40 @@ class DomainExpertAgent(BaseAgent):
         if not top:
             return None
 
-        # Build a compact grounding block. The reviewer prompt explicitly
-        # forbids referencing anything outside this list.
+        # Build a compact grounding block. Every row carries the protein
+        # name + gene symbol straight from the uploaded file — the LLM must
+        # use these verbatim and never re-derive an identity from the
+        # accession number.
         lines = []
         for b in top[:20]:
-            protein = b.get("protein", "?")
+            acc     = b.get("protein", "?")
+            pname   = (b.get("protein_name") or "").strip() or "?"
+            gene    = (b.get("gene_name")    or "").strip() or "?"
             fc      = b.get("log2_fold_change",
-                            b.get("max_pairwise_log2fc",
-                                  b.get("rescue_score", "?")))
-            adj_p   = b.get("adj_p_value", "?")
-            lines.append(f"- {protein}  log2FC={fc}  adj_p={adj_p}")
+                            b.get("max_pairwise_log2fc", "?"))
+            adj_p   = b.get("adj_p_value", "n/a")
+            lines.append(
+                f"- accession={acc}  gene={gene}  name=\"{pname}\"  "
+                f"log2FC={fc}  adj_p={adj_p}"
+            )
         biomarkers_block = "\n".join(lines)
 
         g1 = state.get("group1_label") or "Group1"
         g2 = state.get("group2_label") or "Group2"
         organism = state.get("organism") or "human"
-        program  = state.get("disease_program") or "General"
         omic     = state.get("omic_type") or "proteomics"
         mode     = state.get("analysis_mode") or "supervised"
         n_sig    = state.get("n_significant", "?")
 
+        # NOTE: we deliberately omit any auto-detected disease_program from
+        # the context. Token-based disease detection (e.g. "dmd" in a sample
+        # name → "Duchenne") is heuristic and was producing DMD-framed
+        # interpretations for unrelated experiments. The user's wording in
+        # the chat is the authoritative source for disease context.
         ctx = (
             f"## Analysis context\n"
             f"- Comparison: **{g1}** vs **{g2}**\n"
             f"- Organism: {organism}\n"
-            f"- Disease program: {program}\n"
             f"- Omic type: {omic}\n"
             f"- Mode: {mode}\n"
             f"- Significant biomarkers: {n_sig}\n\n"

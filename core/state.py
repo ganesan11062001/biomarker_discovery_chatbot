@@ -13,11 +13,11 @@ metabolomics, and any future omic layer.
 
 Supported omic types
 --------------------
-  "proteomics"         — ProteomicsAnalysisSkill    (implemented)
-  "proteomics_pooled"  — PooledFoldChangeSkill      (implemented)
-  "transcriptomics"    — TranscriptomicsSkill        (planned)
-  "metabolomics"       — MetabolomicsSkill           (planned)
-  "lipidomics"         — LipidomicsSkill             (planned)
+  "proteomics"         — ProteomicsAnalysisSkill (intensity-only, dual-engine
+                          Python + R/limma; canonical 2-sheet template)
+  "transcriptomics"    — TranscriptomicsSkill   (planned)
+  "metabolomics"       — MetabolomicsSkill      (planned)
+  "lipidomics"         — LipidomicsSkill        (planned)
 """
 from __future__ import annotations
 

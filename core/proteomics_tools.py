@@ -451,8 +451,7 @@ def build_sample_group_map(
 
     # Drop only the truly useless case: zero groups. A single-group result
     # (e.g. only WT samples) is still informative for downstream Q&A even
-    # though no comparison is possible. n=1-per-group pooled designs are
-    # also valid — they route to PooledFoldChangeSkill.
+    # though no comparison is possible.
     if not group_to_samples:
         return {}, {}
 

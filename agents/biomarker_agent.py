@@ -30,9 +30,7 @@ from config.settings import get_settings
 from core.state import BiomarkerState
 from core.tracing import get_biomarker_metadata
 from skills.omics_registry import OmicsSkillRegistry
-from skills.pooled_fold_change import PooledFoldChangeSkill
 from skills.proteomics_analysis import ProteomicsAnalysisSkill
-from skills.silac_analysis import SilacAnalysisSkill
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -70,8 +68,6 @@ class BiomarkerAgent(BaseAgent):
         # Add new omic types here as they are implemented.
         self._registry = OmicsSkillRegistry()
         self._registry.register(ProteomicsAnalysisSkill())
-        self._registry.register(PooledFoldChangeSkill())
-        self._registry.register(SilacAnalysisSkill())
         # Future registrations (uncomment when implemented):
         # self._registry.register(TranscriptomicsSkill())
         # self._registry.register(MetabolomicsSkill())
@@ -97,36 +93,17 @@ class BiomarkerAgent(BaseAgent):
             )
 
         # ── Route to the correct omic skill ──────────────────────────────────
-        #
-        # Routing rules (in priority order):
-        #   1. omic_type already set in state (e.g. "proteomics_pooled") → honour it
-        #   2. is_pooled_design flag set (label_map extracted from Identifier Info sheet,
-        #      AND each group truly has a single sample) → proteomics_pooled
-        #   3. group labels provided with ≥2 replicates each → proteomics (supervised)
-        #   4. No group labels → proteomics (unsupervised CV ranking)
-        #
-        # Downgrade pooled→standard if both group samples are given AND each has
-        # multiple replicates — the user explicitly assigned replicated groups,
-        # so Welch t-test is more appropriate than a fold-change-only analysis.
+        # The canonical 2-sheet template is intensity-only proteomics; legacy
+        # SpC / SILAC / pooled-MaxQuant routing has been removed. The agent
+        # always dispatches to ProteomicsAnalysisSkill for omic_type "proteomics".
         g1 = state.get("group1_samples") or []
         g2 = state.get("group2_samples") or []
 
-        if (
-            state.get("omic_type") == "proteomics_pooled"
-            and len(g1) >= 2
-            and len(g2) >= 2
-        ):
-            logger.info(
-                "Downgrading pooled→proteomics: replicated groups detected "
-                "(g1=%d, g2=%d samples).", len(g1), len(g2),
-            )
-            state["omic_type"]        = "proteomics"
-            state["is_pooled_design"] = False
-
-        if state.get("is_pooled_design") and not state.get("omic_type"):
-            state["omic_type"] = "proteomics_pooled"
-
         omic_type = state.get("omic_type") or _DEFAULT_OMIC_TYPE
+        # Legacy sessions may still carry deprecated omic_type values from
+        # earlier versions of the pipeline; coerce them to the canonical key.
+        if omic_type in ("proteomics_pooled", "proteomics_silac"):
+            state["omic_type"] = omic_type = "proteomics"
 
         # Validate omic type before doing any work
         if omic_type not in self._registry:
@@ -146,12 +123,7 @@ class BiomarkerAgent(BaseAgent):
         _overrides = state.get("analysis_params") or {}
 
         # User-facing progress message — clearly names what is running and why
-        if omic_type == "proteomics_pooled":
-            mode_label = (
-                "pooled log₂ fold-change analysis (n=1 per group — no replicates). "
-                "All pairwise contrasts will be computed."
-            )
-        elif mode == "supervised":
+        if mode == "supervised":
             g1_lbl = state.get("group1_label", "Group 1")
             g2_lbl = state.get("group2_label", "Group 2")
             n1, n2 = len(g1), len(g2)
@@ -227,9 +199,8 @@ class BiomarkerAgent(BaseAgent):
             is_paired=_is_paired,
             all_groups=_all_groups,
             tmt_batches=_tmt_batches,
-            # Pooled-design parameters (PooledFoldChangeSkill)
-            raw_data_path=state.get("raw_data_path", ""),
-            label_map=state.get("label_map"),
+            # Pooled / no-replicates designs → fold-change-only ranking
+            is_pooled_design=bool(state.get("is_pooled_design")),
         )
 
         if result.get("error"):
@@ -239,15 +210,65 @@ class BiomarkerAgent(BaseAgent):
                 f"Analysis failed: {result['error']}",
             )
 
-        # Persist results
+        # ── Dual-engine: run R/limma + intersect with Python results ──────────
+        # Only meaningful for supervised two-group comparisons (Welch / limma
+        # output, which expose log2_fold_change). ANOVA results use max_log2fc
+        # and unsupervised uses cv_percent — neither is compatible.
+        # Any R failure is non-fatal: the Python result is kept.
+        dual = None
+        py_top = result.get("top_biomarkers") or []
+        has_log2fc = bool(py_top) and ("log2_fold_change" in py_top[0])
+        has_adj_p  = bool(py_top) and ("adj_p_value"      in py_top[0])
+        if (
+            mode == "supervised"
+            and len(g1) >= 2 and len(g2) >= 2
+            and has_log2fc and has_adj_p          # need both for dual-engine intersection
+        ):
+            dual = self._run_dual_engine(
+                state=state,
+                python_top=py_top,
+                g1=g1, g2=g2,
+                g1_label=state.get("group1_label") or "Group1",
+                g2_label=state.get("group2_label") or "Group2",
+                adj_pval_cutoff=adj_pval_cutoff,
+                log2fc_cutoff=log2fc_cutoff,
+            )
+
+        # Persist results — prefer dual-engine intersection when available
         state["omic_type"]      = omic_type
-        state["top_biomarkers"] = result["top_biomarkers"]
-        state["top_proteins"]   = result["top_biomarkers"]  # legacy field
-        state["n_significant"]  = result["n_significant"]
+        if dual and not dual["intersected"].empty:
+            top_records = dual["intersected"].head(top_n).to_dict("records")
+            state["top_biomarkers"] = top_records
+            state["top_proteins"]   = top_records
+            state["n_significant"]  = int(dual["qc"]["intersection"])
+            state["dual_engine_qc"] = dual["qc"]
+            state["r_results_path"] = dual["r_csv"]
+        else:
+            state["top_biomarkers"] = result["top_biomarkers"]
+            state["top_proteins"]   = result["top_biomarkers"]
+            state["n_significant"]  = result["n_significant"]
         state["excel_path"]     = result["excel_path"]
         state["qc_summary"]     = result["qc_summary"]
         state["qc_passed"]      = True
         state["status"]         = "analysis_complete"
+
+        # ── Plotly visualisation suite (interactive HTML + PNG) ───────────────
+        # The Python helper internally skips per-plot failures, so it's safe
+        # to invoke even when log2_fold_change is missing — volcano/MA will
+        # be dropped but PCA/heatmap/boxplots still produced.
+        if mode == "supervised":
+            try:
+                plot_paths = self._build_plots(
+                    state=state, python_top=py_top,
+                    dual=dual,
+                    adj_pval_cutoff=adj_pval_cutoff,
+                    log2fc_cutoff=log2fc_cutoff,
+                )
+                if plot_paths:
+                    state["plot_paths"] = plot_paths
+                    result["plot_paths"] = plot_paths
+            except Exception as exc:
+                logger.warning("Plot generation failed: %s", exc)
 
         if result.get("analysis_code"):
             state["analysis_code"] = result["analysis_code"]
@@ -297,6 +318,122 @@ class BiomarkerAgent(BaseAgent):
 
         return state
 
+    # ── Dual-engine helpers ───────────────────────────────────────────────────
+
+    def _run_dual_engine(
+        self,
+        state: BiomarkerState,
+        python_top,
+        g1, g2, g1_label, g2_label,
+        adj_pval_cutoff: float,
+        log2fc_cutoff:   float,
+    ) -> Dict[str, Any] | None:
+        """Run R/limma on the cached expression CSV and intersect with Python."""
+        try:
+            from skills.r_analysis import RAnalysisSkill, RAnalysisError
+            from skills.dual_engine import combine_engines
+            import pandas as pd
+        except Exception as exc:
+            logger.warning("Dual-engine deps not importable: %s — skipping R", exc)
+            return None
+
+        r_skill = RAnalysisSkill(adj_pval_cutoff=adj_pval_cutoff,
+                                  log2fc_cutoff=log2fc_cutoff)
+        if not r_skill.is_available():
+            logger.info("Rscript or limma not available — running Python-only.")
+            return None
+
+        # Load the CSV the Python skill consumed (already cleaned by ingestion)
+        try:
+            expr_df = pd.read_csv(state["data_path"], index_col=0)
+            expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
+        except Exception as exc:
+            logger.warning("Could not reload expression CSV for R: %s", exc)
+            return None
+
+        try:
+            r_res = r_skill.run(
+                expression_df=expr_df,
+                group1_samples=g1, group2_samples=g2,
+                group1_label=g1_label, group2_label=g2_label,
+            )
+        except RAnalysisError as exc:
+            logger.warning("R/limma failed (%s) — falling back to Python only", exc)
+            return None
+
+        # Python results: convert top_biomarkers list-of-dicts back to a DF
+        py_df = pd.DataFrame(python_top)
+        combined = combine_engines(
+            python_results = py_df,
+            r_results      = r_res.results_df,
+            adj_pval_cutoff = adj_pval_cutoff,
+            log2fc_cutoff   = log2fc_cutoff,
+        )
+        return {
+            "intersected": combined.intersected_df,
+            "python":      combined.python_df,
+            "r":           combined.r_df,
+            "qc":          combined.qc,
+            "r_csv":       r_res.csv_path,
+            "expr_df":     expr_df,
+        }
+
+    def _build_plots(
+        self,
+        state: BiomarkerState,
+        python_top,
+        dual: Dict[str, Any] | None,
+        adj_pval_cutoff: float,
+        log2fc_cutoff:   float,
+    ) -> Dict[str, Dict[str, str]]:
+        """Build the Plotly suite using Accession Number as the primary label."""
+        try:
+            from skills.plotly_visuals import build_visualisation_suite
+            import pandas as pd
+        except Exception as exc:
+            logger.warning("Plotly visuals not importable: %s", exc)
+            return {}
+
+        if dual is not None:
+            expr_df = dual["expr_df"]
+            inter_df = dual["intersected"]
+        else:
+            try:
+                expr_df = pd.read_csv(state["data_path"], index_col=0)
+                expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
+                inter_df = None
+            except Exception as exc:
+                logger.warning("Could not load expression CSV for plotting: %s", exc)
+                return {}
+
+        sample_to_group = state.get("sample_to_group") or {}
+        if not sample_to_group:
+            # Build from group labels in state
+            g1 = state.get("group1_samples") or []
+            g2 = state.get("group2_samples") or []
+            sample_to_group = {
+                **{s: state.get("group1_label", "Group1") for s in g1},
+                **{s: state.get("group2_label", "Group2") for s in g2},
+            }
+
+        py_df = pd.DataFrame(python_top)
+        if "accession" not in py_df.columns and "protein" in py_df.columns:
+            py_df = py_df.rename(columns={"protein": "accession"})
+
+        out_dir = str(Path(settings.output_dir) / "plots" /
+                       (state.get("session_id") or "session"))
+
+        suite = build_visualisation_suite(
+            python_results   = py_df,
+            expression_df    = expr_df,
+            sample_to_group  = sample_to_group,
+            intersected_df   = inter_df,
+            out_dir          = out_dir,
+            adj_pval_cutoff  = adj_pval_cutoff,
+            log2fc_cutoff    = log2fc_cutoff,
+        )
+        return suite
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _error(
@@ -320,32 +457,23 @@ class BiomarkerAgent(BaseAgent):
         g2        = state.get("group2_label", "Group 2")
         qc        = result.get("qc_summary") or {}
 
-        top5 = (result.get("top_biomarkers") or [])[:5]
-        if omic_type == "proteomics_pooled":
-            # Pooled: show per-contrast fold changes
-            def _fc_str(b: Dict[str, Any]) -> str:
-                parts = [
-                    f"{k}={v}" for k, v in b.items()
-                    if k not in ("rank", "protein", "rescue_score") and isinstance(v, float)
-                ]
-                return ", ".join(parts[:3]) or "n/a"
+        def _id(b: Dict[str, Any]) -> str:
+            acc  = b.get("protein", "?")
+            gene = (b.get("gene_name") or "").strip()
+            return f"{gene} ({acc})" if gene and gene != "?" else acc
 
+        top5 = (result.get("top_biomarkers") or [])[:5]
+        if mode == "supervised":
             top5_lines = "\n".join(
-                f"  {b.get('rank','?')}. {b.get('protein','?')}  "
-                f"{_fc_str(b)}  rescue={b.get('rescue_score','?')}"
-                for b in top5
-            )
-        elif mode == "supervised":
-            top5_lines = "\n".join(
-                f"  {b.get('rank','?')}. {b.get('protein','?')}  "
+                f"  {b.get('rank','?')}. {_id(b)}  "
                 f"log2FC={b.get('log2_fold_change','?')},  "
-                f"adj_p={b.get('adj_p_value','?')},  "
+                f"adj_p={b.get('adj_p_value','n/a')},  "
                 f"sig={b.get('significance','?')}"
                 for b in top5
             )
         else:
             top5_lines = "\n".join(
-                f"  {b.get('rank','?')}. {b.get('protein','?')}  CV={b.get('cv_percent','?')}%"
+                f"  {b.get('rank','?')}. {_id(b)}  CV={b.get('cv_percent','?')}%"
                 for b in top5
             )
 
@@ -358,13 +486,7 @@ class BiomarkerAgent(BaseAgent):
         )
 
         # Describe the exact statistical method used
-        if omic_type == "proteomics_pooled":
-            method_str = (
-                "**Method:** Log₂ fold-change (pooled n=1 design — no replicates, no p-values). "
-                "Pseudocount +1 applied before log₂ transform. "
-                "All pairwise contrasts computed from the uploaded label map."
-            )
-        elif mode == "supervised":
+        if mode == "supervised":
             method_str = (
                 f"**Method:** Welch two-sample t-test — {g1} vs {g2}. "
                 f"Pipeline: log₂ transform → median normalisation → group-aware missing filter "
@@ -417,27 +539,23 @@ class BiomarkerAgent(BaseAgent):
         qc        = result.get("qc_summary") or {}
         top5      = (result.get("top_biomarkers") or [])[:5]
 
+        def _id(b: Dict[str, Any]) -> str:
+            acc  = b.get("protein", "?")
+            gene = (b.get("gene_name") or "").strip()
+            return f"{gene} ({acc})" if gene and gene != "?" else acc
+
         lines = []
         for b in top5:
             if "log2_fold_change" in b:
                 lines.append(
-                    f"  {b.get('rank','?')}. **{b.get('protein','?')}** — "
+                    f"  {b.get('rank','?')}. **{_id(b)}** — "
                     f"log2FC={b.get('log2_fold_change','?')}, "
-                    f"adj_p={b.get('adj_p_value','?')}, "
+                    f"adj_p={b.get('adj_p_value','n/a')}, "
                     f"{b.get('significance','NS')}"
-                )
-            elif "rescue_score" in b:
-                fc_parts = ", ".join(
-                    f"{k}={v}" for k, v in b.items()
-                    if k not in ("rank", "protein", "rescue_score") and isinstance(v, float)
-                )
-                lines.append(
-                    f"  {b.get('rank','?')}. **{b.get('protein','?')}** — "
-                    f"{fc_parts}  rescue={b.get('rescue_score','?')}"
                 )
             else:
                 lines.append(
-                    f"  {b.get('rank','?')}. **{b.get('protein','?')}** — "
+                    f"  {b.get('rank','?')}. **{_id(b)}** — "
                     f"CV={b.get('cv_percent','?')}%"
                 )
 

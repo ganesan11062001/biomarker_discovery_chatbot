@@ -49,6 +49,62 @@ _GN_RE = re.compile(r'\bGN=(\w[\w\-]*)', re.IGNORECASE)
 _SP_RE = re.compile(r'(?:sp|tr)\|[A-Z0-9\-]+\|([A-Z0-9]+)_[A-Z]+', re.IGNORECASE)
 
 
+# ── Blood / sample-prep contaminants ─────────────────────────────────────────
+# Removed BEFORE submission to Enrichr. These proteins are nearly always
+# present at high intensity in tissue lysates from incomplete blood washout
+# (albumin, hemoglobin), skin contact (keratins), trypsin used in digestion,
+# or immunoglobulins from serum. Leaving them in inflates immune / complement
+# / coagulation pathways and produces misleading enrichment hits.
+#
+# All entries are upper-case gene symbols matched case-insensitively.
+_CONTAMINANT_EXACT: set = {
+    # Serum carrier proteins
+    "ALB", "AFP",
+    # Complement (commonly contaminating)
+    "C3", "C4A", "C4B", "C5", "C6", "C7", "C8A", "C8B", "C8G", "C9",
+    # Coagulation
+    "F2", "FGA", "FGB", "FGG", "PLG", "SERPINC1", "SERPINA1",
+    "APOA1", "APOA2", "APOB", "APOE", "APOC3",
+    # Trypsin / digestion reagents
+    "TRYP1", "PRSS1", "PRSS2",
+    # Immunoglobulins
+    "IGHG1", "IGHG2", "IGHG3", "IGHG4", "IGHA1", "IGHA2", "IGHM", "IGHD", "IGHE",
+    "IGKC", "IGLC1", "IGLC2", "IGLC3", "JCHAIN",
+}
+_CONTAMINANT_PREFIXES: tuple = (
+    "HBA", "HBB", "HBD", "HBG", "HBE", "HBM", "HBZ",   # hemoglobins
+    "KRT",                                              # keratins (skin/hair)
+    "IGH", "IGK", "IGL",                                # immunoglobulin loci
+)
+
+
+def _filter_contaminants(symbols: List[str]) -> tuple[List[str], List[str]]:
+    """Return (clean_symbols, dropped_symbols). Match is case-insensitive.
+
+    Prefix rule: a symbol starting with one of the contaminant prefixes is
+    flagged if either the prefix IS the whole symbol, or the next character
+    is a digit, '-', or '_' (covers human "HBB1" / mouse "Hbb-b1" / "KRT_5").
+    """
+    clean: list[str] = []
+    dropped: list[str] = []
+    for s in symbols:
+        u = str(s).strip().upper()
+        if not u:
+            continue
+        is_contam = u in _CONTAMINANT_EXACT
+        if not is_contam:
+            for p in _CONTAMINANT_PREFIXES:
+                if u.startswith(p) and (
+                    len(u) == len(p)
+                    or u[len(p)] in "-_"
+                    or u[len(p)].isdigit()
+                ):
+                    is_contam = True
+                    break
+        (dropped if is_contam else clean).append(s)
+    return clean, dropped
+
+
 # ── Gene symbol extraction ────────────────────────────────────────────────────
 
 def _extract_gene_symbols(protein_names: List[str]) -> List[str]:
@@ -154,6 +210,14 @@ class PathwaySkill:
             len(protein_list), len(gene_symbols),
         )
 
+        # ── Strip blood / sample-prep contaminants ───────────────────────────
+        # Albumin, hemoglobins, keratins, immunoglobulins etc. inflate
+        # immune / complement / coagulation pathways and are not biologically
+        # meaningful in most tissue proteomics experiments.
+        gene_symbols, dropped = _filter_contaminants(gene_symbols)
+        if dropped:
+            logger.info("Contaminants excluded from enrichment input: %s", dropped)
+
         if not gene_symbols:
             logger.warning("No gene symbols extracted — enrichment skipped.")
             return self._empty_result(output_dir)
@@ -170,6 +234,8 @@ class PathwaySkill:
         # Up/down are subsets of protein_list — regex is consistent and avoids extra API calls
         up_symbols   = _extract_gene_symbols(up_proteins)   if up_proteins   else []
         down_symbols = _extract_gene_symbols(down_proteins) if down_proteins else []
+        up_symbols,   _ = _filter_contaminants(up_symbols)
+        down_symbols, _ = _filter_contaminants(down_symbols)
 
         try:
             import gseapy as gp
@@ -264,6 +330,7 @@ class PathwaySkill:
             "gene_symbols":           gene_symbols[:20],
             "background_size":        len(background_symbols) if background_symbols else None,
             "has_directional":        bool(up_symbols or down_symbols),
+            "contaminants_excluded":  dropped,
         }
 
     @staticmethod

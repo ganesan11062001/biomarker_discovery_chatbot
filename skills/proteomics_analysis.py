@@ -1,8 +1,6 @@
 """
 skills/proteomics_analysis.py
-Analysis Layer — ProteomicsAnalysisSkill
-
-Standard proteomics differential expression pipeline (no R required).
+Analysis Layer — ProteomicsAnalysisSkill (intensity-only, canonical template)
 
 Pipeline
 --------
@@ -22,11 +20,9 @@ Pipeline
 7. Effect size : log₂FC + Cohen's d (or Cohen's d_z for paired, η² for ANOVA)
 8. Export      : formatted multi-sheet Excel workbook
 
-Routing
--------
-Activated when omic_type == "proteomics" (default for any CSV or standard Excel).
-SILAC ratios → SilacAnalysisSkill (omic_type "proteomics_silac").
-Pooled MaxQuant → PooledFoldChangeSkill (omic_type "proteomics_pooled").
+This is the Python half of the dual-engine pipeline. The R half lives in
+``skills/r_analysis.py``; results are intersected by
+``skills/dual_engine.py`` to produce the final top-biomarker list.
 """
 from __future__ import annotations
 
@@ -103,10 +99,11 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         output_dir: str = "outputs",
         file_name: str = "analysis",
         # Extended test method selection
-        test_method: str = "auto",          # "auto"|"welch"|"limma"|"paired_t"|"anova"
+        test_method: str = "auto",          # "auto"|"welch"|"limma"|"paired_t"|"anova"|"fold_change"
         is_paired: bool = False,
         all_groups: Optional[Dict[str, List[str]]] = None,
         tmt_batches: Optional[Dict[str, Any]] = None,
+        is_pooled_design: bool = False,
         **_kwargs,
     ) -> Dict[str, Any]:
         try:
@@ -119,6 +116,7 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
                 is_paired=is_paired,
                 all_groups=all_groups,
                 tmt_batches=tmt_batches,
+                is_pooled_design=is_pooled_design,
             )
             result["omic_type"] = self.omic_type
             return result
@@ -145,6 +143,7 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         is_paired: bool = False,
         all_groups: Optional[Dict[str, List[str]]] = None,
         tmt_batches: Optional[Dict[str, Any]] = None,
+        is_pooled_design: bool = False,
     ) -> Dict[str, Any]:
 
         # 1. Load
@@ -156,6 +155,14 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
                 f"Available columns: {list(df_raw.columns[:10])}"
             )
         data = df_raw[avail].apply(pd.to_numeric, errors="coerce")
+
+        # Protein-metadata lookup — the loaded CSV carries the protein-name
+        # and gene-name columns alongside the numeric samples. We capture them
+        # here so every result row can be enriched with the *actual* names
+        # from the user's file. Without this, downstream LLM consumers (the
+        # domain-expert prompt, the summary message) only see accession
+        # numbers and end up hallucinating protein identities.
+        meta_lookup = self._build_protein_metadata(df_raw, avail)
 
         # 2. QC + normalisation + optional TMT IRS
         data_qc, qc_summary, valid_mask = self._qc(
@@ -170,6 +177,40 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         )
 
         # 4. Analysis branch
+        # Pooled / non-replicated designs (1 sample per condition, or pooled
+        # MaxQuant Identifier Info workbooks) cannot support a valid t-test
+        # because there are no true biological replicates within each "group" —
+        # within-group spread is dominated by between-sample variation. We run
+        # fold-change-only ranking instead, with NO p-values.
+        if (is_pooled_design or test_method == "fold_change"
+            ) and group1_samples and group2_samples:
+            results_df = self._fold_change_only(
+                data_qc, valid_mask,
+                group1_samples, group2_samples,
+                group1_label, group2_label,
+                log2fc_cutoff=log2fc_cutoff,
+                missing_threshold=missing_threshold,
+            )
+            sig_mask = results_df["log2_fold_change"].abs() >= log2fc_cutoff
+            n_sig = int(sig_mask.sum())
+            effective_method = "fold_change_only"
+            qc_summary["test_method"] = effective_method
+            qc_summary["pooled_design_warning"] = (
+                "Pooled / non-replicated design detected — t-tests would treat "
+                "between-sample variation as biological noise. Reporting "
+                "log2 fold-change only, no p-values."
+            )
+            results_df = self._enrich_with_metadata(results_df, meta_lookup)
+            top_df = results_df.head(top_n).copy()
+            return self._finalise_pooled(
+                results_df, top_df, qc_summary, output_dir, file_name,
+                group1_label, group2_label, n_sig,
+                log2fc_cutoff, adj_pval_cutoff,
+                data_path, sample_columns,
+                group1_samples, group2_samples,
+                missing_threshold, top_n,
+            )
+
         is_anova = (
             effective_method == "anova"
             or (all_groups and len(all_groups) >= 2)
@@ -222,6 +263,11 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             effective_method = "unsupervised"
 
         qc_summary["test_method"] = effective_method
+
+        # Attach the protein-name + gene-name columns from the source file —
+        # every downstream consumer (Excel sheets, the chatbot summary, the
+        # domain-expert prompt) gets the ground-truth identity for each row.
+        results_df = self._enrich_with_metadata(results_df, meta_lookup)
 
         top_df = results_df.head(top_n).copy()
         top_biomarkers = top_df.to_dict("records")
@@ -424,11 +470,10 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             if np.isnan(pval):
                 continue
 
-            # log2FC: data is already log2-transformed; cap at ±20
-            if m2 == 0:
-                log2fc = 20.0 if m1 > 0 else 0.0
-            else:
-                log2fc = max(-20.0, min(20.0, float(m1 - m2)))
+            # log2FC convention: log2(group2 / group1) — positive means up in
+            # the second-named group (the "test" condition by convention).
+            # Data is log2-space so we just subtract; cap at ±20.
+            log2fc = max(-20.0, min(20.0, float(m2 - m1)))
 
             # Cohen's d (pooled-SD effect size)
             n1, n2 = len(v1), len(v2)
@@ -461,6 +506,112 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         df = df.sort_values("adj_p_value").reset_index(drop=True)
         df.insert(0, "rank", range(1, len(df) + 1))
         return df
+
+    # ── Pooled / no-replicates: log2 fold-change only ────────────────────────
+
+    def _fold_change_only(
+        self,
+        data: pd.DataFrame,
+        valid_mask: pd.DataFrame,
+        g1_cols: List[str],
+        g2_cols: List[str],
+        g1_label: str,
+        g2_label: str,
+        log2fc_cutoff: float = 1.0,
+        missing_threshold: float = 0.5,
+    ) -> pd.DataFrame:
+        """
+        Pooled-design ranking — log2 fold-change only, no statistical test.
+
+        Use when each "group" contains samples that aren't true biological
+        replicates (e.g. one mouse per tissue, single MaxQuant pool per label).
+        A Welch t-test on such data is statistically invalid; this branch
+        reports log2(group2 / group1) and ranks proteins by |log2FC| only.
+        """
+        g1 = [c for c in g1_cols if c in data.columns]
+        g2 = [c for c in g2_cols if c in data.columns]
+        if not g1 or not g2:
+            raise ValueError("Group columns not found in QC-filtered data.")
+
+        vm = valid_mask.reindex(data.index, fill_value=True)
+        valid_g1 = vm[g1].mean(axis=1) >= missing_threshold
+        valid_g2 = vm[g2].mean(axis=1) >= missing_threshold
+        data = data[valid_g1 | valid_g2]
+        vm   = vm.loc[data.index]
+
+        rows = []
+        for protein in data.index:
+            v1 = data.loc[protein, g1].values.astype(float)
+            v2 = data.loc[protein, g2].values.astype(float)
+            m1, m2 = float(np.nanmean(v1)), float(np.nanmean(v2))
+            log2fc = max(-20.0, min(20.0, m2 - m1))    # log2(group2/group1)
+            det1 = round(float(vm.loc[protein, g1].mean()), 3) if protein in vm.index else 1.0
+            det2 = round(float(vm.loc[protein, g2].mean()), 3) if protein in vm.index else 1.0
+            rows.append({
+                "protein":               protein,
+                f"mean_{g1_label}":      round(m1, 4),
+                f"mean_{g2_label}":      round(m2, 4),
+                "log2_fold_change":      round(log2fc, 4),
+                "abs_log2_fold_change":  round(abs(log2fc), 4),
+                f"detection_{g1_label}": det1,
+                f"detection_{g2_label}": det2,
+                f"n_{g1_label}":         len(g1),
+                f"n_{g2_label}":         len(g2),
+            })
+
+        if not rows:
+            raise ValueError("No proteins had enough values for fold-change ranking.")
+
+        df = pd.DataFrame(rows)
+        df["significance"] = np.where(
+            df["log2_fold_change"].abs() >= log2fc_cutoff, "Notable", "NS",
+        )
+        df = df.sort_values("abs_log2_fold_change", ascending=False).reset_index(drop=True)
+        df.insert(0, "rank", range(1, len(df) + 1))
+        return df
+
+    def _finalise_pooled(
+        self,
+        results_df, top_df, qc_summary, output_dir, file_name,
+        g1_label, g2_label, n_sig,
+        log2fc_cutoff, adj_pval_cutoff,
+        data_path, sample_columns,
+        group1_samples, group2_samples,
+        missing_threshold, top_n,
+    ) -> Dict[str, Any]:
+        """Excel + code export for the fold-change-only branch."""
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = Path(file_name).stem.replace(" ", "_")
+        excel_path = str(Path(output_dir) /
+                          f"biomarkers_{safe_name}_pooled_{ts}.xlsx")
+        # Re-use the regular Excel exporter — it handles missing adj_p_value gracefully
+        results_df_export = results_df.copy()
+        if "adj_p_value" not in results_df_export.columns:
+            results_df_export["adj_p_value"] = pd.NA
+            results_df_export["p_value"]     = pd.NA
+        self._export_excel(
+            results_df_export, top_df, qc_summary, excel_path,
+            g1_label, g2_label, "supervised",
+            adj_pval_cutoff, log2fc_cutoff, file_name,
+            test_method="fold_change_only",
+        )
+        code = self._generate_code(
+            data_path, sample_columns, group1_samples, group2_samples,
+            g1_label, g2_label, "supervised", "generic",
+            adj_pval_cutoff, log2fc_cutoff, missing_threshold, top_n,
+            output_dir, file_name,
+            pooled=True,
+        )
+        return {
+            "omic_type":      self.omic_type,
+            "top_biomarkers": top_df.to_dict("records"),
+            "n_significant":  n_sig,
+            "excel_path":     excel_path,
+            "qc_summary":     qc_summary,
+            "analysis_code":  code,
+            "error":          None,
+        }
 
     # ── Unsupervised: variability ranking ─────────────────────────────────────
 
@@ -625,18 +776,19 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             se     = np.sqrt(s2_pos * (1.0 / p["n1"] + 1.0 / p["n2"]))
             if se < 1e-10:
                 continue
-            t_mod  = (p["m1"] - p["m2"]) / se
+            # Contrast direction: group2 − group1 (positive = up in group2)
+            t_mod  = (p["m2"] - p["m1"]) / se
             pval   = 2.0 * float(stats.t.sf(abs(t_mod), df=df_pos))
             if np.isnan(pval):
                 continue
-            log2fc  = max(-20.0, min(20.0, float(p["m1"] - p["m2"])))
+            log2fc  = max(-20.0, min(20.0, float(p["m2"] - p["m1"])))
             sp      = np.sqrt(p["s2"]) if p["s2"] > 0 else 1e-10
             rows.append({
                 "protein":                   p["protein"],
                 f"mean_{g1_label}":          round(p["m1"], 4),
                 f"mean_{g2_label}":          round(p["m2"], 4),
                 "log2_fold_change":          round(log2fc, 4),
-                "cohens_d":                  round(float((p["m1"] - p["m2"]) / sp), 4),
+                "cohens_d":                  round(float((p["m2"] - p["m1"]) / sp), 4),
                 "p_value":                   pval,
                 "t_statistic_moderated":     round(t_mod, 4),
                 "df_moderated":              round(df_pos, 1),
@@ -693,7 +845,7 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         for protein in data.index:
             v1   = data.loc[protein, g1_p].values.astype(float)
             v2   = data.loc[protein, g2_p].values.astype(float)
-            diff = v1 - v2
+            diff = v2 - v1                       # group2 − group1 (positive = up in group2)
             ok   = ~np.isnan(diff)
             d    = diff[ok]
             if len(d) < 2:
@@ -879,6 +1031,7 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         group1_label, group2_label, analysis_mode, data_type,
         adj_pval_cutoff, log2fc_cutoff, missing_threshold, top_n,
         output_dir, file_name,
+        pooled: bool = False,
     ) -> str:
         """Return a self-contained, re-executable Python script for this analysis."""
         L: List[str] = []
@@ -893,7 +1046,7 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         a('')
         a('import numpy as np')
         a('import pandas as pd')
-        if analysis_mode == "supervised":
+        if analysis_mode == "supervised" and not pooled:
             a('from scipy import stats')
             a('from statsmodels.stats.multitest import multipletests')
         a('from pathlib import Path')
@@ -910,7 +1063,7 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         a('ADJ_PVAL_CUTOFF   = ' + str(adj_pval_cutoff))
         a('LOG2FC_CUTOFF     = ' + str(log2fc_cutoff))
         a('MISSING_THRESHOLD = ' + str(missing_threshold))
-        a('TOP_N             = ' + str(top_n))
+        a('TOP_N             = ' + str(max(int(top_n), 50)))
         a('OUTPUT_DIR        = ' + repr(output_dir))
         a('FILE_NAME         = ' + repr(file_name))
         a('')
@@ -950,7 +1103,39 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         hi_pval    = min(0.01, adj_pval_cutoff / 5.0)
         trend_pval = adj_pval_cutoff * 2.0
 
-        if analysis_mode == "supervised":
+        if pooled:
+            a('# ── 5. POOLED DESIGN — log2 fold-change ranking, NO t-test ─────────')
+            a('# Each group contains non-replicate samples (different tissues or')
+            a('# single MaxQuant pools per condition). A Welch t-test would treat')
+            a('# between-sample variation as biological noise, producing invalid')
+            a('# p-values. We rank by |log2(group2/group1)| instead.')
+            a('g1 = [c for c in GROUP1_SAMPLES if c in data.columns]')
+            a('g2 = [c for c in GROUP2_SAMPLES if c in data.columns]')
+            a('valid_g1 = valid_mask[g1].mean(axis=1) >= MISSING_THRESHOLD')
+            a('valid_g2 = valid_mask[g2].mean(axis=1) >= MISSING_THRESHOLD')
+            a('data = data[valid_g1 | valid_g2]')
+            a('')
+            a('rows = []')
+            a('for protein in data.index:')
+            a('    v1 = data.loc[protein, g1].values.astype(float)')
+            a('    v2 = data.loc[protein, g2].values.astype(float)')
+            a('    m1 = float(np.nanmean(v1))')
+            a('    m2 = float(np.nanmean(v2))')
+            a('    lfc = max(-20.0, min(20.0, m2 - m1))   # log2(group2/group1)')
+            a('    rows.append({')
+            a('        "protein":              protein,')
+            a('        f"mean_{GROUP1_LABEL}": round(m1, 4),')
+            a('        f"mean_{GROUP2_LABEL}": round(m2, 4),')
+            a('        "log2_fold_change":     round(lfc, 4),')
+            a('        "abs_log2_fold_change": round(abs(lfc), 4),')
+            a('    })')
+            a('df = pd.DataFrame(rows)')
+            a('df["significance"] = np.where(df["log2_fold_change"].abs() >= LOG2FC_CUTOFF, "Notable", "NS")')
+            a('df = df.sort_values("abs_log2_fold_change", ascending=False).reset_index(drop=True)')
+            a('df.insert(0, "rank", range(1, len(df) + 1))')
+            a('n_sig = (df["log2_fold_change"].abs() >= LOG2FC_CUTOFF).sum()')
+            a(f'print(f"Proteins with |log2FC|>={log2fc_cutoff}: {{n_sig}}")')
+        elif analysis_mode == "supervised":
             a('# ── 5. Group-aware filter + Welch t-test + BH FDR ──────────────────')
             a('g1 = [c for c in GROUP1_SAMPLES if c in data.columns]')
             a('g2 = [c for c in GROUP2_SAMPLES if c in data.columns]')
@@ -970,12 +1155,13 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             a('    _, pval = stats.ttest_ind(v1, v2, equal_var=False)')
             a('    if np.isnan(pval):')
             a('        continue')
-            a('    # log2FC: data already log2-transformed; cap at ±20')
-            a('    lfc = max(-20.0, min(20.0, float(m1 - m2))) if m2 != 0 else (20.0 if m1 > 0 else 0.0)')
-            a('    # Cohen\'s d (pooled-SD effect size)')
+            a('    # log2FC convention: log2(group2/group1) — positive means up in group2.')
+            a('    # Data is log2-space so we just subtract; cap at ±20.')
+            a('    lfc = max(-20.0, min(20.0, float(m2 - m1)))')
+            a('    # Cohen\'s d (pooled-SD effect size) — same convention')
             a('    n1, n2 = len(v1), len(v2)')
             a('    sp = np.sqrt(((n1-1)*v1.std(ddof=1)**2 + (n2-1)*v2.std(ddof=1)**2) / max(n1+n2-2, 1))')
-            a('    cohens_d = float((m1 - m2) / sp) if sp > 0 else 0.0')
+            a('    cohens_d = float((m2 - m1) / sp) if sp > 0 else 0.0')
             a('    det_g1 = round(float(valid_mask.loc[protein, g1].mean()), 3)')
             a('    det_g2 = round(float(valid_mask.loc[protein, g2].mean()), 3)')
             a('    rows.append({')
@@ -1032,6 +1218,65 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         a('print(df.head(10).to_string(index=False))')
 
         return '\n'.join(L)
+
+    # ── Protein-metadata enrichment ───────────────────────────────────────────
+
+    @staticmethod
+    def _build_protein_metadata(
+        df_raw: pd.DataFrame, sample_cols: List[str]
+    ) -> pd.DataFrame:
+        """
+        Build a DataFrame indexed by accession with `protein_name` and
+        `gene_name` columns, sourced ONLY from the user's uploaded file.
+
+        We never want the LLM to guess identities from accession numbers —
+        every result row is enriched with the actual values that the user
+        supplied, so the chatbot's biological interpretation is grounded.
+        """
+        # All non-sample columns are candidates for identifier metadata.
+        meta_cols = [c for c in df_raw.columns if c not in set(sample_cols)]
+        meta = df_raw[meta_cols].copy() if meta_cols else pd.DataFrame(index=df_raw.index)
+
+        def _pick(hints: Tuple[str, ...]) -> Optional[str]:
+            for c in meta.columns:
+                lc = str(c).strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+                for h in hints:
+                    if h.replace(" ", "").replace("_", "").replace("-", "") in lc:
+                        return c
+            return None
+
+        name_col = _pick(("proteinname", "proteinnames", "description", "protein"))
+        gene_col = _pick(("genename", "genenames", "genesymbol", "gene"))
+
+        out = pd.DataFrame(index=df_raw.index)
+        out["protein_name"] = meta[name_col].astype(str) if name_col else ""
+        out["gene_name"]    = meta[gene_col].astype(str) if gene_col else ""
+        return out
+
+    @staticmethod
+    def _enrich_with_metadata(
+        results_df: pd.DataFrame, meta_lookup: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Attach protein_name + gene_name columns to a results DataFrame
+        whose `protein` column holds the accession (the proteins_df row index)."""
+        if results_df.empty or "protein" not in results_df.columns:
+            return results_df
+        # Map accession → metadata via the index of meta_lookup
+        names = meta_lookup["protein_name"].reindex(results_df["protein"]).values
+        genes = meta_lookup["gene_name"].reindex(results_df["protein"]).values
+        # Insert near the front so they show up first in CSV / Excel previews
+        results_df = results_df.copy()
+        if "protein_name" not in results_df.columns:
+            results_df.insert(
+                results_df.columns.get_loc("protein") + 1,
+                "protein_name", names,
+            )
+        if "gene_name" not in results_df.columns:
+            results_df.insert(
+                results_df.columns.get_loc("protein_name") + 1,
+                "gene_name", genes,
+            )
+        return results_df
 
     # ── Excel export ──────────────────────────────────────────────────────────
 
