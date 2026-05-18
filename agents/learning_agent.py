@@ -675,6 +675,25 @@ class LearningAgent(BaseAgent):
         if all_groups_state:
             ctx += f"  all_groups_assigned: {list(all_groups_state.keys())}\n"
 
+        # 2-sheet canonical template: Sample ID → Group resolution map.
+        # When this is populated, ANY "compare X vs Y" question can resolve
+        # group names directly to the list of sample columns — no LLM
+        # guessing needed.
+        sample_to_group_state = state.get("sample_to_group") or {}
+        if sample_to_group_state and all_groups_state:
+            ctx += (
+                "  sample_to_group_map_present: YES (Sheet 1 defined Sample ID → Group).\n"
+                "    → When the user says 'compare X vs Y', look up X and Y in\n"
+                "      all_groups_assigned to get the exact sample column lists.\n"
+                "      DO NOT ask for clarification — the mapping is unambiguous.\n"
+                f"    → Groups available: {list(all_groups_state.keys())}\n"
+            )
+            # Show first ~3 entries of each group so the LLM sees the actual sample IDs
+            for gname, samples in list(all_groups_state.items())[:6]:
+                preview = samples[:3]
+                more    = "" if len(samples) <= 3 else f" …(+{len(samples)-3} more)"
+                ctx += f"      • {gname}: {preview}{more}\n"
+
         if top_bm:
             ctx += f"  top_5_biomarkers: {[b.get('protein','') for b in top_bm[:5]]}\n"
 

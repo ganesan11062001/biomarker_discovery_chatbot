@@ -140,7 +140,7 @@ _REPLICATE_SUFFIX_RE = re.compile(
 )
 
 
-def infer_groups_from_column_names(
+def infer_groups_from_row0(
     sample_columns: List[str],
     *,
     min_groups: int = 2,
@@ -160,13 +160,13 @@ def infer_groups_from_column_names(
 
     Examples (using the user's canonical-template convention):
 
-        >>> infer_groups_from_column_names(["WT", "WT.1", "DMD", "DMD.1"])
+        >>> infer_groups_from_row0(["WT", "WT.1", "DMD", "DMD.1"])
         {"WT": ["WT", "WT.1"], "DMD": ["DMD", "DMD.1"]}
 
-        >>> infer_groups_from_column_names(["WT_1", "WT_2", "KO_1", "KO_2"])
+        >>> infer_groups_from_row0(["WT_1", "WT_2", "KO_1", "KO_2"])
         {"WT": ["WT_1", "WT_2"], "KO": ["KO_1", "KO_2"]}
 
-        >>> infer_groups_from_column_names(["Sample_1", "Sample_2", "Sample_3"])
+        >>> infer_groups_from_row0(["Sample_1", "Sample_2", "Sample_3"])
         {}   # only one base name → caller falls back to LLM
     """
     if not sample_columns:
@@ -395,6 +395,68 @@ def _pick_column(columns: List[str], hints: tuple) -> Optional[str]:
             if h_norm in n:
                 return c
     return None
+
+
+# Hints for the new 2-sheet canonical template (Sample ID + Group sheet).
+_SAMPLE_ID_HINTS  = ("sample id", "sampleid", "sample_id", "sample-id", "sample")
+_GROUP_HINTS_V2   = ("group", "condition", "treatment", "class", "phenotype", "cohort")
+
+
+def build_sample_group_map(
+    metadata_sheet,
+) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
+    """
+    Read a Sample ID + Group metadata sheet and produce both directions of
+    the mapping used by every group-vs-group analysis.
+
+    Returns ``(sample_to_group, group_to_samples)``:
+      * ``sample_to_group``  — ``{"S1": "WT", "S2": "WT", "S3": "DMD", …}``
+      * ``group_to_samples`` — ``{"WT": ["S1", "S2"], "DMD": ["S3"], …}``
+
+    The Sample ID values here will match the *column names* in the proteins
+    sheet, so the orchestrator can translate "compare WT vs DMD" directly
+    into lists of column names without any LLM inference.
+
+    Returns ``({}, {})`` when the sheet doesn't expose a usable Sample ID
+    and Group column — callers should then fall back to other strategies.
+    """
+    import pandas as pd
+    if metadata_sheet is None or not isinstance(metadata_sheet, pd.DataFrame) \
+            or metadata_sheet.empty:
+        return {}, {}
+
+    columns = list(metadata_sheet.columns)
+    sample_col = _pick_column(columns, _SAMPLE_ID_HINTS)
+    group_col  = _pick_column(columns, _GROUP_HINTS_V2)
+    # Don't let one column win both slots — that happens when the sheet
+    # only has e.g. a "Sample" column. Force them to be different.
+    if sample_col is not None and sample_col == group_col:
+        alt = [c for c in columns if c != sample_col]
+        group_col = _pick_column(alt, _GROUP_HINTS_V2)
+
+    if sample_col is None or group_col is None:
+        return {}, {}
+
+    sample_to_group: Dict[str, str] = {}
+    group_to_samples: Dict[str, List[str]] = {}
+    for _, row in metadata_sheet.iterrows():
+        sid = _clean(row.get(sample_col))
+        grp = _clean(row.get(group_col))
+        if not sid or not grp:
+            continue
+        sid_str = str(sid).strip()
+        grp_str = str(grp).strip()
+        sample_to_group[sid_str] = grp_str
+        group_to_samples.setdefault(grp_str, []).append(sid_str)
+
+    # Drop only the truly useless case: zero groups. A single-group result
+    # (e.g. only WT samples) is still informative for downstream Q&A even
+    # though no comparison is possible. n=1-per-group pooled designs are
+    # also valid — they route to PooledFoldChangeSkill.
+    if not group_to_samples:
+        return {}, {}
+
+    return sample_to_group, group_to_samples
 
 
 def build_sample_map(identifier_sheet) -> Dict[str, Dict[str, Any]]:

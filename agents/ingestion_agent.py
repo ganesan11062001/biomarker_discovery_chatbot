@@ -248,6 +248,40 @@ class IngestionAgent(BaseAgent):
         except Exception as exc:
             logger.debug("sample_map construction failed (non-fatal): %s", exc)
 
+        # ── 2-sheet canonical template: Sample ID + Group metadata sheet ──────
+        # The user's standard going forward:
+        #   Sheet 1:  columns "Sample ID" + "Group"
+        #   Sheet 2:  Protein Name, Accession Number, Gene Name + sample columns
+        #             whose headers ARE the Sample ID values from Sheet 1.
+        # When found, state["sample_to_group"] resolves any "compare X vs Y"
+        # question into the exact list of sample columns without LLM guessing.
+        try:
+            from core.proteomics_tools import build_sample_group_map
+            sample_to_group, group_to_samples = ({}, {})
+            for _sheet_name, _sheet in (all_sheets or {}).items():
+                if not hasattr(_sheet, "columns"):
+                    continue
+                s2g, g2s = build_sample_group_map(_sheet)
+                # Only adopt a sheet's map when there are at least 2 groups —
+                # a single-group sheet has no comparison potential and is
+                # likely a description / parameters sheet, not a metadata map.
+                if s2g and g2s and len(g2s) >= 2:
+                    sample_to_group, group_to_samples = s2g, g2s
+                    logger.info(
+                        "2-sheet template detected — sample→group map from %r: "
+                        "%d samples in %d groups (%s)",
+                        _sheet_name, len(s2g), len(g2s), list(g2s.keys()),
+                    )
+                    break
+            if sample_to_group:
+                state["sample_to_group"] = sample_to_group
+                # `all_groups` is consumed by run_analysis / run_all_comparisons —
+                # populating it from the explicit Sheet 1 map gives a
+                # deterministic, no-LLM resolution path.
+                state["all_groups"] = group_to_samples
+        except Exception as exc:
+            logger.debug("Sample-group map construction failed (non-fatal): %s", exc)
+
         # ── Dynamic metadata detection (organism / software / disease) ────────
         # All three functions live in core.proteomics_tools and read from the
         # actual file at runtime — no hardcoded defaults. Detected values are
