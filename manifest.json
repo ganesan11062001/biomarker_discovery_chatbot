@@ -15,7 +15,7 @@
   },
   "environment": {
     "python": {
-      "requires": "~=3.11.0"
+      "requires": "~=3.14.0"
     }
   },
   "files": {
@@ -29,7 +29,7 @@
       "checksum": "c5e9989f7980ecf6a977c3bb2d4b776e"
     },
     ".python-version": {
-      "checksum": "4093376b29730d3bf1aa9f0e47a1c605"
+      "checksum": "6fa22f6d450006ea49e7df471b6151c7"
     },
     ".rscignore": {
       "checksum": "04747e2b6d6e5ff5155c73f158b5b8a0"
@@ -45,6 +45,36 @@
     },
     "agents/__init__.py": {
       "checksum": "3edbd31b69fb184594d7109e682db463"
+    },
+    "agents/__pycache__/__init__.cpython-314.pyc": {
+      "checksum": "fdfbb19133d621c956ed43617244524a"
+    },
+    "agents/__pycache__/base_agent.cpython-314.pyc": {
+      "checksum": "54af61ddf1222ad5bd3efe437727f8a4"
+    },
+    "agents/__pycache__/biomarker_agent.cpython-314.pyc": {
+      "checksum": "e6054a45b17875683a04e3a45bd1583c"
+    },
+    "agents/__pycache__/chat_agent.cpython-314.pyc": {
+      "checksum": "d8ab455cca3745c087e980e2cce18277"
+    },
+    "agents/__pycache__/code_reviewer.cpython-314.pyc": {
+      "checksum": "035311adad83c40cc3afdbcfaf35e6ea"
+    },
+    "agents/__pycache__/domain_expert.cpython-314.pyc": {
+      "checksum": "3b074a9bd146b548faa47c54cee6ad06"
+    },
+    "agents/__pycache__/enrichment_agent.cpython-314.pyc": {
+      "checksum": "bed787ea5019c48460bfd35ad1bd8f8c"
+    },
+    "agents/__pycache__/ingestion_agent.cpython-314.pyc": {
+      "checksum": "1762f90d1ac4775cb25179aa06dd0bf2"
+    },
+    "agents/__pycache__/learning_agent.cpython-314.pyc": {
+      "checksum": "70df3f015a8e367e2d7e66d6e019aee7"
+    },
+    "agents/__pycache__/visualization_agent.cpython-314.pyc": {
+      "checksum": "ee3e3059b552d77363dd9d49b1254c56"
     },
     "agents/base_agent.py": {
       "checksum": "1ad49c6a0ff3fc482e611d8adf85d7e9"
@@ -73,11 +103,32 @@
     "api/__init__.py": {
       "checksum": "d41d8cd98f00b204e9800998ecf8427e"
     },
+    "api/__pycache__/__init__.cpython-314.pyc": {
+      "checksum": "2a0802475f488c1152e7b966da962d94"
+    },
+    "api/__pycache__/main.cpython-314.pyc": {
+      "checksum": "62c0f8ef2148e0bcb215d48d457d2cad"
+    },
     "api/main.py": {
       "checksum": "26e620dc3e9ad1b9e7727ca82d8cd444"
     },
     "api/routes/__init__.py": {
       "checksum": "d41d8cd98f00b204e9800998ecf8427e"
+    },
+    "api/routes/__pycache__/__init__.cpython-314.pyc": {
+      "checksum": "d9c2acab21c15646beeba18c623b8cd9"
+    },
+    "api/routes/__pycache__/chat.cpython-314.pyc": {
+      "checksum": "124e8aa64ab2c2c8ed760be43da7304b"
+    },
+    "api/routes/__pycache__/results.cpython-314.pyc": {
+      "checksum": "0273d74ae737aeb6249891fe584796f5"
+    },
+    "api/routes/__pycache__/sessions.cpython-314.pyc": {
+      "checksum": "b2deaf359913dec3162267b32f4a6e89"
+    },
+    "api/routes/__pycache__/upload.cpython-314.pyc": {
+      "checksum": "c6123d74f9e20bc7168b2fc231337b65"
     },
     "api/routes/chat.py": {
       "checksum": "c568e367433d9a873a4f2c2a950a9a6d"
@@ -97,11 +148,47 @@
     "config/__init__.py": {
       "checksum": "d41d8cd98f00b204e9800998ecf8427e"
     },
+    "config/__pycache__/__init__.cpython-314.pyc": {
+      "checksum": "7079b77bdf4f75414969201a1d0dd59e"
+    },
+    "config/__pycache__/settings.cpython-314.pyc": {
+      "checksum": "3ce4e468ce6bea89565399d72fc41e64"
+    },
     "config/settings.py": {
       "checksum": "3297b9b680be3901cae10f19d29aa9f3"
     },
     "core/__init__.py": {
       "checksum": "7a0d547f9c132eee61e6acc76db3a50d"
+    },
+    "core/__pycache__/__init__.cpython-314.pyc": {
+      "checksum": "acfa935fcf05911f1e601b74a575084e"
+    },
+    "core/__pycache__/data_store.cpython-314.pyc": {
+      "checksum": "3a4b5b31ecdefa6008dbc79566e2183c"
+    },
+    "core/__pycache__/langgraph_workflow.cpython-314.pyc": {
+      "checksum": "d8f4fd3d67d5c2d4956ae18818afc929"
+    },
+    "core/__pycache__/llm_tools.cpython-314.pyc": {
+      "checksum": "5af69019b2e3a5004f32d34d349dcd2f"
+    },
+    "core/__pycache__/maxquant_filters.cpython-314.pyc": {
+      "checksum": "f8f6caf45479e94808dcfbe35eab7f46"
+    },
+    "core/__pycache__/proteomics_tools.cpython-314.pyc": {
+      "checksum": "dfaba685b850f3038baf3437cdb9a4b2"
+    },
+    "core/__pycache__/safe_exec.cpython-314.pyc": {
+      "checksum": "e7a418d5a28af9896ac95c779374dd8f"
+    },
+    "core/__pycache__/session_manager.cpython-314.pyc": {
+      "checksum": "e28d78d793e433a3e7622ca1eab7830e"
+    },
+    "core/__pycache__/state.cpython-314.pyc": {
+      "checksum": "2a3df8490ae8c6320a57a437fe0323ce"
+    },
+    "core/__pycache__/tracing.cpython-314.pyc": {
+      "checksum": "ea9460ff72ef9d343d8768b9eebfc2c3"
     },
     "core/action_units.py": {
       "checksum": "4944673505a477b2a0c41ad563d73c3f"
@@ -171,6 +258,42 @@
     },
     "skills/__init__.py": {
       "checksum": "2795f14077fa14afdb0e786c2d1ad0a2"
+    },
+    "skills/__pycache__/__init__.cpython-314.pyc": {
+      "checksum": "839fd87e5c6c0a405e8878fdbe2d2742"
+    },
+    "skills/__pycache__/base_skill.cpython-314.pyc": {
+      "checksum": "2c65dfea1e054f24abc0039b4ec5d976"
+    },
+    "skills/__pycache__/load_data.cpython-314.pyc": {
+      "checksum": "0c2d71e9b5307be725b7f3cee2f6a943"
+    },
+    "skills/__pycache__/omics_registry.cpython-314.pyc": {
+      "checksum": "79fff34f2bda280903140253a425375b"
+    },
+    "skills/__pycache__/plotly_visuals.cpython-314.pyc": {
+      "checksum": "f480f87595d39cf03c02f448a230db57"
+    },
+    "skills/__pycache__/pooled_fold_change.cpython-314.pyc": {
+      "checksum": "adda4f5fad3168a169677f9b17f2a9b8"
+    },
+    "skills/__pycache__/protein_lookup.cpython-314.pyc": {
+      "checksum": "1643a602420d62e7c2fb7f304e051eec"
+    },
+    "skills/__pycache__/proteomics_analysis.cpython-314.pyc": {
+      "checksum": "29a80f827a33e3385177250b24d134b2"
+    },
+    "skills/__pycache__/r_analysis.cpython-314.pyc": {
+      "checksum": "9e8096e622e4c531707bc2c15f1a1d30"
+    },
+    "skills/__pycache__/run_enrichment.cpython-314.pyc": {
+      "checksum": "ad9f016f3d9237236ee2cd927023e361"
+    },
+    "skills/__pycache__/run_visualization.cpython-314.pyc": {
+      "checksum": "fc0810b12a8a5763e5af7e42063c64d4"
+    },
+    "skills/__pycache__/silac_analysis.cpython-314.pyc": {
+      "checksum": "4588a912c9ecff8d2f8f6a8a052bebc6"
     },
     "skills/base_skill.py": {
       "checksum": "27a9fb03b450f61fa1c07179450df535"
