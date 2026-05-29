@@ -2368,6 +2368,22 @@ class LearningAgent(BaseAgent):
             g2_samples = decision.get("group2_samples") or []
             all_cols   = state.get("sample_columns") or []
             all_groups = state.get("all_groups") or {}
+            label_map  = state.get("label_map") or {}
+
+            def _resolve_from_label_map(label: Optional[str]) -> List[str]:
+                """Expand a group label via sample->group metadata mapping."""
+                if not label or not isinstance(label_map, dict):
+                    return []
+                wanted = str(label).strip().lower()
+                if not wanted:
+                    return []
+                matches = [
+                    sample
+                    for sample, grp in label_map.items()
+                    if str(grp).strip().lower() == wanted and sample in all_cols
+                ]
+                # Preserve data-column order for deterministic downstream analysis.
+                return [c for c in all_cols if c in matches]
 
             def _expand(label: Optional[str], current: List[str]) -> List[str]:
                 """Resolve a group label to its full replicate column list.
@@ -2379,6 +2395,11 @@ class LearningAgent(BaseAgent):
                 """
                 if not label:
                     return current
+                # 0. Metadata label map from canonical 2-sheet templates
+                #    (sample ID -> group label), used heavily in pooled designs.
+                lm = _resolve_from_label_map(label)
+                if len(lm) >= len(current) and lm:
+                    return lm
                 # 1. Authoritative: groups already resolved at ingest
                 #    (row-0 labels or replicate-suffix stripping).
                 if label in all_groups and len(all_groups[label]) >= len(current):

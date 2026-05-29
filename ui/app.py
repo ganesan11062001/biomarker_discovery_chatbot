@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -383,21 +384,37 @@ def _api_create_session(
     disease_program: str | None = None,
     organism: str | None = None,
 ) -> str | None:
-    try:
-        params = {}
-        if disease_program:
-            params["disease_program"] = disease_program
-        if organism:
-            params["organism"] = organism
-        r = requests.post(
-            f"{API_BASE}/chat/session",
-            params=params,
-            timeout=10,
-        )
-        if r.status_code == 201:
-            return r.json()["session_id"]
-    except requests.exceptions.ConnectionError:
-        pass
+    params: dict[str, str] = {}
+    if disease_program:
+        params["disease_program"] = disease_program
+    if organism:
+        params["organism"] = organism
+
+    # API can be briefly unavailable during reload/startup; retry quickly.
+    attempts = 3
+    for i in range(attempts):
+        try:
+            r = requests.post(
+                f"{API_BASE}/chat/session",
+                params=params,
+                timeout=20,
+            )
+            if r.status_code == 201:
+                return r.json().get("session_id")
+            st.session_state["api_error"] = f"API {r.status_code}: {r.text[:200]}"
+            return None
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            if i < attempts - 1:
+                time.sleep(0.6 * (i + 1))
+                continue
+            st.session_state["api_error"] = (
+                "Cannot reach API session endpoint. "
+                "Please ensure backend is running on http://localhost:8000."
+            )
+            return None
+        except requests.exceptions.RequestException as exc:
+            st.session_state["api_error"] = f"Session creation failed: {exc}"
+            return None
     return None
 
 

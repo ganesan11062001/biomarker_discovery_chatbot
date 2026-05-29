@@ -165,8 +165,17 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         meta_lookup = self._build_protein_metadata(df_raw, avail)
 
         # 2. QC + normalisation + optional TMT IRS
+        required_samples = list(group1_samples or []) + list(group2_samples or [])
+        if all_groups:
+            for cols in all_groups.values():
+                required_samples.extend(cols or [])
+        required_samples = [c for c in dict.fromkeys(required_samples) if c in data.columns]
         data_qc, qc_summary, valid_mask = self._qc(
-            data, missing_threshold, data_type, tmt_batches=tmt_batches,
+            data,
+            missing_threshold,
+            data_type,
+            required_samples=required_samples,
+            tmt_batches=tmt_batches,
         )
 
         # 3. Resolve effective test method
@@ -309,6 +318,7 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         data: pd.DataFrame,
         missing_threshold: float,
         data_type: str,
+        required_samples: Optional[List[str]] = None,
         tmt_batches: Optional[Dict[str, Any]] = None,
     ) -> Tuple[pd.DataFrame, Dict, pd.DataFrame]:
         """
@@ -351,7 +361,9 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
 
         # ── Step 3: sample filter (>80% missing) ─────────────────────────────
         miss_samp = data.isna().mean(axis=0)
-        data = data.loc[:, miss_samp <= 0.80]
+        must_keep = set(required_samples or [])
+        keep_cols = [c for c in data.columns if (miss_samp.get(c, 1.0) <= 0.80) or (c in must_keep)]
+        data = data.loc[:, keep_cols]
 
         # ── Step 4: median-centering normalisation ────────────────────────────
         #    Subtract each sample's median and add the global median back.
@@ -405,6 +417,64 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
 
     # ── Supervised: two-group differential expression ─────────────────────────
 
+    @staticmethod
+    def _resolve_group_columns(
+        requested: List[str],
+        available: List[str],
+    ) -> List[str]:
+        """Resolve requested group columns against available columns robustly.
+
+        Matching order:
+        1) exact match
+        2) case-insensitive trimmed match
+        3) pandas-style duplicate suffix match (e.g. A -> A.1)
+        """
+        if not requested or not available:
+            return []
+
+        out: List[str] = []
+        avail_map = {str(c).strip().lower(): c for c in available}
+        avail_set = set(available)
+
+        for raw in requested:
+            key = str(raw).strip()
+            if not key:
+                continue
+
+            if key in avail_set:
+                out.append(key)
+                continue
+
+            low = key.lower()
+            if low in avail_map:
+                out.append(avail_map[low])
+                continue
+
+            # Common proteomics matrix headers: "A Intensity", "A_LFQ", etc.
+            token_hits = [
+                c for c in available
+                if str(c).startswith(f"{key} ")
+                or str(c).startswith(f"{key}_")
+                or str(c).strip().lower().startswith(f"{low} ")
+                or str(c).strip().lower().startswith(f"{low}_")
+            ]
+            if token_hits:
+                out.extend(token_hits)
+                continue
+
+            # Handle duplicate-column suffixes produced by pandas (A, A.1, A.2).
+            prefix = f"{key}."
+            prefix_low = f"{low}."
+            suffix_hits = [
+                c for c in available
+                if str(c).startswith(prefix) or str(c).strip().lower().startswith(prefix_low)
+            ]
+            if suffix_hits:
+                out.extend(suffix_hits)
+
+        # Preserve order and remove accidental duplicates.
+        return [c for c in dict.fromkeys(out)]
+
     def _supervised(
         self,
         data: pd.DataFrame,
@@ -417,8 +487,9 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         adj_pval_cutoff: float = 0.05,
         missing_threshold: float = 0.5,
     ) -> pd.DataFrame:
-        g1 = [c for c in g1_cols if c in data.columns]
-        g2 = [c for c in g2_cols if c in data.columns]
+        available_cols = list(data.columns)
+        g1 = self._resolve_group_columns(g1_cols, available_cols)
+        g2 = self._resolve_group_columns(g2_cols, available_cols)
 
         if not g1 or not g2:
             raise ValueError(
@@ -528,10 +599,18 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         A Welch t-test on such data is statistically invalid; this branch
         reports log2(group2 / group1) and ranks proteins by |log2FC| only.
         """
-        g1 = [c for c in g1_cols if c in data.columns]
-        g2 = [c for c in g2_cols if c in data.columns]
+        available_cols = list(data.columns)
+        g1 = self._resolve_group_columns(g1_cols, available_cols)
+        g2 = self._resolve_group_columns(g2_cols, available_cols)
         if not g1 or not g2:
-            raise ValueError("Group columns not found in QC-filtered data.")
+            raise ValueError(
+                "Group columns not found in QC-filtered data.\n"
+                f"Group1 requested: {g1_cols}\n"
+                f"Group1 matched: {g1}\n"
+                f"Group2 requested: {g2_cols}\n"
+                f"Group2 matched: {g2}\n"
+                f"Available columns: {available_cols}"
+            )
 
         vm = valid_mask.reindex(data.index, fill_value=True)
         valid_g1 = vm[g1].mean(axis=1) >= missing_threshold

@@ -340,6 +340,38 @@ class IngestionAgent(BaseAgent):
                                                           "proteomics_silac") else hinted
         if is_pooled:
             logger.info("Pooled / no-replicates design — fold-change-only ranking. Label map: %s", label_map)
+            if isinstance(label_map, dict) and result["sample_columns"]:
+                def _resolve_sample_id_to_columns(sample_id: str, cols: List[str]) -> List[str]:
+                    sid = str(sample_id).strip()
+                    sid_low = sid.lower()
+                    exact = [c for c in cols if c == sid]
+                    if exact:
+                        return exact
+                    # Canonical matrix patterns: "A Intensity", "A_LFQ".
+                    hits = [
+                        c for c in cols
+                        if str(c).startswith(f"{sid} ")
+                        or str(c).startswith(f"{sid}_")
+                        or str(c).strip().lower().startswith(f"{sid_low} ")
+                        or str(c).strip().lower().startswith(f"{sid_low}_")
+                    ]
+                    return hits
+
+                pooled_groups: Dict[str, List[str]] = {}
+                for sample_id, grp in label_map.items():
+                    if grp is None:
+                        continue
+                    resolved_cols = _resolve_sample_id_to_columns(sample_id, result["sample_columns"])
+                    if not resolved_cols:
+                        continue
+                    pooled_groups.setdefault(str(grp), []).extend(resolved_cols)
+                pooled_groups = {k: list(dict.fromkeys(v)) for k, v in pooled_groups.items() if v}
+                if len(pooled_groups) >= 2:
+                    state["all_groups"] = pooled_groups
+                    logger.info(
+                        "Groups resolved from metadata label map: %s",
+                        {k: len(v) for k, v in pooled_groups.items()},
+                    )
 
         # ── Auto-detect groups from column names (non-pooled) ─────────────────
         # Strategy:
