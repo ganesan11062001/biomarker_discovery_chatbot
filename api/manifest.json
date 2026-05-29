@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "locale": "English_United States.1252",
+  "metadata": {
+    "appmode": "python-fastapi",
+    "entrypoint": "main:app"
+  },
+  "python": {
+    "version": "3.12.4",
+    "package_manager": {
+      "name": "pip",
+      "version": "26.0.1",
+      "package_file": "..\\requirements.txt"
+    }
+  },
+  "environment": {
+    "python": {
+      "requires": "==3.12.4"
+    }
+  },
+  "files": {
+    "..\\requirements.txt": {
+      "checksum": "76c2e9cb862608925e9a20d36dbfdb51"
+    },
+    "__init__.py": {
+      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
+    },
+    "main.py": {
+      "checksum": "26e620dc3e9ad1b9e7727ca82d8cd444"
+    },
+    "routes/__init__.py": {
+      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
+    },
+    "routes/chat.py": {
+      "checksum": "c568e367433d9a873a4f2c2a950a9a6d"
+    },
+    "routes/results.py": {
+      "checksum": "a9fdd8c88895fb24416acf71d774083c"
+    },
+    "routes/sessions.py": {
+      "checksum": "f0a7157a9009b0322e9e26387649899b"
+    },
+    "routes/upload.py": {
+      "checksum": "747cfe2227222cfec5db0c8ce0568b83"
+    }
+  }
+}
