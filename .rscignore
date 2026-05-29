@@ -1,0 +1,13 @@
+.git/
+.venv/
+.vscode/
+.tools/
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/
+outputs/
+logs/
+frontend/
+node_modules/
