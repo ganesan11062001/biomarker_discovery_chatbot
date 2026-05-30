@@ -44,6 +44,24 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# ── Diagnostic panel (visible when ?debug=1 in the URL) ──────────────────────
+if st.query_params.get("debug") == "1":
+    st.subheader("🔧 Diagnostic")
+    st.write({
+        "API_BASE": API_BASE,
+        "CONNECT_API_KEY_set": bool(_CONNECT_API_KEY),
+        "CONNECT_API_KEY_len": len(_CONNECT_API_KEY),
+    })
+    try:
+        r = requests.get(f"{API_BASE}/docs", timeout=10)
+        st.write({"GET /docs status": r.status_code,
+                  "content_type": r.headers.get("content-type"),
+                  "first_200_chars": r.text[:200]})
+    except Exception as e:
+        st.error(f"Request to {API_BASE}/docs failed: {e!r}")
+    st.stop()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CSS  —  BioSpace Theme (chat-only)
 # ══════════════════════════════════════════════════════════════════════════════
