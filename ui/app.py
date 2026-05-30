@@ -19,7 +19,7 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
+API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
 
 # ── Posit Connect auth ───────────────────────────────────────────────────────
 # When the FastAPI is deployed on Posit Connect with "All users - login
@@ -60,6 +60,22 @@ if st.query_params.get("debug") == "1":
     except Exception as e:
         st.error(f"Request to {API_BASE}/docs failed: {e!r}")
     st.stop()
+
+# ── Loud banner if API_BASE_URL is misconfigured on Posit Connect ────────────
+_running_on_connect = bool(os.getenv("RSTUDIO_PRODUCT") or os.getenv("CONNECT_SERVER"))
+if API_BASE.startswith(("http://localhost", "http://127.0.0.1")) and _running_on_connect:
+    st.error(
+        "❌ `API_BASE_URL` is not configured on Posit Connect.\n\n"
+        f"Current value: `{API_BASE}` — this only works in local development.\n\n"
+        "**Fix:** Open this Streamlit content in Connect → **Vars** panel → add:\n"
+        "```\n"
+        "API_BASE_URL = https://rndconnect.solidbio.com/content/<your-fastapi-guid>\n"
+        "CONNECT_API_KEY = <a Connect API key>\n"
+        "```\n"
+        "Then click **Restart**."
+    )
+    st.stop()
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
