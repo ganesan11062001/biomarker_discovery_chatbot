@@ -2344,6 +2344,39 @@ class LearningAgent(BaseAgent):
         if decision.get("omic_type"):
             state["omic_type"] = decision["omic_type"]
 
+        # ── Deterministic intent overrides ────────────────────────────────────
+        # The LLM occasionally mis-routes a couple of recurring phrasings.
+        # Patch them here so the answer is always grounded in the right source.
+        _uq_lower = (user_query or "").lower()
+
+        # "show / generate / render plots" must go to the visualization agent
+        # — not to the answer step (which would just describe plots in text).
+        _viz_phrases = (
+            "show plot", "show the plot", "show plots", "show the plots",
+            "generate plot", "make plot", "render plot", "draw plot",
+            "show me the plot", "give me the plot", "display plot",
+            "show chart", "show charts", "show heatmap", "show volcano",
+            "show pca",
+        )
+        if action == "answer" and any(p in _uq_lower for p in _viz_phrases):
+            self.logger.info("Override: 'answer' -> 'run_visualization' (user asked to show plots).")
+            action = "run_visualization"
+            state["intent"] = action
+
+        # "top N biomarkers / biomarker list / ranked biomarkers" must come from
+        # the differential-analysis results (state['top_biomarkers']), NOT from
+        # a raw-data query that would rank by SpC / intensity.
+        _top_phrases = ("top biomarker", "top biomarkers", "ranked biomarker",
+                        "biomarker list", "list of biomarkers", "best biomarker")
+        if (
+            action in {"query_data", "answer"}
+            and any(p in _uq_lower for p in _top_phrases)
+            and state.get("top_biomarkers")
+        ):
+            self.logger.info("Override: '%s' -> 'answer' (top biomarkers grounded in analysis results).", action)
+            action = "answer"
+            state["intent"] = action
+
         # ── Clarification question ────────────────────────────────────────────
         if action == "ask_clarification":
             question = (
