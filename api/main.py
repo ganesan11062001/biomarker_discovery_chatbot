@@ -6,6 +6,7 @@ Start:  uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -63,6 +64,10 @@ app = FastAPI(
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
+    # Posit Connect proxies content under /content/<guid>/ and strips the
+    # prefix before forwarding. Setting root_path lets FastAPI build correct
+    # absolute URLs for /docs, OpenAPI, and redirects.
+    root_path=os.getenv("FASTAPI_ROOT_PATH", ""),
 )
 
 # CORS — allow Streamlit UI (localhost:8501) and any local origin
