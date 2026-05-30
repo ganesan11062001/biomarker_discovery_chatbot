@@ -21,6 +21,21 @@ if str(_ROOT) not in sys.path:
 
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 
+# ── Posit Connect auth ───────────────────────────────────────────────────────
+# When the FastAPI is deployed on Posit Connect with "All users - login
+# required", we must authenticate every request with a Connect API key.
+# Set CONNECT_API_KEY in this Streamlit content's Vars panel.
+_CONNECT_API_KEY = os.getenv("CONNECT_API_KEY", "").strip()
+if _CONNECT_API_KEY:
+    _session = requests.Session()
+    _session.headers.update({"Authorization": f"Key {_CONNECT_API_KEY}"})
+    # Route module-level requests.get/post/etc. through the authenticated session.
+    requests.get = _session.get        # type: ignore[assignment]
+    requests.post = _session.post      # type: ignore[assignment]
+    requests.put = _session.put        # type: ignore[assignment]
+    requests.delete = _session.delete  # type: ignore[assignment]
+    requests.patch = _session.patch    # type: ignore[assignment]
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="BiomarkerAI",
