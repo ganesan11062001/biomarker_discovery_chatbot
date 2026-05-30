@@ -26,15 +26,24 @@ API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
 # required", we must authenticate every request with a Connect API key.
 # Set CONNECT_API_KEY in this Streamlit content's Vars panel.
 _CONNECT_API_KEY = os.getenv("CONNECT_API_KEY", "").strip()
+# Internal Connect servers often use a corporate CA that the Python image
+# does not trust. Allow opting out of TLS verification via env var.
+_VERIFY_SSL = os.getenv("API_VERIFY_SSL", "1").strip().lower() not in {"0", "false", "no"}
+if not _VERIFY_SSL:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+_session = requests.Session()
+_session.verify = _VERIFY_SSL
 if _CONNECT_API_KEY:
-    _session = requests.Session()
     _session.headers.update({"Authorization": f"Key {_CONNECT_API_KEY}"})
-    # Route module-level requests.get/post/etc. through the authenticated session.
-    requests.get = _session.get        # type: ignore[assignment]
-    requests.post = _session.post      # type: ignore[assignment]
-    requests.put = _session.put        # type: ignore[assignment]
-    requests.delete = _session.delete  # type: ignore[assignment]
-    requests.patch = _session.patch    # type: ignore[assignment]
+# Route module-level requests.get/post/etc. through the configured session
+# so every call inherits both the auth header and the verify setting.
+requests.get = _session.get        # type: ignore[assignment]
+requests.post = _session.post      # type: ignore[assignment]
+requests.put = _session.put        # type: ignore[assignment]
+requests.delete = _session.delete  # type: ignore[assignment]
+requests.patch = _session.patch    # type: ignore[assignment]
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -51,6 +60,7 @@ _diag = {
     "API_BASE_URL_env_raw": repr(os.getenv("API_BASE_URL")),
     "CONNECT_API_KEY_set": bool(_CONNECT_API_KEY),
     "CONNECT_API_KEY_len": len(_CONNECT_API_KEY),
+    "VERIFY_SSL": _VERIFY_SSL,
     "AZURE_OPENAI_API_KEY_set": bool(os.getenv("AZURE_OPENAI_API_KEY")),
 }
 st.json(_diag)
