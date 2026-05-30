@@ -44,6 +44,28 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# ── Diagnostic panel (ALWAYS visible at the top — remove later) ─────────────
+st.warning("🔧 Connect diagnostic — remove this block once everything works")
+_diag = {
+    "API_BASE": API_BASE,
+    "API_BASE_URL_env_raw": repr(os.getenv("API_BASE_URL")),
+    "CONNECT_API_KEY_set": bool(_CONNECT_API_KEY),
+    "CONNECT_API_KEY_len": len(_CONNECT_API_KEY),
+    "AZURE_OPENAI_API_KEY_set": bool(os.getenv("AZURE_OPENAI_API_KEY")),
+}
+st.json(_diag)
+try:
+    _r = requests.get(f"{API_BASE}/docs", timeout=10)
+    st.json({
+        "probe_url": f"{API_BASE}/docs",
+        "status": _r.status_code,
+        "content_type": _r.headers.get("content-type"),
+        "first_200_chars": _r.text[:200],
+    })
+except Exception as _e:
+    st.error(f"Probe to {API_BASE}/docs failed: {_e!r}")
+st.divider()
+
 # ── Diagnostic panel (visible when ?debug=1 in the URL) ──────────────────────
 if st.query_params.get("debug") == "1":
     st.subheader("🔧 Diagnostic")
