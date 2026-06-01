@@ -264,21 +264,22 @@ st.markdown("""
 
 /* ── Chat input ── */
 [data-testid="stChatInput"] {
-    background: rgba(255,255,255,0.03) !important;
-    border: 1px solid rgba(255,255,255,0.08) !important;
+    background: #ffffff !important;
+    border: 1px solid rgba(255,255,255,0.18) !important;
     border-radius: 16px !important;
     transition: all 0.2s;
 }
 [data-testid="stChatInput"]:focus-within {
-    border-color: rgba(56,189,248,0.4) !important;
-    box-shadow: 0 0 0 3px rgba(56,189,248,0.07), 0 0 20px rgba(56,189,248,0.1) !important;
+    border-color: rgba(56,189,248,0.6) !important;
+    box-shadow: 0 0 0 3px rgba(56,189,248,0.15), 0 0 20px rgba(56,189,248,0.15) !important;
 }
 [data-testid="stChatInput"] textarea {
-    background: transparent !important;
-    color: #e2e8f0 !important;
+    background: #ffffff !important;
+    color: #0f172a !important;
     font-size: 0.94rem !important;
+    caret-color: #0f172a !important;
 }
-[data-testid="stChatInput"] textarea::placeholder { color: #475569 !important; }
+[data-testid="stChatInput"] textarea::placeholder { color: #64748b !important; }
 [data-testid="stChatInput"] button { color: #475569 !important; }
 [data-testid="stChatInput"] button:hover { color: #38bdf8 !important; }
 
@@ -1031,7 +1032,8 @@ def _render_main() -> None:
                 #      would miss legitimate re-renders).
                 old_plots = set(astate.get("plot_paths") or [])
                 new_plots = set(new_astate.get("plot_paths") or [])
-                intent    = (new_astate.get("intent") or "").lower()
+                intent    = ((resp.get("intent") if resp else None)
+                             or new_astate.get("intent") or "").lower()
                 viz_turn  = intent in {"run_visualization", "run_full_pipeline"}
                 has_plots = bool(new_plots - old_plots) or (viz_turn and bool(new_plots))
 
