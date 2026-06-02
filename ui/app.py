@@ -787,57 +787,103 @@ def _fetch_file(session_id: str, path: str) -> bytes | None:
         return None
 
 
-def _render_inline_plots(session_id: str, plot_paths: list[str]) -> None:
-    """Render PNG thumbnail grid inside a chat message bubble."""
-    if not plot_paths:
-        return
+def _normalize_plot_paths(plot_paths: list[str]) -> list[str]:
+    """Collapse PNG/HTML/JSON variants of the same plot into a stable stem path.
 
-    # Only PNG paths (skip any HTML paths that ended up in the list)
-    png_paths = [p for p in plot_paths if str(p).endswith(".png")]
-    if not png_paths:
+    The visualization skill writes three siblings (.png, .html, .json) per plot,
+    but on Posit Workbench / Linux containers without Chromium, kaleido PNG export
+    fails and `_save()` returns only the `.html` path. The renderers used to filter
+    on `.endswith('.png')` and dropped every HTML-only plot. We now keep one
+    "stem path" per plot and let downstream renderers probe each variant.
+    """
+    seen: set[str] = set()
+    stems: list[str] = []
+    for p in plot_paths:
+        sp = str(p)
+        # Use the .png path as the canonical stem — the API can resolve siblings.
+        if sp.endswith((".png", ".html", ".json")):
+            stem = sp.rsplit(".", 1)[0] + ".png"
+        else:
+            stem = sp
+        if stem in seen:
+            continue
+        seen.add(stem)
+        stems.append(stem)
+    return stems
+
+
+def _render_inline_plots(session_id: str, plot_paths: list[str]) -> None:
+    """Render plot thumbnails inside a chat message bubble.
+
+    Tries PNG first; if PNG is unavailable (e.g. kaleido failed in production),
+    falls back to rendering the interactive Plotly figure inline using the sibling
+    .json artifact so plots are never silently dropped.
+    """
+    stems = _normalize_plot_paths(plot_paths)
+    if not stems:
         return
 
     st.markdown(
         "<div style='margin:14px 0 8px;font-size:0.82rem;color:#475569;"
         "font-weight:600;letter-spacing:0.4px;text-transform:uppercase;'>"
-        f"📊 {len(png_paths)} plot{'s' if len(png_paths) != 1 else ''} generated</div>",
+        f"📊 {len(stems)} plot{'s' if len(stems) != 1 else ''} generated</div>",
         unsafe_allow_html=True,
     )
 
     cols_per_row = 2
-    rows = [png_paths[i:i + cols_per_row] for i in range(0, len(png_paths), cols_per_row)]
+    rows = [stems[i:i + cols_per_row] for i in range(0, len(stems), cols_per_row)]
 
     for row_paths in rows:
         cols = st.columns(len(row_paths))
         for col, path in zip(cols, row_paths):
             label = Path(path).stem.split("_", 1)[-1].replace("_", " ").title()
-            img_bytes = _fetch_file(session_id, path)
             with col:
-                # Defensive rendering: only call st.image when the bytes look like
-                # a real PNG (PNG magic = 89 50 4E 47). Empty / non-PNG payloads
-                # used to render as a stray "0" before this guard.
+                # 1) Try PNG (fast static thumbnail).
+                img_bytes = _fetch_file(session_id, path)
                 if img_bytes and len(img_bytes) > 8 and img_bytes[:4] == b"\x89PNG":
                     st.image(img_bytes, caption=label, use_container_width=True)
-                else:
-                    st.markdown(
-                        f"<div style='border:1px dashed rgba(255,255,255,0.1);"
-                        f"border-radius:10px;padding:24px 14px;text-align:center;"
-                        f"color:#64748b;font-size:0.78rem;'>"
-                        f"⚠ Could not load <b>{label}</b><br>"
-                        f"<code style='font-size:0.7rem;color:#94a3b8;'>{path}</code>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
+                    continue
+
+                # 2) Fall back to interactive Plotly via the sibling JSON.
+                json_path  = path.replace(".png", ".json")
+                json_bytes = _fetch_file(session_id, json_path)
+                if json_bytes:
+                    try:
+                        fig = _go.Figure(_json.loads(json_bytes.decode("utf-8")))
+                        st.markdown(
+                            f"<div style='font-size:0.82rem;font-weight:600;"
+                            f"color:#94a3b8;margin:0 0 4px;'>📊 {label}</div>",
+                            unsafe_allow_html=True,
+                        )
+                        st.plotly_chart(
+                            fig,
+                            use_container_width=True,
+                            key=f"inline_plotly_{Path(path).stem}",
+                        )
+                        continue
+                    except Exception:
+                        pass
+
+                # 3) Last resort: surface the failure instead of rendering a "0".
+                st.markdown(
+                    f"<div style='border:1px dashed rgba(255,255,255,0.1);"
+                    f"border-radius:10px;padding:24px 14px;text-align:center;"
+                    f"color:#64748b;font-size:0.78rem;'>"
+                    f"⚠ Could not load <b>{label}</b><br>"
+                    f"<code style='font-size:0.7rem;color:#94a3b8;'>{path}</code>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
 
 def _render_interactive_plots(session_id: str, plot_paths: list[str]) -> None:
     """Render interactive Plotly charts in a standalone expander OUTSIDE chat messages."""
-    png_paths = [p for p in plot_paths if str(p).endswith(".png")]
-    if not png_paths:
+    stems = _normalize_plot_paths(plot_paths)
+    if not stems:
         return
 
     with st.expander("🔬 Explore plots interactively  (zoom · hover · pan)", expanded=False):
-        for path in png_paths:
+        for path in stems:
             label = (
                 Path(path).stem
                 .split("_", 1)[-1]
