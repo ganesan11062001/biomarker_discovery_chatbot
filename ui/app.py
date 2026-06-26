@@ -1072,16 +1072,18 @@ def _render_main() -> None:
                 # Detect whether this response generated new plots.
                 # Two triggers:
                 #   1. New PNGs appeared in plot_paths since the last turn, OR
-                #   2. The orchestrator routed this turn to the visualization
-                #      agent — in that case treat any existing plots as fresh
-                #      (file names can be deterministic, so set-delta alone
-                #      would miss legitimate re-renders).
+                #   2. The orchestrator routed this turn to an agent that
+                #      produces plots — in that case treat any existing plots
+                #      as fresh (file names can be deterministic, so set-delta
+                #      alone would miss legitimate re-renders).
                 old_plots = set(astate.get("plot_paths") or [])
                 new_plots = set(new_astate.get("plot_paths") or [])
                 intent    = ((resp.get("intent") if resp else None)
                              or new_astate.get("intent") or "").lower()
-                viz_turn  = intent in {"run_visualization", "run_full_pipeline"}
-                has_plots = bool(new_plots - old_plots) or (viz_turn and bool(new_plots))
+                plot_producing_turn = intent in {
+                    "run_analysis", "run_visualization", "run_full_pipeline",
+                }
+                has_plots = bool(new_plots - old_plots) or (plot_producing_turn and bool(new_plots))
 
                 # Clear has_plots from all previous messages so plots attach
                 # to exactly the message that produced them

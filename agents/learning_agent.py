@@ -2368,13 +2368,23 @@ class LearningAgent(BaseAgent):
         # a raw-data query that would rank by SpC / intensity.
         _top_phrases = ("top biomarker", "top biomarkers", "ranked biomarker",
                         "biomarker list", "list of biomarkers", "best biomarker")
+        _top_re = re.search(r"top\s*\d*\s*biomarker", _uq_lower)
         if (
             action in {"query_data", "answer"}
-            and any(p in _uq_lower for p in _top_phrases)
+            and (any(p in _uq_lower for p in _top_phrases) or _top_re)
             and state.get("top_biomarkers")
         ):
-            self.logger.info("Override: '%s' -> 'answer' (top biomarkers grounded in analysis results).", action)
-            action = "answer"
+            requested_top_n = decision.get("top_n") or 0
+            stored_count = len(state.get("top_biomarkers") or [])
+            if requested_top_n > stored_count:
+                self.logger.info(
+                    "Override: '%s' -> 'run_analysis' (user wants top %d but only %d stored).",
+                    action, requested_top_n, stored_count,
+                )
+                action = "run_analysis"
+            else:
+                self.logger.info("Override: '%s' -> 'answer' (top biomarkers grounded in analysis results).", action)
+                action = "answer"
             state["intent"] = action
 
         # ── Clarification question ────────────────────────────────────────────
