@@ -773,7 +773,8 @@ class DataLoadingSkill:
                                     skiprows=header_idx)
             except UnicodeDecodeError:
                 continue
-        return pd.read_csv(path, index_col=0)
+        # Last-resort fallback: latin-1 decodes any byte and never raises.
+        return pd.read_csv(path, index_col=0, encoding="latin-1")
 
     def _ensure_proteins_are_rows(self, df: pd.DataFrame) -> pd.DataFrame:
         rows_prot = _looks_like_protein_index(df.index)

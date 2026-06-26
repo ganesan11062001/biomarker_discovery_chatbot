@@ -45,6 +45,7 @@ import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from core.io_utils import read_csv_safe
 from skills.base_skill import BaseOmicsSkill, OmicsAnalysisResult
 
 
@@ -146,8 +147,10 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         is_pooled_design: bool = False,
     ) -> Dict[str, Any]:
 
-        # 1. Load
-        df_raw = pd.read_csv(data_path, index_col=0)
+        # 1. Load — use encoding-robust reader so files with µ / Greek letters
+        # in headers (common in MaxQuant + Excel-on-Windows exports) decode
+        # cleanly instead of raising UnicodeDecodeError on the default utf-8.
+        df_raw = read_csv_safe(data_path, index_col=0)
         avail = [c for c in sample_columns if c in df_raw.columns]
         if not avail:
             raise ValueError(
