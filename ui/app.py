@@ -431,6 +431,30 @@ st.markdown("""
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(56,189,248,0.3); }
+
+/* ── Thinking indicator (replaces st.spinner circle while a reply is loading) ── */
+.thinking-dots {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 2px;
+    color: #94a3b8;
+    font-style: italic;
+    font-size: 0.92rem;
+    padding: 6px 2px;
+    letter-spacing: 0.2px;
+}
+.thinking-dots span {
+    display: inline-block;
+    animation: thinking-bounce 1.4s ease-in-out infinite both;
+    opacity: 0.35;
+}
+.thinking-dots span:nth-child(1) { animation-delay: 0s;    }
+.thinking-dots span:nth-child(2) { animation-delay: 0.16s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.32s; }
+@keyframes thinking-bounce {
+    0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+    40%           { opacity: 1;   transform: translateY(-2px); }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1057,8 +1081,14 @@ def _render_main() -> None:
 
         if user_input:
             st.session_state["messages"].append({"role": "user", "content": user_input})
-            with st.spinner(""):
-                resp = _api_send_message(session_id, user_input)
+            thinking = st.empty()
+            thinking.markdown(
+                "<div class='thinking-dots'>Thinking"
+                "<span>.</span><span>.</span><span>.</span></div>",
+                unsafe_allow_html=True,
+            )
+            resp = _api_send_message(session_id, user_input)
+            thinking.empty()
             if resp:
                 new_sid = resp.get("session_id")
                 if new_sid and new_sid != session_id:

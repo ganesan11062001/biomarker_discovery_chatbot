@@ -19,7 +19,7 @@ import { useCallback, useEffect, useMemo, useRef } from "react";
 import { streamChat } from "@/lib/api";
 import { extractArtifacts } from "@/lib/artifacts";
 import { useAppStore } from "@/lib/store";
-import type { ChatMessage, SkillBadge } from "@/types";
+import type { Artifact, ChatMessage, SkillBadge } from "@/types";
 
 interface UseChatResult {
   messages:    ChatMessage[];
@@ -114,18 +114,42 @@ export function useChat(): UseChatResult {
         }
         case "artifact":
           appendArtifact(sid, event.artifact);
+          // Auto-open the artifact panel the first time a plot arrives in
+          // this session so the user actually sees the plot. Skip if the
+          // user has already opened the panel — don't fight their choice.
+          if (event.artifact.kind === "plot") {
+            const store = useAppStore.getState();
+            if (!store.artifactPanelOpen) {
+              store.setArtifactPanelOpen(true);
+            }
+            store.focusArtifact(event.artifact.id);
+          }
           break;
         case "message_complete": {
           const finalContent = event.message.content || "";
-          const artifacts = extractArtifacts(placeholderId, finalContent, now());
+          const extracted    = extractArtifacts(placeholderId, finalContent, now());
+          // Merge: backend-emitted artifacts (plots, structured tables) ride
+          // along on the message payload; text-extracted artifacts come from
+          // the markdown body. Dedup by id so refreshes don't double up.
+          const backendArts: Artifact[] = event.message.artifacts ?? [];
+          const merged: Artifact[]      = [];
+          const seenIds = new Set<string>();
+          for (const a of [...backendArts, ...extracted]) {
+            if (seenIds.has(a.id)) continue;
+            seenIds.add(a.id);
+            merged.push(a);
+          }
           updateMessage(sid, placeholderId, {
             content:   finalContent,
             streaming: false,
             hasPlots:  event.message.hasPlots,
             skills:    event.message.skills,
-            artifacts,
+            artifacts: merged,
           });
-          for (const art of artifacts) appendArtifact(sid, art);
+          // Only push the TEXT-EXTRACTED artifacts to the session list here.
+          // Backend-emitted artifacts were already appended via the SSE
+          // `artifact` event above — pushing again would duplicate them.
+          for (const art of extracted) appendArtifact(sid, art);
           break;
         }
         case "error":
