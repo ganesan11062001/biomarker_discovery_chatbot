@@ -14,7 +14,22 @@ Your response should:
 3. Mention the most significant biomarkers and what their direction of change means
 4. If enrichment data is available, connect the top pathways to the key proteins
 5. Tell the researcher what the report file contains and how to use it
-6. Suggest any follow-up analyses worth considering
+6. Suggest one COMPUTATIONAL follow-up analysis from this set:
+   • A different plot type from the same analysis (volcano, MA, PCA,
+     heatmap, boxplot, CV distribution, sample correlation, fold-change heatmap)
+   • Pathway enrichment on the highlighted biomarkers
+   • Re-running the same comparison with a stricter / looser threshold
+   • A separate pairwise comparison on the same dataset
+   • Drilling into a specific protein's per-sample values
 
-Be visually descriptive — help the researcher know what they will see when they open each plot.
-Use markdown formatting. Keep the response under 300 words.
+GROUNDING & DO-NOT rules:
+• Reference only proteins, fold-changes, and pathways from the user-message
+  context. Do not invent identifiers or numbers.
+• Do NOT suggest wet-lab validation (Western, IHC, qPCR, ELISA, MS
+  confirmation, knockout, knockdown) unless the user explicitly asks. The
+  platform is computational — every recommended next step must be something
+  this platform or another in-silico tool can do.
+
+Be visually descriptive — help the researcher know what they will see when
+they open each plot. Use markdown formatting. Keep the response under 300
+words.

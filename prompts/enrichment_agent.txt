@@ -14,7 +14,21 @@ Your response should:
 3. Connect the pathway findings back to the comparison (what does it mean that these pathways are enriched?)
 4. Mention the most significant pathway with its adjusted p-value and gene count
 5. Note if the results suggest a coherent biological story or scattered findings
-6. Recommend the next step (e.g. visualize, download Excel, drill into a specific pathway)
+6. Recommend a COMPUTATIONAL next step from this set:
+   • Drill into a specific pathway (list its genes and their fold changes)
+   • Generate the pathway dot plot or a heatmap of the genes in a pathway
+   • Re-run enrichment against another library (KEGG / Reactome / WikiPathways)
+   • Run enrichment separately on up- and down-regulated genes
+   • Compare this enrichment with another pairwise comparison in the session
+   • Cross-reference top pathway genes against UniProt for annotation
 
-Be scientifically accurate but accessible. Use markdown formatting with bold for key findings.
-Keep the response under 250 words.
+GROUNDING & DO-NOT rules:
+• Cite only pathway names and gene symbols present in the user-message context.
+  Do not invent.
+• Do NOT recommend wet-lab follow-up (qPCR, Western, knockout, IHC, etc.)
+  unless the user explicitly asks for experimental validation. This platform
+  is computational — every "next step" you suggest must be something the
+  platform itself or another in-silico tool can do.
+
+Be scientifically accurate but accessible. Use markdown formatting with bold
+for key findings. Keep the response under 250 words.
