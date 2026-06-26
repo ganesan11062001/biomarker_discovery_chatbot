@@ -95,6 +95,41 @@ export function fileUrl(sessionId: string, path: string): string {
   return `${API_BASE}/results/${sessionId}/file?path=${encodeURIComponent(path)}`;
 }
 
+/** Direct URL to the formatted Excel biomarker report. The backend serves
+ *  it with Content-Disposition: attachment so the browser downloads instead
+ *  of opening inline. */
+export function excelDownloadUrl(sessionId: string): string {
+  return `${API_BASE}/results/${sessionId}/excel`;
+}
+
+/** Shape of the JSON returned by GET /results/{session_id}. Only the fields
+ *  the report download cares about are typed; the rest is captured loosely. */
+export interface AnalysisStateSnapshot {
+  session_id:       string;
+  data_type?:       string | null;
+  n_proteins?:      number | null;
+  n_samples?:       number | null;
+  omic_type?:       string | null;
+  group1_label?:    string | null;
+  group2_label?:    string | null;
+  group1_samples?:  string[] | null;
+  group2_samples?:  string[] | null;
+  analysis_mode?:   string | null;
+  qc_summary?:      Record<string, unknown> | null;
+  n_significant?:   number | null;
+  top_biomarkers?:  Array<Record<string, unknown>> | null;
+  analysis_summary?: string | null;
+  excel_path?:      string | null;
+  pathways?:        Array<Record<string, unknown>> | null;
+  status?:          string | null;
+}
+
+export async function fetchAnalysisState(
+  sessionId: string,
+): Promise<AnalysisStateSnapshot> {
+  return jsonRequest<AnalysisStateSnapshot>(`/results/${sessionId}`);
+}
+
 // ── Chat (SSE streaming) ──────────────────────────────────────────────────────
 
 /**
