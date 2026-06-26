@@ -239,7 +239,10 @@ def chat(request: ChatRequest, http_request: Request):
     # ── Legacy JSON path ─────────────────────────────────────────────────────
     result = _run_workflow_turn(request)
     msgs = result["new_assistant_messages"]
-    last_response = (msgs[-1]["content"] if msgs else "Analysis complete.")
+    last_response = (
+        "\n\n---\n\n".join(m["content"] for m in msgs if m.get("content"))
+        if msgs else "Analysis complete."
+    )
     return ChatResponse(
         session_id=result["session_id"],
         response=last_response,

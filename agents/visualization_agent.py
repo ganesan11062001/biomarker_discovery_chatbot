@@ -132,7 +132,11 @@ class VisualizationAgent(BaseAgent):
             state["status"]      = "report_ready"
 
             msg = self._llm_visualization_summary(result, state)
-            state["messages"].append({"role": "assistant", "content": msg})
+            state["messages"].append({
+                "role": "assistant",
+                "content": msg,
+                "has_plots": bool(result.get("plot_paths")),
+            })
 
             logger.info(
                 "Visualization complete | session=%s plots=%d",

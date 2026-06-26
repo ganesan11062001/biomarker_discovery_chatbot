@@ -258,15 +258,19 @@ class BiomarkerAgent(BaseAgent):
         # be dropped but PCA/heatmap/boxplots still produced.
         if mode == "supervised":
             try:
-                plot_paths = self._build_plots(
+                plot_suite = self._build_plots(
                     state=state, python_top=py_top,
                     dual=dual,
                     adj_pval_cutoff=adj_pval_cutoff,
                     log2fc_cutoff=log2fc_cutoff,
                 )
-                if plot_paths:
-                    state["plot_paths"] = plot_paths
-                    result["plot_paths"] = plot_paths
+                if plot_suite:
+                    flat_paths = [
+                        p for variants in plot_suite.values()
+                        for p in variants.values() if p
+                    ]
+                    state["plot_paths"] = flat_paths
+                    result["plot_paths"] = flat_paths
             except Exception as exc:
                 logger.warning("Plot generation failed: %s", exc)
 
