@@ -16,7 +16,7 @@ from typing import List, Optional
 
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
-from core.state import BiomarkerState
+from core.state import BiomarkerState, find_analysis
 from core.tracing import get_visualization_metadata
 from skills.run_visualization import ProteomicsPlotSuite, PLOT_REGISTRY, resolve_plot_names
 
@@ -71,7 +71,12 @@ class VisualizationAgent(BaseAgent):
 
     @_traceable(run_type="chain", name="agent.visualization",
                 tags=["biomarker-discovery", "visualization"])
-    def run(self, state: BiomarkerState, requested_plots: Optional[List[str]] = None) -> BiomarkerState:
+    def run(
+        self,
+        state: BiomarkerState,
+        requested_plots: Optional[List[str]] = None,
+        target_comparison: Optional[str] = None,
+    ) -> BiomarkerState:
         rt = _get_run_tree()
         if rt is not None:
             try:
@@ -80,9 +85,17 @@ class VisualizationAgent(BaseAgent):
                 )
             except Exception:
                 pass
-        protein_source = state.get("top_biomarkers") or state.get("top_proteins") or []
 
-        if not protein_source and not state.get("excel_path"):
+        # ── Resolve which past analysis we are visualising ───────────────────
+        # When the user names a specific comparison ("plots for X vs Y"), the
+        # orchestrator passes it through as target_comparison and we look it up
+        # in state["analyses"]. Otherwise we fall back to the legacy mirror
+        # fields, which point at the most-recent analysis.
+        view, analysis_entry, fallback_notice = self._resolve_view(state, target_comparison)
+
+        protein_source = view.get("top_biomarkers") or []
+
+        if not protein_source and not view.get("excel_path"):
             msg = self._llm_no_data()
             state["status"]        = "error"
             state["error_message"] = "No analysis results to visualize."
@@ -95,7 +108,7 @@ class VisualizationAgent(BaseAgent):
             requested_plots = self._detect_requested_plots(user_query)
 
         # ── Build stem from existing result path ──────────────────────────────
-        result_path = state.get("excel_path") or state.get("dea_result_path") or ""
+        result_path = view.get("excel_path") or state.get("dea_result_path") or ""
         stem = Path(result_path).stem if result_path else "biomarker"
 
         # ── Run plot suite ────────────────────────────────────────────────────
@@ -103,35 +116,42 @@ class VisualizationAgent(BaseAgent):
         try:
             result = self.plot_suite.execute(
                 top_proteins       = protein_source,
-                analysis_mode      = state.get("analysis_mode", "supervised"),
+                analysis_mode      = view.get("analysis_mode") or state.get("analysis_mode", "supervised"),
                 omic_type          = state.get("omic_type", "proteomics"),
-                test_method        = state.get("test_method", "welch"),
+                test_method        = view.get("test_method")  or state.get("test_method", "welch"),
                 is_paired          = state.get("is_paired", False),
                 all_groups         = state.get("all_groups"),
                 data_path          = state.get("data_path", ""),
                 sample_columns     = state.get("sample_columns") or [],
-                group1_samples     = state.get("group1_samples") or [],
-                group2_samples     = state.get("group2_samples") or [],
-                group1_label       = state.get("group1_label", "Group1"),
-                group2_label       = state.get("group2_label", "Group2"),
+                group1_samples     = view.get("group1_samples") or [],
+                group2_samples     = view.get("group2_samples") or [],
+                group1_label       = view.get("group1_label", "Group1"),
+                group2_label       = view.get("group2_label", "Group2"),
                 adj_pval_cutoff    = float(analysis_params.get("adj_pval_cutoff", 0.05)),
                 log2fc_cutoff      = float(analysis_params.get("log2fc_cutoff", 1.0)),
-                top_pathways       = state.get("pathways"),
-                enrichment_result_path = state.get("enrichment_result_path", ""),
+                top_pathways       = view.get("pathways"),
+                enrichment_result_path = view.get("enrichment_result_path", ""),
                 contrast_groups    = [
-                    state.get("group1_label", "Group1"),
-                    state.get("group2_label", "Group2"),
+                    view.get("group1_label", "Group1"),
+                    view.get("group2_label", "Group2"),
                 ],
                 plot_types         = requested_plots or None,
                 output_dir         = settings.output_dir,
                 stem               = stem,
             )
 
-            state["plot_paths"]  = result.get("plot_paths", [])
+            new_plot_paths = result.get("plot_paths", []) or []
+            state["plot_paths"]  = new_plot_paths
             state["report_path"] = result.get("report_path")
             state["status"]      = "report_ready"
+            # Persist plots back to the matching analysis entry so future
+            # "show plots for X vs Y" calls return the same set.
+            if analysis_entry is not None:
+                analysis_entry["plot_paths"] = new_plot_paths
 
-            msg = self._llm_visualization_summary(result, state)
+            if fallback_notice:
+                state["messages"].append({"role": "assistant", "content": fallback_notice})
+            msg = self._llm_visualization_summary(result, state, view)
             state["messages"].append({"role": "assistant", "content": msg})
 
             logger.info(
@@ -158,6 +178,67 @@ class VisualizationAgent(BaseAgent):
             })
 
         return state
+
+    # ── Target-analysis resolution ────────────────────────────────────────────
+
+    def _resolve_view(
+        self,
+        state: BiomarkerState,
+        target_comparison: Optional[str],
+    ) -> tuple:
+        """Return ``(view, analysis_entry, fallback_notice)``.
+
+        ``view`` is a flat dict carrying the analysis-specific fields the rest
+        of run() needs. When state["analyses"] is empty (legacy session), the
+        view mirrors the state's legacy fields. When a target is requested
+        but no match is found, we fall back to the most recent analysis and
+        return a ``fallback_notice`` message for the user.
+        """
+        analyses = state.get("analyses") or []
+        notice   = None
+
+        if not analyses:
+            # Legacy single-analysis session — read everything from state mirrors.
+            view = {
+                "top_biomarkers":     state.get("top_biomarkers") or state.get("top_proteins") or [],
+                "excel_path":         state.get("excel_path"),
+                "group1_label":       state.get("group1_label", "Group1"),
+                "group2_label":       state.get("group2_label", "Group2"),
+                "group1_samples":     state.get("group1_samples") or [],
+                "group2_samples":     state.get("group2_samples") or [],
+                "analysis_mode":      state.get("analysis_mode"),
+                "test_method":        state.get("test_method"),
+                "pathways":           state.get("pathways"),
+                "enrichment_result_path": state.get("enrichment_result_path", ""),
+                "plot_paths":         state.get("plot_paths"),
+            }
+            return view, None, None
+
+        entry = find_analysis(state, target_comparison)
+        if entry is None and target_comparison:
+            entry  = analyses[-1]
+            notice = (
+                f"_I couldn't find a saved analysis matching "
+                f"**{target_comparison}** — using the most recent analysis "
+                f"(**{entry.get('comparison_id','?')}**) instead._"
+            )
+        elif entry is None:
+            entry = analyses[-1]
+
+        view = {
+            "top_biomarkers":     entry.get("top_biomarkers") or [],
+            "excel_path":         entry.get("excel_path"),
+            "group1_label":       entry.get("group1_label", "Group1"),
+            "group2_label":       entry.get("group2_label", "Group2"),
+            "group1_samples":     entry.get("group1_samples") or [],
+            "group2_samples":     entry.get("group2_samples") or [],
+            "analysis_mode":      entry.get("analysis_mode"),
+            "test_method":        entry.get("test_method"),
+            "pathways":           entry.get("pathways"),
+            "enrichment_result_path": entry.get("enrichment_result_path", ""),
+            "plot_paths":         entry.get("plot_paths"),
+        }
+        return view, entry, notice
 
     # ── Plot type detection ───────────────────────────────────────────────────
 
@@ -189,14 +270,26 @@ class VisualizationAgent(BaseAgent):
 
     @_traceable(run_type="chain", name="viz.summary",
                 tags=["biomarker-discovery", "visualization"])
-    def _llm_visualization_summary(self, result: dict, state: BiomarkerState) -> str:
-        protein_source = state.get("top_biomarkers") or state.get("top_proteins") or []
+    def _llm_visualization_summary(
+        self,
+        result: dict,
+        state: BiomarkerState,
+        view: Optional[dict] = None,
+    ) -> str:
+        # view holds the analysis-specific fields we just visualised; fall back
+        # to state's legacy mirrors only if a view wasn't built (defensive).
+        v = view or {}
+        protein_source = v.get("top_biomarkers") or state.get("top_biomarkers") \
+                          or state.get("top_proteins") or []
         top10    = protein_source[:10]
-        pathways = (state.get("pathways") or [])[:5]
-        g1       = state.get("group1_label", "Group1")
-        g2       = state.get("group2_label", "Group2")
+        pathways = (v.get("pathways") or state.get("pathways") or [])[:5]
+        g1       = v.get("group1_label") or state.get("group1_label", "Group1")
+        g2       = v.get("group2_label") or state.get("group2_label", "Group2")
         plots    = result.get("plot_paths", [])
         plots_run = result.get("plots_run", [])
+        n_sig    = len([p for p in protein_source
+                        if p.get("significance") not in (None, "NS", "")]) \
+                   or state.get("n_significant", 0)
 
         protein_lines = self._format_protein_lines(top10)
         pathway_lines = "\n".join(
@@ -207,8 +300,8 @@ class VisualizationAgent(BaseAgent):
         ctx = (
             f"Visualization complete for {state.get('omic_type','proteomics')} analysis.\n"
             f"Comparison: {g1} vs {g2}\n"
-            f"Analysis mode: {state.get('analysis_mode','supervised')}\n"
-            f"Significant biomarkers: {state.get('n_significant', 0)}\n\n"
+            f"Analysis mode: {v.get('analysis_mode') or state.get('analysis_mode','supervised')}\n"
+            f"Significant biomarkers: {n_sig}\n\n"
             f"Plots generated ({len(plots)}):\n"
             + "\n".join(f"  - {Path(p).name}" for p in plots) + "\n\n"
             f"Plot types: {plots_run}\n\n"

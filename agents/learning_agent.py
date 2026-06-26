@@ -90,6 +90,15 @@ class DecisionSchema(BaseModel):
     # Write a complete, kind, professional question the user sees verbatim.
     clarification_question: Optional[str]           = None
 
+    # Target comparison — used by follow-up actions (run_visualization,
+    # run_enrichment, query_data, show_code) to disambiguate which past
+    # analysis the user is asking about in a multi-comparison session.
+    # Accepts a canonical comparison_id ("DMD_Quad_vs_BL6_Quad") OR a
+    # free-text label like "DMD vs BL6" — find_analysis() handles fuzzy match.
+    # Leave null when the user has not specified, or when the action does not
+    # reference a prior analysis.
+    target_comparison: Optional[str]                = None
+
     @field_validator("action")
     @classmethod
     def _validate_action(cls, v: str) -> str:
@@ -241,39 +250,104 @@ PAIRED DESIGN (set is_paired = true when user describes matched samples):
   "compare before and after treatment for each patient" → is_paired = true
   "paired t-test with samples matched by patient ID" → is_paired = true, test_method = "paired_t"
 
-Decision rules (in priority order):
-1.  Questions ("what is X", "explain X", "how does Y work", "what did the analysis find") → "answer"
-2.  Off-topic messages → "answer"
-3.  No data loaded yet → "answer" (tell user to upload a file first)
-4.  "show code" / "give me the code" / "what code was used" / "show me the query" /
-    "what query did you run" / "how did you get that answer" / "show the SQL" → "show_code"
-    (The handler picks between the analysis script and the most recent
+TARGET COMPARISON EXTRACTION — RARELY USED. Leave "target_comparison" null
+by default. The system always operates on the LATEST analysis: biomarkers,
+plots, pathways, and biological interpretation refer to whatever was just
+computed. Only populate "target_comparison" in the narrow case where the
+user EXPLICITLY references a past comparison by its group names AND a
+different analysis has since been run.
+
+  Populate examples (rare):
+    "show me the volcano plot for the WT vs KO analysis we did earlier"
+      → target_comparison = "WT vs KO"
+    "go back to the mdx vs WT results and show me enrichment"
+      → target_comparison = "mdx vs WT"
+
+  Leave null (the common case):
+    "show plots" / "show the volcano"          → null (uses latest)
+    "run enrichment"                            → null (uses latest)
+    "what are the top biomarkers?"              → null (uses latest)
+    "compare DMD Quad vs BL6 Quad"              → null (run_analysis with the
+                                                  groups; new analysis, not
+                                                  an addressing query)
+    "what is the most up-regulated protein"     → null (query_data on file)
+
+  Default behavior: target_comparison = null → all downstream operations use
+  the most recent completed analysis. This is what the user almost always
+  wants. Setting target_comparison without explicit reference is an error.
+
+Decision rules — evaluate IN ORDER and stop at the first match.
+Action-specific rules come BEFORE the generic "answer" fallback so questions
+that reference the user's actual file get routed to query_data, not answer.
+
+1.  No data loaded yet AND user asks anything that requires data → "answer"
+    (tell them to upload a file first). Skip every other rule.
+
+2.  File-grounded questions — anything that asks for a concrete value, cell,
+    sheet structure, or ranking that lives IN the user's file → "query_data".
+    Triggers: "what is the <metric/value> of X?", "fold change of X in A vs B?",
+    "most up/down-regulated protein in X vs Y?", "is X detected in Y?",
+    "top N proteins by intensity in <group>?", "how many sheets/columns/rows?",
+    "what is the MW / accession of X?", "which proteins have value 0 in Y?".
+    Even if phrased as a question, file-grounded questions are NEVER "answer".
+
+3.  Code or query inspection — "show code", "give me the code", "what code
+    was used", "show me the query", "what query did you run", "how did you
+    get that answer", "show the SQL" → "show_code".
+    (Handler picks between the analysis script and the most recent
     data-query snippet based on the user's phrasing.)
-5.  Re-run with new parameter values (see below) → "run_analysis" + fill parameter fields
-6.  "change the code to use X method" / "add a step to the script" → "modify_code"
-7.  "look up proteins" / "get gene names" / "annotate" / "UniProt" / "convert IDs" → "query_database"
-7b. Specific values, sheet structure, cell content, accession lookups, MW, intensity counts,
-    or detection-of-X-in-sample-Y questions about the uploaded FILE → "query_data"
-    (Distinguish from "answer": if the question is about a concrete value in the file
-    rather than a concept, definition, or analysis result, prefer "query_data".)
-7c. MULTI-QUESTION MESSAGES: Note — when the user pastes 2+ questions in one message,
-    the orchestrator splits them automatically and routes each question through this
-    same decision step. So just answer for the SINGLE question you receive; do not
-    worry about "the rest".
-8.  Pathway / enrichment / KEGG / GO → "run_enrichment"
-9.  Plot / visualize / chart / heatmap / volcano / report → "run_visualization"
-10. Data uploaded but NO analysis yet AND user says "run analysis", "analyse the
-    data", "do the analysis", "full analysis", "run all", "give me everything",
-    "comprehensive analysis" — anything generic without a named group pair →
-    "run_full_pipeline"
-11. After a full pipeline has already run, "run analysis" with no specific pair
-    repeats the pipeline (still "run_full_pipeline").
-12. "run analysis" / "analyze" with SPECIFIC group names (e.g. "Disease vs Control",
-    "DMD Quad vs BL6 Quad") → "run_analysis"
-    - Set group1_label, group1_samples, group2_label, group2_samples from available_columns.
-    - Leave sample lists empty if you cannot confidently match column names.
-13. "run all pairwise comparisons WITHOUT enrichment / plots" (explicit, rare) →
-    "run_all_comparisons"
+
+4.  Re-run with explicit threshold values ("re-run with p<0.01", "change
+    threshold to 0.01 and re-analyse", "use stricter cutoffs and run again")
+    → "run_analysis" + populate parameter fields (see PARAMETER EXTRACTION).
+    Use "modify_code" ONLY when the user wants a code-level change that
+    cannot be expressed as a threshold value.
+
+5.  External lookup — "look up proteins online", "annotate", "get gene names
+    from UniProt", "convert IDs" → "query_database".
+    If the user mentions a protein that IS in the loaded file, prefer
+    query_data — the file already carries names, accessions, gene symbols, MW.
+
+6.  Enrichment — "pathway", "enrichment", "KEGG", "GO", "Reactome",
+    "WikiPathways" → "run_enrichment".
+    Precondition: significant biomarkers exist (top_5_biomarkers present in
+    context). Otherwise ask_clarification.
+
+7.  Visualisation — "plot", "visualise", "chart", "heatmap", "volcano", "PCA",
+    "boxplot", "report" → "run_visualization". Populate requested_plots with
+    the specific plot names the user mentioned; leave [] for "all plots" /
+    unspecified.
+
+8.  Specific comparison — "run analysis" / "compare" / "analyse" with named
+    group(s) ("Disease vs Control", "DMD Quad vs BL6 Quad", "WT vs KO") →
+    "run_analysis".
+    Sample-list population:
+      • If `sample_to_group_map_present: YES` and `all_groups_assigned`
+        contains the named groups, COPY the sample lists from that map into
+        group1_samples / group2_samples. Do not leave them empty.
+      • Otherwise, populate from all_sample_columns only when you can match
+        column-name patterns to the group labels with high confidence; leave
+        empty if uncertain (ingestion will fill them in).
+
+9.  Multi-group ANOVA — "ANOVA across all groups", "compare WT, KO, and HET",
+    "test all groups simultaneously" → "run_analysis" with test_method="anova"
+    and populate all_groups (NOT group1_samples / group2_samples).
+
+10. Generic analysis request — "run analysis", "analyse the data", "do the
+    analysis", "full analysis", "run all", "give me everything",
+    "comprehensive analysis" with NO named group pair → "run_full_pipeline".
+    Applies whether or not a pipeline has already run.
+
+11. Explicit pairwise-only — "run all pairwise comparisons WITHOUT enrichment
+    / plots" (rare; user has to be explicit) → "run_all_comparisons".
+
+12. Conceptual / general-knowledge questions ("what is a t-test?", "explain
+    KEGG", "how does limma work?", "what is FDR?") and off-topic chat →
+    "answer". Use this as the FALLBACK when no specific action matches.
+
+MULTI-QUESTION MESSAGES: when the user pastes 2+ questions in one message,
+the orchestrator splits them automatically and routes each through this same
+decision step. Decide for the SINGLE question you receive; ignore "the rest".
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CLARIFICATION PHILOSOPHY  —  ask the user rather than assume anything uncertain
@@ -369,6 +443,100 @@ that CANNOT be done by adjusting a threshold value.
 
 For "run_analysis" populate groups only when you can confidently match column names to group labels.
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONFIDENCE CALIBRATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  0.95–1.00 — Schema-anchored: an action verb + explicit group names match
+               groups present in all_groups_assigned, or the message is a
+               clear conceptual question.
+  0.80–0.94 — Clear intent with one minor uncertainty (e.g. group name needs
+               fuzzy match; threshold mentioned but units unclear).
+  0.70–0.79 — Borderline. Prefer "ask_clarification" over guessing — running
+               the wrong analysis costs the user more than one extra turn.
+  < 0.70   — Auto-demoted to "answer". If you arrive here, you should
+              probably have routed to ask_clarification instead.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DISAMBIGUATION EXAMPLES  (commonly-misrouted patterns)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Pattern                                              | Action
+─────────────────────────────────────────────────────|─────────────────────
+"what is the most up-regulated protein in A vs B?"   | query_data
+"fold change of TTN in WT vs KO?"                    | query_data
+"is dystrophin detected in the DMD samples?"         | query_data
+"top 10 proteins by intensity in mdx group"          | query_data
+"explain what fold change means"                     | answer
+"how does limma differ from Welch?"                  | answer
+"what did the analysis find?"  (results in state)    | answer
+"run analysis"  (no groups named, no analysis yet)   | run_full_pipeline
+"give me a comprehensive analysis"                   | run_full_pipeline
+"compare DMD Quad vs BL6 Quad"                       | run_analysis
+"re-run with p<0.01"                                 | run_analysis (+adj_pval_cutoff=0.01)
+"add a step to the pipeline that filters by MW"      | modify_code
+"show me the code that produced this"                | show_code
+"look up SERPINA1 in UniProt"  (not in file)         | query_database
+"look up SERPINA1"  (IS in loaded file)              | query_data
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FEW-SHOT JSON OUTPUTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Example A — specific comparison with groups present in context
+Context excerpt: data_loaded=True, all_groups_assigned={"DMD_Quad":["s1","s2","s3"], "BL6_Quad":["s4","s5","s6"]}
+User: "Compare DMD Quad vs BL6 Quad"
+Output:
+{"action":"run_analysis","group1_label":"DMD_Quad","group1_samples":["s1","s2","s3"],
+ "group2_label":"BL6_Quad","group2_samples":["s4","s5","s6"],"requested_plots":[],
+ "confidence":0.97,"reason":"Named pair matches all_groups_assigned exactly.",
+ "adj_pval_cutoff":null,"log2fc_cutoff":null,"missing_threshold":null,"top_n":null,
+ "test_method":null,"is_paired":null,"all_groups":null,"omic_type":null,
+ "clarification_question":null}
+
+Example B — re-run with stricter threshold
+Context excerpt: analysis_complete=true
+User: "Re-run with p<0.01 and at least 2-fold change"
+Output:
+{"action":"run_analysis","group1_label":null,"group1_samples":[],"group2_label":null,
+ "group2_samples":[],"requested_plots":[],"confidence":0.95,
+ "reason":"Threshold override; reuse last analysis groups.",
+ "adj_pval_cutoff":0.01,"log2fc_cutoff":1.0,"missing_threshold":null,"top_n":null,
+ "test_method":null,"is_paired":null,"all_groups":null,"omic_type":null,
+ "clarification_question":null}
+
+Example C — file-grounded value question
+Context excerpt: data_loaded=True
+User: "What is the most up-regulated protein in mdx vs WT?"
+Output:
+{"action":"query_data","group1_label":null,"group1_samples":[],"group2_label":null,
+ "group2_samples":[],"requested_plots":[],"confidence":0.96,
+ "reason":"Ranking question computable from the file via fold-change SQL.",
+ "adj_pval_cutoff":null,"log2fc_cutoff":null,"missing_threshold":null,"top_n":null,
+ "test_method":null,"is_paired":null,"all_groups":null,"omic_type":null,
+ "clarification_question":null}
+
+Example D — generic full pipeline
+Context excerpt: data_loaded=True, analysis_complete=false
+User: "Just run the analysis"
+Output:
+{"action":"run_full_pipeline","group1_label":null,"group1_samples":[],"group2_label":null,
+ "group2_samples":[],"requested_plots":[],"confidence":0.92,
+ "reason":"Generic request, no named pair — run all pairwise + enrichment + plots.",
+ "adj_pval_cutoff":null,"log2fc_cutoff":null,"missing_threshold":null,"top_n":null,
+ "test_method":null,"is_paired":null,"all_groups":null,"omic_type":null,
+ "clarification_question":null}
+
+Example E — ambiguous comparison → clarify
+Context excerpt: data_loaded=True, all_groups_assigned={"WT":[...],"mdx":[...],"uDys5":[...],"H2":[...]}
+User: "Compare the groups"
+Output:
+{"action":"ask_clarification","group1_label":null,"group1_samples":[],"group2_label":null,
+ "group2_samples":[],"requested_plots":[],"confidence":0.95,
+ "reason":"Four groups present; user did not specify which pair or ANOVA.",
+ "adj_pval_cutoff":null,"log2fc_cutoff":null,"missing_threshold":null,"top_n":null,
+ "test_method":null,"is_paired":null,"all_groups":null,"omic_type":null,
+ "clarification_question":"I can see four groups in your data: **WT**, **mdx**, **uDys5**, **H2**. Which comparison would you like? Options:\n\n1. A specific pairwise comparison (e.g. *mdx vs WT*) — supervised DEA.\n2. **All pairwise comparisons** — produces a separate result for every pair.\n3. **One-way ANOVA across all four groups** — single F-test, good when you want to ask whether ANY group differs.\n\nJust let me know which fits your experiment!"}
+
 OUTPUT: valid JSON only — no markdown fences, no prose, no trailing text.
 {
   "action": "<action>",
@@ -387,18 +555,23 @@ OUTPUT: valid JSON only — no markdown fences, no prose, no trailing text.
   "is_paired": null,
   "all_groups": null,
   "omic_type": null,
-  "clarification_question": null
+  "clarification_question": null,
+  "target_comparison": null
 }
 
-For "ask_clarification": set "clarification_question" to the full question text
-(markdown supported). Leave all group/param fields null. Set confidence ≥ 0.9.
+For "ask_clarification": set "clarification_question" to the full question
+text (markdown supported). Leave all group/param fields null. Use confidence
+≥ 0.9 (you ARE confident the right move is to ask).
 
-"confidence" is a float 0.0–1.0. Decisions with confidence < 0.7 are auto-demoted to "answer".
+For "run_visualization": populate "requested_plots" with canonical plot names
+the user asked for. Leave it empty [] if the user wants all standard plots
+or was not specific.
+Available plot names: volcano, ma_plot, heatmap, pca, boxplot,
+sample_correlation, cv_distribution, fc_heatmap, topn_bar, rescue_bar,
+pathway_dotplot.
 
-For "run_visualization": populate "requested_plots" with canonical plot names the user asked for.
-Leave it empty [] if the user wants all standard plots or was not specific.
-Available plot names: volcano, ma_plot, heatmap, pca, boxplot, sample_correlation,
-cv_distribution, fc_heatmap, topn_bar, rescue_bar, pathway_dotplot.
+omic_type accepts ONLY "proteomics" (other values will be silently dropped).
+Leave it null unless the user explicitly asserts the omic type.
 """
 
 _ANSWER_SYSTEM_PROMPT = """\
@@ -443,7 +616,15 @@ RULE 4 — NO INVENTED IDENTIFIERS:
   Do NOT invent protein names, gene symbols, accession IDs, or pathway names
   that are not grounded in the session context or your verified training knowledge.
 
-RULE 5 — FORMAT:
+RULE 5 — COMPUTATIONAL NEXT STEPS ONLY:
+  This is a computational pipeline. When suggesting follow-up actions, only
+  recommend in-silico steps the platform can perform: additional comparisons,
+  alternate statistical tests, threshold sweeps, pathway enrichment, additional
+  plots, UniProt cross-reference, sub-group re-analysis. Do NOT suggest wet-lab
+  follow-up (Western blot, qPCR, IHC, ELISA, knockout, animal study, MS
+  re-acquisition) unless the user explicitly asks for experimental validation.
+
+RULE 6 — FORMAT:
   Use markdown formatting. Be concise and precise. For session-data summaries,
   present actual numbers from the context (n_proteins, n_samples, sample_columns, etc.)
   rather than generic descriptions.
@@ -686,6 +867,28 @@ class LearningAgent(BaseAgent):
 
         if top_bm:
             ctx += f"  top_5_biomarkers: {[b.get('protein','') for b in top_bm[:5]]}\n"
+
+        # Multi-comparison history — for awareness only. By default, all
+        # follow-up actions (viz, enrichment, query, answer) act on the
+        # LATEST analysis (the last entry here). target_comparison should
+        # remain null unless the user explicitly references a past comparison.
+        analyses_state = state.get("analyses") or []
+        if analyses_state:
+            latest = analyses_state[-1]
+            ctx += (
+                f"  latest_analysis: {latest.get('comparison_id','?')} "
+                f"(n_sig={latest.get('n_significant',0)}, "
+                f"method={latest.get('test_method') or 'auto'})\n"
+            )
+            older = analyses_state[:-1]
+            if older:
+                ids = [a.get('comparison_id','?') for a in older[-6:]]
+                ctx += f"  previous_analyses ({len(older)} earlier): {ids}\n"
+                ctx += (
+                    "  → ALL downstream actions default to latest_analysis. "
+                    "Only set target_comparison when the user EXPLICITLY "
+                    "asks to revisit a previous comparison by name.\n"
+                )
 
         # Include last 5 conversation turns so the LLM knows what was recently discussed
         recent = _recent_messages(state.get("messages") or [], n=5)
@@ -1624,7 +1827,10 @@ class LearningAgent(BaseAgent):
                     # answer, ask_clarification, run_*, load_data — all fall through
                     # to the conversational answer path for sub-questions, since we
                     # don't want side-effects like re-running analysis 30 times.
-                    sub_state = self._answer(sub_state)
+                    sub_state = self._answer(
+                        sub_state,
+                        target_comparison=sub_decision.get("target_comparison"),
+                    )
 
                 last = next(
                     (m["content"] for m in reversed(sub_state.get("messages") or [])
@@ -2169,7 +2375,11 @@ class LearningAgent(BaseAgent):
 
     @_traceable(run_type="chain", name="orchestrator.answer",
                 tags=["biomarker-discovery", "answer"])
-    def _answer(self, state: BiomarkerState) -> BiomarkerState:
+    def _answer(
+        self,
+        state: BiomarkerState,
+        target_comparison: Optional[str] = None,
+    ) -> BiomarkerState:
         """
         Answer any question using full session context + LLM knowledge.
 
@@ -2177,8 +2387,22 @@ class LearningAgent(BaseAgent):
           • Injects actual biomarker list as a grounding anchor so the LLM
             cannot fabricate protein names or statistics that differ from what
             was computed.
+          • When ``target_comparison`` is supplied (and matches a stored
+            analysis), the grounding biomarker/pathway list is read from that
+            specific entry in state["analyses"] — so "top 10 in WT vs KO"
+            doesn't accidentally surface results from the most-recent run.
         """
+        # Resolve which past analysis (if any) the user is asking about.
+        from core.state import find_analysis as _find_analysis
+        target_entry = _find_analysis(state, target_comparison) if target_comparison else None
+
         ctx = ["## Session context (ONLY use this when answering questions about the user's data)"]
+        if target_comparison and target_entry is None and (state.get("analyses") or []):
+            ctx.append(
+                f"_Note: the user mentioned '**{target_comparison}**' but no "
+                f"saved analysis matched. Falling back to the most recent run._"
+            )
+            target_entry = (state.get("analyses") or [])[-1]
         if state.get("data_type"):
             sample_cols  = state.get("sample_columns") or []
             meta_cols    = state.get("metadata_columns") or []
@@ -2247,27 +2471,57 @@ class LearningAgent(BaseAgent):
         else:
             ctx.append("- Data loaded: NO — user has not uploaded a file yet")
 
-        # ── Grounding anchor: inject actual values so LLM cannot hallucinate ──
-        # This is the primary hallucination guard for session-specific claims.
-        if state.get("top_biomarkers"):
-            ctx.append("\n## Grounded biomarker data (cite ONLY from this list)")
-            for b in (state.get("top_biomarkers") or [])[:25]:
+        # ── Grounding anchor: inject ONLY the latest analysis's data ──────────
+        # Single source of truth for the active session context. Pathways and
+        # biomarkers must come from the SAME analysis or the LLM will mix them.
+        # Resolution priority:
+        #   1. target_entry — only set when user EXPLICITLY named a past comparison
+        #   2. The last entry in state["analyses"] — the most recent analysis
+        #   3. The legacy mirror fields (top_biomarkers, pathways) as a final fallback
+        analyses_state = state.get("analyses") or []
+        active_entry   = target_entry or (analyses_state[-1] if analyses_state else None)
+
+        if active_entry is not None:
+            ground_biomarkers = active_entry.get("top_biomarkers") or []
+            ground_pathways   = active_entry.get("pathways") or []
+            active_cmp_id     = active_entry.get("comparison_id")
+        else:
+            ground_biomarkers = state.get("top_biomarkers") or []
+            ground_pathways   = state.get("pathways") or []
+            active_cmp_id     = None
+
+        if ground_biomarkers:
+            label = (
+                f"\n## Grounded biomarker data — latest analysis `{active_cmp_id}` "
+                "(cite ONLY from this list)"
+                if active_cmp_id
+                else "\n## Grounded biomarker data (cite ONLY from this list)"
+            )
+            ctx.append(label)
+            for b in ground_biomarkers[:25]:
                 protein = b.get("protein", "")
                 lfc     = b.get("log2_fold_change", b.get("rescue_score", "?"))
                 adjp    = b.get("adj_p_value", "?")
                 ctx.append(f"  - {protein}  log2FC={lfc}  adj_p={adjp}")
             ctx.append(
                 "CRITICAL: Do not mention any protein name, fold-change value, or "
-                "p-value that is not listed above."
+                "p-value that is not listed above. All current results refer to "
+                "the LATEST analysis. Do not surface biomarkers or pathways from "
+                "older comparisons unless the user explicitly asked for them."
             )
 
-        if state.get("pathways"):
-            ctx.append("\n## Grounded pathway data (cite ONLY from this list)")
-            for p in (state.get("pathways") or [])[:10]:
+        if ground_pathways:
+            ctx.append("\n## Grounded pathway data (from the same latest analysis)")
+            for p in ground_pathways[:10]:
                 ctx.append(
                     f"  - {p.get('pathway','')}  "
                     f"adj_p={p.get('p_adjust', p.get('adj_p','?'))}"
                 )
+        elif ground_biomarkers:
+            ctx.append(
+                "\n_Pathway enrichment has not been run for the latest analysis. "
+                "Suggest running enrichment if the user asks about pathways._"
+            )
 
         # Last 20 messages, with long content truncated to avoid token overflow
         history = _recent_messages(state.get("messages") or [], n=20, truncate_at=600)
@@ -2499,12 +2753,18 @@ class LearningAgent(BaseAgent):
 
         # ── Enrichment ────────────────────────────────────────────────────────
         if action == "run_enrichment":
-            return self._specialist("enrichment").run(state)
+            target = decision.get("target_comparison")
+            return self._specialist("enrichment").run(state, target_comparison=target)
 
         # ── Visualisation ──────────────────────────────────────────────────────
         if action == "run_visualization":
             requested_plots = decision.get("requested_plots") or []
-            return self._specialist("visualization").run(state, requested_plots=requested_plots or None)
+            target          = decision.get("target_comparison")
+            return self._specialist("visualization").run(
+                state,
+                requested_plots=requested_plots or None,
+                target_comparison=target,
+            )
 
         # ── Code display ──────────────────────────────────────────────────────
         if action == "show_code":
@@ -2523,4 +2783,4 @@ class LearningAgent(BaseAgent):
             return self._query_data(state)
 
         # ── Answer (default) ──────────────────────────────────────────────────
-        return self._answer(state)
+        return self._answer(state, target_comparison=decision.get("target_comparison"))

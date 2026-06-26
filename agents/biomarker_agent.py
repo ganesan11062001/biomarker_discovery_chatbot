@@ -22,12 +22,14 @@ No other changes are needed.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
-from core.state import BiomarkerState
+from core.io_utils import read_csv_safe
+from core.state import BiomarkerState, make_comparison_id
 from core.tracing import get_biomarker_metadata
 from skills.omics_registry import OmicsSkillRegistry
 from skills.proteomics_analysis import ProteomicsAnalysisSkill
@@ -91,6 +93,21 @@ class BiomarkerAgent(BaseAgent):
                 "No data loaded. Please upload a file first.",
                 "No data found. Please upload your file before running analysis.",
             )
+
+        # ── Clear stale downstream artifacts from any previous analysis ───────
+        # Every new analysis run replaces the active session context. Pathway
+        # enrichment, plots, and biological interpretation from a prior run
+        # are NOT valid for this run's biomarker list — so they're cleared.
+        # If the user wants pathways/plots for this new analysis, they request
+        # those next and the corresponding agent will repopulate.
+        for stale_field in (
+            "pathways",
+            "enrichment_result_path",
+            "plot_paths",
+            "report_path",
+            "biological_interpretation",
+        ):
+            state.pop(stale_field, None)
 
         # ── Route to the correct omic skill ──────────────────────────────────
         # The canonical 2-sheet template is intensity-only proteomics; legacy
@@ -301,6 +318,15 @@ class BiomarkerAgent(BaseAgent):
         except Exception as exc:
             logger.warning("Domain expert interpretation failed: %s", exc)
 
+        # ── Snapshot this analysis into state["analyses"] history ──────────────
+        # Each call to BiomarkerAgent.run() appends one entry so multi-comparison
+        # sessions can recall a specific analysis later by comparison_id or
+        # by fuzzy "g1 vs g2" match. The legacy single-valued state fields
+        # (top_biomarkers, excel_path, plot_paths) keep mirroring the most
+        # recent entry for backward-compat with older code paths.
+        self._append_to_history(state, g1=g1, g2=g2, mode=mode,
+                                test_method=_test_method, result=result)
+
         logger.info(
             "Analysis complete | session=%s omic=%s significant=%d",
             state.get("session_id"), omic_type, result["n_significant"],
@@ -345,7 +371,7 @@ class BiomarkerAgent(BaseAgent):
 
         # Load the CSV the Python skill consumed (already cleaned by ingestion)
         try:
-            expr_df = pd.read_csv(state["data_path"], index_col=0)
+            expr_df = read_csv_safe(state["data_path"], index_col=0)
             expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
         except Exception as exc:
             logger.warning("Could not reload expression CSV for R: %s", exc)
@@ -399,7 +425,7 @@ class BiomarkerAgent(BaseAgent):
             inter_df = dual["intersected"]
         else:
             try:
-                expr_df = pd.read_csv(state["data_path"], index_col=0)
+                expr_df = read_csv_safe(state["data_path"], index_col=0)
                 expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
                 inter_df = None
             except Exception as exc:
@@ -433,6 +459,50 @@ class BiomarkerAgent(BaseAgent):
             log2fc_cutoff    = log2fc_cutoff,
         )
         return suite
+
+    # ── History management ────────────────────────────────────────────────────
+
+    def _append_to_history(
+        self,
+        state: BiomarkerState,
+        g1: list,
+        g2: list,
+        mode: str,
+        test_method: str,
+        result: Dict[str, Any],
+    ) -> None:
+        """Append a frozen snapshot of this analysis to state["analyses"].
+
+        If an entry with the same comparison_id already exists, it is replaced
+        rather than duplicated — so re-running the same comparison with new
+        thresholds updates in place instead of bloating the list.
+        """
+        g1_label = state.get("group1_label") or "Group1"
+        g2_label = state.get("group2_label") or "Group2"
+        cmp_id   = make_comparison_id(g1_label, g2_label)
+
+        entry: Dict[str, Any] = {
+            "comparison_id":   cmp_id,
+            "group1_label":    g1_label,
+            "group2_label":    g2_label,
+            "group1_samples":  list(g1),
+            "group2_samples":  list(g2),
+            "analysis_mode":   mode,
+            "test_method":     test_method,
+            "top_biomarkers":  list(state.get("top_biomarkers") or []),
+            "n_significant":   int(state.get("n_significant") or 0),
+            "excel_path":      state.get("excel_path"),
+            "plot_paths":      state.get("plot_paths") or {},
+            "qc_summary":      result.get("qc_summary") or {},
+            "analysis_summary": state.get("analysis_summary"),
+            "biological_interpretation": state.get("biological_interpretation"),
+            "timestamp":       datetime.now(timezone.utc).isoformat(),
+        }
+
+        history = list(state.get("analyses") or [])
+        history = [a for a in history if a.get("comparison_id") != cmp_id]
+        history.append(entry)
+        state["analyses"] = history
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

@@ -17,7 +17,8 @@ import pandas as pd
 
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
-from core.state import BiomarkerState
+from core.io_utils import read_csv_safe
+from core.state import BiomarkerState, find_analysis
 from core.tracing import get_enrichment_metadata
 from skills.run_enrichment import PathwaySkill
 
@@ -71,7 +72,11 @@ class EnrichmentAgent(BaseAgent):
 
     @_traceable(run_type="chain", name="agent.enrichment",
                 tags=["biomarker-discovery", "enrichment"])
-    def run(self, state: BiomarkerState) -> BiomarkerState:
+    def run(
+        self,
+        state: BiomarkerState,
+        target_comparison: Optional[str] = None,
+    ) -> BiomarkerState:
         rt = _get_run_tree()
         if rt is not None:
             try:
@@ -79,7 +84,12 @@ class EnrichmentAgent(BaseAgent):
             except Exception:
                 pass
 
-        protein_source = state.get("top_biomarkers") or state.get("top_proteins")
+        # ── Resolve which past analysis we are enriching ─────────────────────
+        view, analysis_entry, fallback_notice = self._resolve_view(state, target_comparison)
+        if fallback_notice:
+            state["messages"].append({"role": "assistant", "content": fallback_notice})
+
+        protein_source = view.get("top_biomarkers") or []
         if not protein_source:
             msg = self._llm_no_data()
             state["status"]        = "error"
@@ -114,7 +124,7 @@ class EnrichmentAgent(BaseAgent):
         # Background: all measured proteins from the experiment
         background_proteins = self._get_background_proteins(state)
 
-        results_path = state.get("excel_path") or state.get("dea_result_path") or ""
+        results_path = view.get("excel_path") or state.get("dea_result_path") or ""
 
         try:
             result = self.pathway_skill.execute(
@@ -129,10 +139,15 @@ class EnrichmentAgent(BaseAgent):
             state["enrichment_result_path"] = result["enrichment_result_path"]
             state["pathways"]               = result["top_pathways"]
             state["status"]                 = "enrichment_complete"
+            # Persist enrichment back to the matching analysis entry so future
+            # "show enrichment for X vs Y" calls return the same set.
+            if analysis_entry is not None:
+                analysis_entry["pathways"]               = result["top_pathways"]
+                analysis_entry["enrichment_result_path"] = result["enrichment_result_path"]
 
             msg = self._llm_enrichment_summary(result, state, sig_proteins,
                                                up_proteins, down_proteins,
-                                               background_proteins)
+                                               background_proteins, view)
             state["messages"].append({"role": "assistant", "content": msg})
 
             logger.info(
@@ -162,6 +177,50 @@ class EnrichmentAgent(BaseAgent):
 
         return state
 
+    # ── Target-analysis resolution ────────────────────────────────────────────
+
+    def _resolve_view(
+        self,
+        state: BiomarkerState,
+        target_comparison: Optional[str],
+    ) -> tuple:
+        """Return ``(view, analysis_entry, fallback_notice)``.
+
+        When state["analyses"] is non-empty we resolve the target (or use most
+        recent) and read group labels + biomarker list from that entry. For
+        legacy single-analysis sessions we mirror the state's legacy fields.
+        """
+        analyses = state.get("analyses") or []
+        notice   = None
+
+        if not analyses:
+            view = {
+                "top_biomarkers": state.get("top_biomarkers") or state.get("top_proteins") or [],
+                "excel_path":     state.get("excel_path"),
+                "group1_label":   state.get("group1_label", "Group1"),
+                "group2_label":   state.get("group2_label", "Group2"),
+            }
+            return view, None, None
+
+        entry = find_analysis(state, target_comparison)
+        if entry is None and target_comparison:
+            entry  = analyses[-1]
+            notice = (
+                f"_I couldn't find a saved analysis matching "
+                f"**{target_comparison}** — using the most recent analysis "
+                f"(**{entry.get('comparison_id','?')}**) instead._"
+            )
+        elif entry is None:
+            entry = analyses[-1]
+
+        view = {
+            "top_biomarkers": entry.get("top_biomarkers") or [],
+            "excel_path":     entry.get("excel_path"),
+            "group1_label":   entry.get("group1_label", "Group1"),
+            "group2_label":   entry.get("group2_label", "Group2"),
+        }
+        return view, entry, notice
+
     # ── Background extraction ─────────────────────────────────────────────────
 
     def _get_background_proteins(self, state: BiomarkerState) -> Optional[List[str]]:
@@ -170,7 +229,7 @@ class EnrichmentAgent(BaseAgent):
         if not data_path:
             return None
         try:
-            col = pd.read_csv(data_path, usecols=[0], header=0).iloc[:, 0]
+            col = read_csv_safe(data_path, usecols=[0], header=0).iloc[:, 0]
             proteins = [str(p) for p in col.tolist() if pd.notna(p) and str(p).strip()]
             logger.info("Background: %d measured proteins from data file", len(proteins))
             return proteins or None
@@ -190,9 +249,11 @@ class EnrichmentAgent(BaseAgent):
         up_proteins: List[str],
         down_proteins: List[str],
         background_proteins: Optional[List[str]],
+        view: Optional[dict] = None,
     ) -> str:
-        g1      = state.get("group1_label", "Group1")
-        g2      = state.get("group2_label", "Group2")
+        v       = view or {}
+        g1      = v.get("group1_label") or state.get("group1_label", "Group1")
+        g2      = v.get("group2_label") or state.get("group2_label", "Group2")
         omic    = state.get("omic_type", "proteomics")
         organism = state.get("organism", "human")
         bg_size = result.get("background_size") or (len(background_proteins) if background_proteins else "genome-wide")

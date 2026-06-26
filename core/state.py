@@ -21,9 +21,89 @@ Supported omic types
 """
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph.message import add_messages
+
+
+# ── Comparison helpers ────────────────────────────────────────────────────────
+
+def make_comparison_id(group1_label: str, group2_label: str) -> str:
+    """Canonical slug used as the key for an analysis entry in state['analyses'].
+
+    Normalises whitespace and unsafe characters so the same comparison resolves
+    to the same id regardless of how the user types it. Order matters
+    (group1_vs_group2 ≠ group2_vs_group1) because fold-change sign depends on it.
+    """
+    def _slug(label: str) -> str:
+        s = re.sub(r"\s+", "_", (label or "").strip())
+        s = re.sub(r"[^A-Za-z0-9_]+", "", s)
+        return s or "Group"
+    return f"{_slug(group1_label)}_vs_{_slug(group2_label)}"
+
+
+def _normalise_for_match(s: str) -> str:
+    """Lower-case, strip punctuation, collapse whitespace — used for fuzzy match."""
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def find_analysis(
+    state: "BiomarkerState",
+    target: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolve which entry in state['analyses'] the user is asking about.
+
+    Resolution order:
+      1. None / empty target → most recent entry (last appended).
+      2. Exact comparison_id match.
+      3. Fuzzy match against "<g1> vs <g2>" — checks both label orders so
+         "WT vs KO" finds the entry stored as KO_vs_WT too.
+      4. Single-label match — if `target` contains only one group name and
+         exactly one entry has that group as g1 or g2, return that entry.
+
+    Returns None when no entries exist OR no fuzzy/exact match is found.
+    """
+    analyses = state.get("analyses") or []
+    if not analyses:
+        return None
+    if not target or not target.strip():
+        return analyses[-1]
+
+    # Exact id match
+    for a in analyses:
+        if a.get("comparison_id") == target:
+            return a
+
+    norm_target = _normalise_for_match(target)
+
+    # Fuzzy match against both label orders
+    for a in analyses:
+        g1 = _normalise_for_match(a.get("group1_label", ""))
+        g2 = _normalise_for_match(a.get("group2_label", ""))
+        if not g1 or not g2:
+            continue
+        forward  = f"{g1} vs {g2}"
+        backward = f"{g2} vs {g1}"
+        if forward in norm_target or backward in norm_target:
+            return a
+        # Also accept "g1 g2" / "g2 g1" without "vs"
+        if g1 in norm_target and g2 in norm_target:
+            return a
+
+    # Single-label fallback — only when exactly one entry mentions the label
+    candidates = []
+    for a in analyses:
+        g1 = _normalise_for_match(a.get("group1_label", ""))
+        g2 = _normalise_for_match(a.get("group2_label", ""))
+        if g1 and g1 in norm_target:
+            candidates.append(a)
+        elif g2 and g2 in norm_target:
+            candidates.append(a)
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None
 
 
 class BiomarkerState(TypedDict, total=False):
@@ -108,7 +188,10 @@ class BiomarkerState(TypedDict, total=False):
     qc_passed:  Optional[bool]
     qc_summary: Optional[Dict[str, Any]]
 
-    # ── Analysis results (generic — omic-type agnostic) ───────────────────────
+    # ── Analysis results — MOST RECENT analysis (legacy / convenience mirrors) ──
+    # These mirror the *most recent* entry in `analyses`. They exist so older
+    # code paths keep working without scanning the history list. Authoritative
+    # source for multi-analysis sessions is `analyses` below.
     top_biomarkers:   Optional[List[Dict[str, Any]]] # ranked biomarker list
     n_significant:    Optional[int]
     excel_path:       Optional[str]                  # formatted Excel report
@@ -122,13 +205,38 @@ class BiomarkerState(TypedDict, total=False):
     top_proteins:    Optional[List[Dict]]   # mirrors top_biomarkers
     dea_result_path: Optional[str]          # legacy CSV path
 
-    # ── Enrichment results ────────────────────────────────────────────────────
+    # ── Enrichment results (most-recent mirror) ───────────────────────────────
     enrichment_result_path: Optional[str]
     pathways:               Optional[List[Dict]]
 
-    # ── Visualization output ──────────────────────────────────────────────────
+    # ── Visualization output (most-recent mirror) ─────────────────────────────
     plot_paths:  Optional[List[str]]
     report_path: Optional[str]
+
+    # ── Multi-comparison history ──────────────────────────────────────────────
+    # Each entry is one completed analysis. Filled by BiomarkerAgent on every
+    # run (including each pair of `_run_all_comparisons`). Downstream agents
+    # (visualization, enrichment, query) consult this list when the user asks
+    # about a specific comparison ("plots for X vs Y", "top 10 in A vs B").
+    # Entry shape:
+    #   {
+    #     "comparison_id":   "DMD_Quad_vs_BL6_Quad",   # canonical slug
+    #     "group1_label":    "DMD_Quad",
+    #     "group2_label":    "BL6_Quad",
+    #     "group1_samples":  [...], "group2_samples": [...],
+    #     "analysis_mode":   "supervised" | "unsupervised",
+    #     "test_method":     "limma" | "welch" | ...,
+    #     "top_biomarkers":  [...],
+    #     "n_significant":   123,
+    #     "excel_path":      "...",
+    #     "plot_paths":      ["..."],
+    #     "pathways":        [...],            # filled by EnrichmentAgent later
+    #     "enrichment_result_path": "...",     # filled by EnrichmentAgent later
+    #     "analysis_summary":  "...",
+    #     "biological_interpretation": "...",
+    #     "timestamp":       "ISO8601",
+    #   }
+    analyses: Optional[List[Dict[str, Any]]]
 
     # ── Status ────────────────────────────────────────────────────────────────
     status:        Optional[str]
