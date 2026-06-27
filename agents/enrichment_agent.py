@@ -11,7 +11,8 @@ Design:
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -80,6 +81,10 @@ class EnrichmentAgent(BaseAgent):
                 pass
 
         protein_source = state.get("top_biomarkers") or state.get("top_proteins")
+
+        # If user chose "all", read the full results from the Excel file
+        if state.get("enrichment_scope") == "all" and state.get("excel_path"):
+            protein_source = self._load_all_significant(state) or protein_source
         if not protein_source:
             msg = self._llm_no_data()
             state["status"]        = "error"
@@ -130,10 +135,23 @@ class EnrichmentAgent(BaseAgent):
             state["pathways"]               = result["top_pathways"]
             state["status"]                 = "enrichment_complete"
 
+            # Store reproducible enrichment code for "show code"
+            state["analysis_code"] = self._build_enrichment_code(
+                protein_list, up_proteins, down_proteins,
+                background_proteins, state,
+            )
+
+            # Generate pathway dotplot
+            self._generate_pathway_plot(state, result)
+
             msg = self._llm_enrichment_summary(result, state, sig_proteins,
                                                up_proteins, down_proteins,
                                                background_proteins)
-            state["messages"].append({"role": "assistant", "content": msg})
+            state["messages"].append({
+                "role": "assistant",
+                "content": msg,
+                "has_plots": bool(state.get("plot_paths")),
+            })
 
             logger.info(
                 "Enrichment complete | session=%s sig=%d up=%d down=%d kegg=%d go=%d bg=%s",
@@ -161,6 +179,32 @@ class EnrichmentAgent(BaseAgent):
             state["messages"].append({"role": "assistant", "content": msg})
 
         return state
+
+    # ── Load all significant proteins from Excel ─────────────────────────────
+
+    @staticmethod
+    def _load_all_significant(state: BiomarkerState) -> Optional[List[Dict]]:
+        """Read the 'All Results' sheet from the analysis Excel and return
+        all proteins that passed significance filters."""
+        excel_path = state.get("excel_path")
+        if not excel_path:
+            return None
+        try:
+            df = pd.read_excel(excel_path, sheet_name="All Results")
+            sig = df[df["significance"].notna() & (df["significance"] != "NS")]
+            if sig.empty:
+                sig = df
+            records = sig.to_dict("records")
+            logger.info(
+                "Enrichment scope=all: loaded %d significant proteins from Excel "
+                "(vs %d in top_biomarkers)",
+                len(records),
+                len(state.get("top_biomarkers") or []),
+            )
+            return records
+        except Exception as exc:
+            logger.warning("Could not read All Results from Excel: %s", exc)
+            return None
 
     # ── Background extraction ─────────────────────────────────────────────────
 
@@ -276,6 +320,65 @@ class EnrichmentAgent(BaseAgent):
             return self._call_llm(messages, max_tokens=150)
         except Exception:
             return f"Pathway enrichment failed: {error_text}"
+
+    # ── Pathway dotplot ──────────────────────────────────────────────────────
+
+    def _generate_pathway_plot(self, state: BiomarkerState, result: Dict) -> None:
+        """Generate a pathway dotplot and store paths in state."""
+        try:
+            from skills.run_visualization import plot_pathway_dot
+            stem = state.get("session_id") or "session"
+            out_dir = str(Path(settings.output_dir) / "plots" / stem)
+            path = plot_pathway_dot(
+                pathways=result.get("top_pathways", []),
+                stem=stem,
+                output_dir=out_dir,
+            )
+            if path:
+                plot_paths = list(state.get("plot_paths") or [])
+                plot_paths.append(path)
+                state["plot_paths"] = plot_paths
+                logger.info("Pathway dotplot generated: %s", path)
+        except Exception as exc:
+            logger.warning("Pathway dotplot generation failed: %s", exc)
+
+    # ── Reproducible code ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_enrichment_code(
+        protein_list: List[str],
+        up_proteins: List[str],
+        down_proteins: List[str],
+        background: Optional[List[str]],
+        state: BiomarkerState,
+    ) -> str:
+        organism = state.get("organism", "human")
+        g1 = state.get("group1_label", "Group1")
+        g2 = state.get("group2_label", "Group2")
+        return (
+            f"import gseapy as gp\n\n"
+            f"# Pathway enrichment: {g1} vs {g2}\n"
+            f"# Organism: {organism}\n"
+            f"# Significant proteins submitted: {len(protein_list)}\n"
+            f"#   Up-regulated (higher in {g2}):   {len(up_proteins)}\n"
+            f"#   Down-regulated (higher in {g1}): {len(down_proteins)}\n"
+            f"# Background: {len(background) if background else 'genome-wide'} proteins\n\n"
+            f"gene_list = {protein_list[:10]!r}  # ... ({len(protein_list)} total)\n"
+            f"background = {background[:5]!r}  # ... ({len(background)} total)\n\n" if background else
+            f"gene_list = {protein_list[:10]!r}  # ... ({len(protein_list)} total)\n\n"
+            f"libraries = ['KEGG_2021_Human', 'GO_Biological_Process_2023',\n"
+            f"             'Reactome_2022', 'WikiPathways_2023_Human']\n\n"
+            f"for lib in libraries:\n"
+            f"    enr = gp.enrichr(\n"
+            f"        gene_list=gene_list,\n"
+            f"        gene_sets=lib,\n"
+            f"        organism='{organism}',\n"
+            f"        background=background if background else 20000,\n"
+            f"        cutoff=0.05,\n"
+            f"    )\n"
+            f"    sig = enr.results[enr.results['Adjusted P-value'] <= 0.05]\n"
+            f"    print(f'{{lib}}: {{len(sig)}} significant terms')\n"
+        )
 
     # ── Fallback ──────────────────────────────────────────────────────────────
 

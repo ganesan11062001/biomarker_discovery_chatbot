@@ -911,17 +911,26 @@ def _render_interactive_plots(session_id: str, plot_paths: list[str]) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _render_quick_actions(session_id: str, astate: dict) -> str | None:
-    data_loaded   = bool(astate.get("data_type"))
-    analysis_done = bool(astate.get("excel_path"))
+    data_loaded      = bool(astate.get("data_type"))
+    analysis_done    = bool(astate.get("excel_path"))
+    enrichment_done  = bool(astate.get("enrichment_result_path"))
 
     if analysis_done:
-        actions = [
-            "Summarise results",
-            "Show top 10 biomarkers",
-            "Generate standard plots",
-            "Run pathway enrichment",
-            "Show analysis code",
-        ]
+        if enrichment_done:
+            actions = [
+                "Summarise results",
+                "Show top 10 biomarkers",
+                "Generate standard plots",
+                "Show analysis code",
+            ]
+        else:
+            actions = [
+                "Summarise results",
+                "Show top 10 biomarkers",
+                "Generate standard plots",
+                "Run pathway enrichment",
+                "Show analysis code",
+            ]
     elif data_loaded:
         actions = [
             "Run all comparisons",
@@ -931,7 +940,7 @@ def _render_quick_actions(session_id: str, astate: dict) -> str | None:
     else:
         return None
 
-    # Excel download — shown alongside quick actions when available
+    # Results download — shown alongside quick actions when available
     excel_path = astate.get("excel_path")
     if excel_path and session_id:
         dl_col, chips_col = st.columns([1, 4])
@@ -939,11 +948,19 @@ def _render_quick_actions(session_id: str, astate: dict) -> str | None:
             try:
                 r = requests.get(f"{API_BASE}/results/{session_id}/excel", timeout=20)
                 if r.status_code == 200:
+                    if enrichment_done:
+                        dl_label = "⬇ Download Enrichment"
+                        dl_name  = f"enrichment_{session_id[:8]}.csv"
+                        dl_mime  = "text/csv"
+                    else:
+                        dl_label = "⬇ Download Excel"
+                        dl_name  = f"biomarkers_{session_id[:8]}.xlsx"
+                        dl_mime  = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     st.download_button(
-                        "⬇ Download Excel",
+                        dl_label,
                         data=r.content,
-                        file_name=f"biomarkers_{session_id[:8]}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        file_name=dl_name,
+                        mime=dl_mime,
                     )
             except Exception:
                 pass
@@ -1082,6 +1099,7 @@ def _render_main() -> None:
                              or new_astate.get("intent") or "").lower()
                 plot_producing_turn = intent in {
                     "run_analysis", "run_visualization", "run_full_pipeline",
+                    "run_enrichment",
                 }
                 has_plots = bool(new_plots - old_plots) or (plot_producing_turn and bool(new_plots))
 

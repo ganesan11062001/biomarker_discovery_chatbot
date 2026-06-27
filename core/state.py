@@ -124,6 +124,7 @@ class BiomarkerState(TypedDict, total=False):
 
     # ── Enrichment results ────────────────────────────────────────────────────
     enrichment_result_path: Optional[str]
+    enrichment_scope:       Optional[str]   # "top_n" | "all" — user choice for gene set
     pathways:               Optional[List[Dict]]
 
     # ── Visualization output ──────────────────────────────────────────────────

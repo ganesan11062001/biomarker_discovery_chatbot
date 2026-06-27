@@ -2305,6 +2305,19 @@ class LearningAgent(BaseAgent):
         user_query = state.get("user_query", "")
         state["messages"].append({"role": "user", "content": user_query})
 
+        # ── Handle pending enrichment scope response ─────────────────────────
+        if state.get("status") == "awaiting_enrichment_scope":
+            uq = user_query.lower()
+            if any(w in uq for w in ("all", "2", "every", "full", "complete")):
+                state["enrichment_scope"] = "all"
+                self.logger.info("Enrichment scope: all significant proteins")
+            else:
+                state["enrichment_scope"] = "top_n"
+                self.logger.info("Enrichment scope: top N biomarkers only")
+            state["status"] = "ready"
+            state["intent"] = "run_enrichment"
+            return self._specialist("enrichment").run(state)
+
         # ── Multi-question split ──────────────────────────────────────────────
         # If the user pasted ≥2 questions, split them and answer each one
         # individually — each question gets its own routing decision and
@@ -2509,6 +2522,30 @@ class LearningAgent(BaseAgent):
 
         # ── Enrichment ────────────────────────────────────────────────────────
         if action == "run_enrichment":
+            # If the user hasn't already chosen a scope and there are more
+            # significant proteins than the stored top_biomarkers list, ask.
+            top_bm_list   = state.get("top_biomarkers") or []
+            n_sig         = state.get("n_significant") or 0
+            already_chose = state.get("enrichment_scope")
+
+            if not already_chose and top_bm_list and n_sig > len(top_bm_list):
+                state["messages"].append({
+                    "role": "assistant",
+                    "content": (
+                        f"Before running pathway enrichment, I'd like to confirm "
+                        f"which protein set to use:\n\n"
+                        f"1. **Top {len(top_bm_list)} biomarkers** — the ranked list "
+                        f"from your differential analysis\n"
+                        f"2. **All {n_sig} differentially expressed proteins** — "
+                        f"every protein that passed significance thresholds\n\n"
+                        f"Option 2 is generally recommended for pathway enrichment "
+                        f"as it gives a more complete biological picture. "
+                        f"Which would you prefer?"
+                    ),
+                })
+                state["status"] = "awaiting_enrichment_scope"
+                return state
+
             return self._specialist("enrichment").run(state)
 
         # ── Visualisation ──────────────────────────────────────────────────────

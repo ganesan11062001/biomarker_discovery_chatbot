@@ -133,13 +133,21 @@ def get_analysis_state(session_id: str):
 
 @router.get("/{session_id}/excel")
 def download_excel(session_id: str):
-    """Download the formatted Excel biomarker results file."""
+    """Download the latest results file (enrichment CSV if available, else biomarker Excel)."""
     try:
         state = SessionManager.get_session(session_id)
     except KeyError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{session_id}' not found.",
+        )
+
+    enrichment_path = state.get("enrichment_result_path")
+    if enrichment_path and Path(enrichment_path).exists():
+        return FileResponse(
+            path=enrichment_path,
+            media_type="text/csv",
+            filename=f"enrichment_{session_id[:8]}.csv",
         )
 
     excel_path = state.get("excel_path")
