@@ -191,7 +191,8 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         # because there are no true biological replicates within each "group" —
         # within-group spread is dominated by between-sample variation. We run
         # fold-change-only ranking instead, with NO p-values.
-        if (is_pooled_design or test_method == "fold_change"
+        if (is_pooled_design or effective_method == "fold_change_only"
+                or test_method == "fold_change"
             ) and group1_samples and group2_samples:
             results_df = self._fold_change_only(
                 data_qc, valid_mask,
@@ -222,7 +223,7 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
 
         is_anova = (
             effective_method == "anova"
-            or (all_groups and len(all_groups) >= 2)
+            and all_groups and len(all_groups) >= 2
         )
 
         if is_anova and all_groups and len(all_groups) >= 2:
@@ -749,6 +750,8 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             return test_method
         n1 = len([c for c in g1_cols if c in data.columns])
         n2 = len([c for c in g2_cols if c in data.columns])
+        if min(n1, n2) <= 1:
+            return "fold_change_only"  # no valid statistical test with n=1
         return "limma" if min(n1, n2) <= 4 else "welch"
 
     # ── eBayes prior estimation (Smyth 2004) ──────────────────────────────────

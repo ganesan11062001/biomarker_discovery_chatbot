@@ -128,17 +128,32 @@ class BiomarkerAgent(BaseAgent):
             g2_lbl = state.get("group2_label", "Group 2")
             n1, n2 = len(g1), len(g2)
             _req_method = _overrides.get("test_method") or state.get("test_method") or "auto"
+            # Mirror _resolve_test_method so the label matches what will actually run
+            if _req_method == "auto":
+                if min(n1, n2) <= 1:
+                    _effective_label_method = "fold_change_only"
+                elif min(n1, n2) <= 4:
+                    _effective_label_method = "limma"
+                else:
+                    _effective_label_method = "welch"
+            else:
+                _effective_label_method = _req_method
             _method_label = {
-                "limma":    "limma moderated t-test (eBayes)",
-                "paired_t": "paired t-test",
-                "anova":    "one-way ANOVA",
-                "welch":    "Welch t-test",
-            }.get(_req_method, "auto-selected test (limma for n≤4, Welch for n≥5)")
+                "limma":            "limma moderated t-test (eBayes)",
+                "paired_t":         "paired t-test",
+                "anova":            "one-way ANOVA",
+                "welch":            "Welch t-test",
+                "fold_change_only": "fold-change only (n=1, no statistical test)",
+            }.get(_effective_label_method, _effective_label_method)
+            _pipeline_suffix = (
+                "BH FDR." if _effective_label_method != "fold_change_only"
+                else "ranked by |log₂FC|."
+            )
             mode_label = (
                 f"differential expression analysis — **{g1_lbl}** (n={n1}) vs "
                 f"**{g2_lbl}** (n={n2}) — {_method_label}. "
                 f"Pipeline: log₂ transform → median normalisation → "
-                f"group-aware filter → half-min imputation → {_method_label} → BH FDR."
+                f"group-aware filter → half-min imputation → {_method_label} → {_pipeline_suffix}"
             )
         else:
             mode_label = (
@@ -175,8 +190,19 @@ class BiomarkerAgent(BaseAgent):
             or "auto"
         )
         _is_paired   = bool(state.get("is_paired") or _overrides.get("is_paired", False))
-        _all_groups  = state.get("all_groups") or _overrides.get("all_groups")
         _tmt_batches = state.get("tmt_batches")
+
+        # Only pass all_groups when the user explicitly requested ANOVA across 3+
+        # groups. For pairwise run_analysis (group1/group2 set), all_groups is
+        # inherited from ingestion-time label detection and must NOT be forwarded —
+        # the skill's is_anova condition fires on any all_groups with ≥2 entries,
+        # causing a spurious ANOVA attempt that fails when n=1 per group.
+        _explicit_anova = _test_method == "anova"
+        _override_groups = _overrides.get("all_groups")
+        if _explicit_anova or _override_groups:
+            _all_groups = _override_groups or state.get("all_groups")
+        else:
+            _all_groups = None
 
         result = skill.execute(
             # Standard parameters
@@ -509,15 +535,46 @@ class BiomarkerAgent(BaseAgent):
         )
 
         # Describe the exact statistical method used
+        _actual_method = qc.get("test_method", "welch")
         if mode == "supervised":
-            method_str = (
-                f"**Method:** Welch two-sample t-test — {g1} vs {g2}. "
-                f"Pipeline: log₂ transform → median normalisation → group-aware missing filter "
-                f"→ half-min imputation → Welch t-test → Benjamini-Hochberg FDR. "
-                f"Significance thresholds: adj. p < {_adj_pval}{_overrides_note}, "
-                f"|log₂FC| ≥ {_log2fc}{_overrides_note}. "
-                f"Effect size: Cohen's d (pooled SD)."
-            )
+            _pipeline_steps = "log₂ transform → median normalisation → group-aware missing filter → half-min imputation"
+            if _actual_method == "fold_change_only":
+                method_str = (
+                    f"**Method:** Fold-change only (no statistical test) — {g1} vs {g2}. "
+                    f"n=1 per group: statistical testing is invalid with a single observation. "
+                    f"Pipeline: {_pipeline_steps} → log₂ fold-change ranking. "
+                    f"Proteins ranked by |log₂FC| ≥ {_log2fc}{_overrides_note}. "
+                    f"No p-values or FDR correction are reported."
+                )
+            elif _actual_method == "limma":
+                method_str = (
+                    f"**Method:** limma moderated t-test (eBayes empirical Bayes) — {g1} vs {g2}. "
+                    f"Pipeline: {_pipeline_steps} → limma eBayes → Benjamini-Hochberg FDR. "
+                    f"Significance thresholds: adj. p < {_adj_pval}{_overrides_note}, "
+                    f"|log₂FC| ≥ {_log2fc}{_overrides_note}. "
+                    f"Effect size: Cohen's d (pooled SD)."
+                )
+            elif _actual_method == "paired_t":
+                method_str = (
+                    f"**Method:** Paired t-test — {g1} vs {g2}. "
+                    f"Pipeline: {_pipeline_steps} → paired t-test → Benjamini-Hochberg FDR. "
+                    f"Significance thresholds: adj. p < {_adj_pval}{_overrides_note}, "
+                    f"|log₂FC| ≥ {_log2fc}{_overrides_note}."
+                )
+            elif _actual_method == "anova":
+                method_str = (
+                    f"**Method:** One-way ANOVA across groups. "
+                    f"Pipeline: {_pipeline_steps} → one-way ANOVA → Benjamini-Hochberg FDR. "
+                    f"Significance threshold: adj. p < {_adj_pval}{_overrides_note}."
+                )
+            else:  # welch (default)
+                method_str = (
+                    f"**Method:** Welch two-sample t-test — {g1} vs {g2}. "
+                    f"Pipeline: {_pipeline_steps} → Welch t-test → Benjamini-Hochberg FDR. "
+                    f"Significance thresholds: adj. p < {_adj_pval}{_overrides_note}, "
+                    f"|log₂FC| ≥ {_log2fc}{_overrides_note}. "
+                    f"Effect size: Cohen's d (pooled SD)."
+                )
         else:
             method_str = (
                 "**Method:** Unsupervised variability ranking (no group labels). "

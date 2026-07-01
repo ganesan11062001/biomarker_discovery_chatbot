@@ -203,22 +203,26 @@ that drives the pipeline. Choose exactly one action:
                              • "what is the molecular weight of <protein X>?"
                              • "how many sheets does this file have?"
                              • "what is the largest / smallest / highest-MW protein?"
-                             • "what is the most up/down-regulated protein in X vs Y?"
-                             • "what is the fold change of <X> in <group A> vs <group B>?"
-                             • "top N proteins by intensity in <group>?"
-                           For "most up/down in X vs Y" questions: this is a SQL
-                           fold-change computation, NOT a full analysis. Route here,
-                           NOT to run_analysis or run_full_pipeline. The bot writes
-                           SQL like SELECT protein, LOG2((A+1)/(B+1)) AS fc
-                           ORDER BY fc DESC LIMIT 1.
+                             • "what is the raw intensity of <protein X> in sample <Y>?"
+                             • "top N proteins by raw intensity in <group>?" (raw values, no stats)
+                           IMPORTANT — do NOT use query_data for these; use run_analysis instead:
+                             • "top N hits / biomarkers / differentially expressed proteins comparing X vs Y"
+                             • "most up/down-regulated proteins in X vs Y"
+                             • "what is the fold change of <X> in <group A> vs <group B>?" when
+                               that implies running a comparison pipeline, not a raw lookup
+                           For raw single-protein lookups ("what is the intensity of protein X in
+                           sample Y?") route here. For RANKED DIFFERENTIAL LISTS across two groups,
+                           use run_analysis.
   "ask_clarification"   — ask the user a focused, professional question before proceeding
   "answer"              — answer a question, explain something, or have a conversation
 
 Analysis routing — the canonical template is intensity-only proteomics:
   • Two-sheet template (Sheet 1 metadata: Sample ID | Group; Sheet 2 proteins:
     Protein Name | Accession | Gene | sample columns) is the supported format.
-  • Test method auto-selected: limma eBayes for n≤4 per group, Welch t-test for n≥5.
+  • Test method auto-selected: fold-change only for n=1 per group; limma eBayes
+    for 2≤n≤4 per group; Welch t-test for n≥5.
     ≥2 samples per group → supervised differential expression (log₂FC, Cohen's d, adj. p-value).
+    n=1 per group → fold-change-only ranking (no statistical test is valid).
     No group labels → unsupervised CV/MAD/IQR variability ranking.
   • The Python pipeline is paired with an R + limma engine; the dual-engine
     combiner intersects significant proteins from both to produce the final list.
@@ -272,6 +276,20 @@ Decision rules (in priority order):
     "DMD Quad vs BL6 Quad") → "run_analysis"
     - Set group1_label, group1_samples, group2_label, group2_samples from available_columns.
     - Leave sample lists empty if you cannot confidently match column names.
+12b. Questions asking for a RANKED LIST of hits / biomarkers / differentially expressed
+    proteins from a comparison — even when phrased as a question rather than a command:
+      • "What are the top N hits for <X> vs <Y>?"
+      • "Show me the top N biomarkers comparing <X> and <Y>"
+      • "What proteins are most up/down-regulated in <X> vs <Y>?"
+      • "List the top hits between <X> and <Y> tissues"
+    → "run_analysis" (not query_data, not answer — a full DEA pipeline is required)
+12c. "Pool / combine all <X> samples into one group vs all <Y> samples" — even when
+    the user says "across all tissues", "combined analysis", "as a whole", or is
+    responding to a clarification that offered a combined option:
+    → "run_analysis" with group1_label=<X>, group2_label=<Y>.
+    Do NOT route to run_all_comparisons — that runs every tissue pair separately.
+    Leave group1_samples/group2_samples empty; the resolver will pool all sub-groups
+    whose name starts with <X> or <Y> automatically.
 13. "run all pairwise comparisons WITHOUT enrichment / plots" (explicit, rare) →
     "run_all_comparisons"
 
@@ -2543,7 +2561,23 @@ class LearningAgent(BaseAgent):
                 for known, cols in all_groups.items():
                     if known.lower() == label.lower() and len(cols) >= len(current):
                         return list(cols)
-                # 2. If the current sample list still looks short, widen via
+                # 2. Prefix pooling: "DMD" should pool "DMD Heart", "DMD Quad", etc.
+                #    Matches sub-groups whose name starts with "<label> " (space-delimited
+                #    to avoid "DMD" matching "DMDx" or similar).
+                prefix = label.lower() + " "
+                prefix_cols = []
+                for known, cols in all_groups.items():
+                    if known.lower().startswith(prefix) or known.lower() == label.lower():
+                        prefix_cols.extend(c for c in cols if c in all_cols)
+                if prefix_cols:
+                    # Preserve data-column order
+                    pooled = [c for c in all_cols if c in prefix_cols]
+                    if len(pooled) > len(current):
+                        self.logger.info(
+                            "Prefix-pooled '%s' from sub-groups → %s", label, pooled
+                        )
+                        return pooled
+                # 3. If the current sample list still looks short, widen via
                 #    prefix/substring match against actual columns.
                 if len(current) < 2:
                     matched = self._match_columns_by_label(label, all_cols)
