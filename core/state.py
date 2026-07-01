@@ -122,9 +122,16 @@ class BiomarkerState(TypedDict, total=False):
     top_proteins:    Optional[List[Dict]]   # mirrors top_biomarkers
     dea_result_path: Optional[str]          # legacy CSV path
 
+    # Accumulated results across all comparisons run in this session.
+    # Keyed by "Group1_vs_Group2"; each value holds the full biomarker list,
+    # significance count, and excel path so cross-comparison questions (e.g.
+    # overlap) can access every prior run, not just the last one.
+    comparison_history: Optional[Dict[str, Any]]
+
     # ── Enrichment results ────────────────────────────────────────────────────
     enrichment_result_path: Optional[str]
     enrichment_scope:       Optional[str]   # "top_n" | "all" — user choice for gene set
+    enrichment_top_n:       Optional[int]   # explicit N when scope is "top_n"
     pathways:               Optional[List[Dict]]
 
     # ── Visualization output ──────────────────────────────────────────────────

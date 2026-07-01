@@ -85,6 +85,20 @@ class EnrichmentAgent(BaseAgent):
         # If user chose "all", read the full results from the Excel file
         if state.get("enrichment_scope") == "all" and state.get("excel_path"):
             protein_source = self._load_all_significant(state) or protein_source
+
+        # If user specified an explicit top-N, slice protein_source to that count
+        enrichment_top_n = state.get("enrichment_top_n")
+        if (
+            enrichment_top_n
+            and state.get("enrichment_scope") == "top_n"
+            and protein_source
+            and len(protein_source) > enrichment_top_n
+        ):
+            protein_source = protein_source[:enrichment_top_n]
+            logger.info(
+                "Enrichment: sliced to top %d proteins per user request (was %d)",
+                enrichment_top_n, len(state.get("top_biomarkers") or []),
+            )
         if not protein_source:
             msg = self._llm_no_data()
             state["status"]        = "error"
@@ -190,7 +204,12 @@ class EnrichmentAgent(BaseAgent):
         if not excel_path:
             return None
         try:
-            df = pd.read_excel(excel_path, sheet_name="All Results")
+            xl = pd.ExcelFile(excel_path)
+            if "All Results" not in xl.sheet_names:
+                logger.warning("'All Results' sheet not found in %s (available: %s)",
+                               excel_path, xl.sheet_names)
+                return None
+            df = xl.parse("All Results")
             sig = df[df["significance"].notna() & (df["significance"] != "NS")]
             if sig.empty:
                 sig = df
@@ -352,27 +371,40 @@ class EnrichmentAgent(BaseAgent):
         background: Optional[List[str]],
         state: BiomarkerState,
     ) -> str:
+        from skills.run_enrichment import _normalize_organism, _LIBRARIES
+
         organism = state.get("organism", "human")
         g1 = state.get("group1_label", "Group1")
         g2 = state.get("group2_label", "Group2")
+
+        organism_key = _normalize_organism(organism)
+        libs = _LIBRARIES.get(organism_key, _LIBRARIES["human"])
+        enr_organism = "human" if organism_key == "human" else "mouse"
+
+        # Build gene-list + optional background block separately to avoid
+        # Python's ternary-inside-implicit-string-concat precedence bug.
+        data_block = f"gene_list = {protein_list[:10]!r}  # ... ({len(protein_list)} total)\n"
+        if background:
+            data_block += (
+                f"background = {background[:5]!r}  # ... ({len(background)} total)\n"
+            )
+        data_block += "\n"
+
         return (
             f"import gseapy as gp\n\n"
             f"# Pathway enrichment: {g1} vs {g2}\n"
-            f"# Organism: {organism}\n"
+            f"# Organism: {organism} (key: {organism_key})\n"
             f"# Significant proteins submitted: {len(protein_list)}\n"
             f"#   Up-regulated (higher in {g2}):   {len(up_proteins)}\n"
             f"#   Down-regulated (higher in {g1}): {len(down_proteins)}\n"
             f"# Background: {len(background) if background else 'genome-wide'} proteins\n\n"
-            f"gene_list = {protein_list[:10]!r}  # ... ({len(protein_list)} total)\n"
-            f"background = {background[:5]!r}  # ... ({len(background)} total)\n\n" if background else
-            f"gene_list = {protein_list[:10]!r}  # ... ({len(protein_list)} total)\n\n"
-            f"libraries = ['KEGG_2021_Human', 'GO_Biological_Process_2023',\n"
-            f"             'Reactome_2022', 'WikiPathways_2023_Human']\n\n"
+            + data_block
+            + f"libraries = {libs!r}\n\n"
             f"for lib in libraries:\n"
             f"    enr = gp.enrichr(\n"
             f"        gene_list=gene_list,\n"
             f"        gene_sets=lib,\n"
-            f"        organism='{organism}',\n"
+            f"        organism='{enr_organism}',\n"
             f"        background=background if background else 20000,\n"
             f"        cutoff=0.05,\n"
             f"    )\n"

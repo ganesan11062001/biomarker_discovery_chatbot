@@ -515,7 +515,7 @@ def _extract_questions(text: str) -> List[str]:
 
     # Fallback: paragraph with multiple "?" on a single line
     if len(questions) < 2 and text.count("?") >= 2:
-        parts = [p.strip() for p in re.split(r"(?<=\?)\s+", text) if p.strip()]
+        parts = [p.strip() for p in re.split(r"(?<=\?)\s*", text) if p.strip()]
         questions = [_QUESTION_TAG_RE.sub("", p).strip()
                      for p in parts if p.endswith("?")]
 
@@ -607,7 +607,6 @@ class LearningAgent(BaseAgent):
         ctx += f"  n_proteins: {state.get('n_proteins', 0)}\n"
         ctx += f"  n_samples: {state.get('n_samples', 0)}\n"
         ctx += f"  omic_type: {state.get('omic_type', 'none')}\n"
-        ctx += f"  data_type: {state.get('data_type', 'none')}\n"
         ctx += f"  analysis_complete: {state.get('n_significant') is not None}\n"
         ctx += f"  n_significant: {state.get('n_significant', 'none')}\n"
         ctx += f"  analysis_mode: {state.get('analysis_mode', 'none')}\n"
@@ -944,6 +943,14 @@ class LearningAgent(BaseAgent):
         biomarker = self._specialist("biomarker")
         summary_lines: List[str] = []
 
+        # Snapshot group fields so we can restore them after the loop;
+        # writing each pair's labels into state during iteration would leave
+        # the last comparison's values visible to downstream enrichment/viz.
+        _saved_g1_label   = state.get("group1_label")
+        _saved_g1_samples = state.get("group1_samples")
+        _saved_g2_label   = state.get("group2_label")
+        _saved_g2_samples = state.get("group2_samples")
+
         for g1_name, g2_name in pairs:
             state["group1_label"]   = g1_name
             state["group1_samples"] = groups[g1_name]
@@ -960,6 +967,13 @@ class LearningAgent(BaseAgent):
                 f"- **{g1_name} vs {g2_name}**: {n_sig} significant | "
                 f"top: {', '.join(top3)}"
             )
+
+        # Restore the pre-loop group fields so downstream agents (enrichment,
+        # viz, answer) see the original comparison context, not the last pair.
+        state["group1_label"]   = _saved_g1_label
+        state["group1_samples"] = _saved_g1_samples
+        state["group2_label"]   = _saved_g2_label
+        state["group2_samples"] = _saved_g2_samples
 
         state["messages"].append({
             "role": "assistant",
@@ -2261,6 +2275,29 @@ class LearningAgent(BaseAgent):
                 "p-value that is not listed above."
             )
 
+        # ── Multi-comparison history: every prior run's full biomarker list ────
+        # Required for cross-comparison questions (overlap, unique-to-group, etc.)
+        cmp_hist = state.get("comparison_history") or {}
+        if len(cmp_hist) > 1:
+            ctx.append(
+                "\n## Comparison history — ALL analyses run this session "
+                "(use these for overlap / intersection questions)"
+            )
+            for cmp_key, cmp_data in cmp_hist.items():
+                top = (cmp_data.get("top_biomarkers") or [])
+                n_sig = cmp_data.get("n_significant", "?")
+                ctx.append(f"\n### {cmp_key}  (n_significant={n_sig})")
+                for b in top[:50]:
+                    protein = b.get("protein", "")
+                    lfc     = b.get("log2_fold_change", b.get("rescue_score", "?"))
+                    adjp    = b.get("adj_p_value", "?")
+                    ctx.append(f"  - {protein}  log2FC={lfc}  adj_p={adjp}")
+            ctx.append(
+                "To find overlap: identify proteins present in BOTH lists above. "
+                "To find unique markers: identify proteins in one list but not the other. "
+                "Base ALL overlap/intersection answers on the actual protein names listed above."
+            )
+
         if state.get("pathways"):
             ctx.append("\n## Grounded pathway data (cite ONLY from this list)")
             for p in (state.get("pathways") or [])[:10]:
@@ -2310,9 +2347,15 @@ class LearningAgent(BaseAgent):
             uq = user_query.lower()
             if any(w in uq for w in ("all", "2", "every", "full", "complete")):
                 state["enrichment_scope"] = "all"
+                state.pop("enrichment_top_n", None)
                 self.logger.info("Enrichment scope: all significant proteins")
             else:
                 state["enrichment_scope"] = "top_n"
+                _topn_m = re.search(r"top\s*(\d+)", uq)
+                if _topn_m:
+                    state["enrichment_top_n"] = int(_topn_m.group(1))
+                else:
+                    state.pop("enrichment_top_n", None)
                 self.logger.info("Enrichment scope: top N biomarkers only")
             state["status"] = "ready"
             state["intent"] = "run_enrichment"
@@ -2380,8 +2423,16 @@ class LearningAgent(BaseAgent):
         # the differential-analysis results (state['top_biomarkers']), NOT from
         # a raw-data query that would rank by SpC / intensity.
         _top_phrases = ("top biomarker", "top biomarkers", "ranked biomarker",
-                        "biomarker list", "list of biomarkers", "best biomarker")
-        _top_re = re.search(r"top\s*\d*\s*biomarker", _uq_lower)
+                        "biomarker list", "list of biomarkers", "best biomarker",
+                        "most different", "most differential", "most significant",
+                        "biggest difference", "largest difference", "highest fold",
+                        "most dysregulated", "most changed", "most altered")
+        _top_re = re.search(
+            r"top\s*\d*\s*biomarker"          # "top10 biomarkers", "top biomarker"
+            r"|most\s+\w+\s+biomarker"         # "most different biomarkers"
+            r"|top\s*\d+\s+most",              # "top 10 most ..."
+            _uq_lower,
+        )
         if (
             action in {"query_data", "answer"}
             and (any(p in _uq_lower for p in _top_phrases) or _top_re)
@@ -2398,6 +2449,27 @@ class LearningAgent(BaseAgent):
             else:
                 self.logger.info("Override: '%s' -> 'answer' (top biomarkers grounded in analysis results).", action)
                 action = "answer"
+            state["intent"] = action
+
+        # When analysis is complete, never let query_data answer ranking/comparison
+        # questions — the raw file has accession IDs without fold-changes, so it
+        # always returns Unknown/NaN for anything about differential expression.
+        _ranking_re = re.search(
+            r"most\s+\w+\s*(protein|biomarker)|"
+            r"(highest|largest|biggest|most)\s+(fold|change|differ|express|regulat)|"
+            r"rank(ed)?\s+(protein|biomarker)|"
+            r"(list|show|give).{0,20}(protein|biomarker)",
+            _uq_lower,
+        )
+        if (
+            action == "query_data"
+            and _ranking_re
+            and state.get("top_biomarkers")
+        ):
+            self.logger.info(
+                "Override: 'query_data' -> 'answer' (ranking question, analysis results available)."
+            )
+            action = "answer"
             state["intent"] = action
 
         # ── Clarification question ────────────────────────────────────────────
@@ -2522,13 +2594,43 @@ class LearningAgent(BaseAgent):
 
         # ── Enrichment ────────────────────────────────────────────────────────
         if action == "run_enrichment":
-            # If the user hasn't already chosen a scope and there are more
-            # significant proteins than the stored top_biomarkers list, ask.
-            top_bm_list   = state.get("top_biomarkers") or []
-            n_sig         = state.get("n_significant") or 0
-            already_chose = state.get("enrichment_scope")
+            top_bm_list = state.get("top_biomarkers") or []
+            n_sig       = state.get("n_significant") or 0
 
-            if not already_chose and top_bm_list and n_sig > len(top_bm_list):
+            # Parse user's current message for an explicit scope instruction.
+            # This takes priority over any previously cached enrichment_scope.
+            _eq = _uq_lower
+            _explicit_all  = bool(re.search(
+                r"\ball\b|\beverything\b|\bfull\b|\bcomplete\b|\bevery\b"
+                r"|\ball\s+(significant|differential|expressed|proteins?)",
+                _eq,
+            ))
+            _explicit_topn = bool(re.search(
+                r"top\s*\d+\s*(biomarkers?|proteins?|only|just)"
+                r"|\bonly\s+top\b|\bjust\s+top\b"
+                r"|\btop\s+\d+\s+only\b",
+                _eq,
+            ))
+
+            if _explicit_all:
+                state["enrichment_scope"] = "all"
+                state.pop("enrichment_top_n", None)
+                self.logger.info("Enrichment scope overridden by user message: all")
+            elif _explicit_topn:
+                state["enrichment_scope"] = "top_n"
+                # Capture the specific N the user requested (e.g. "top10" → 10)
+                _topn_match = re.search(r"top\s*(\d+)", _eq)
+                if _topn_match:
+                    state["enrichment_top_n"] = int(_topn_match.group(1))
+                    self.logger.info(
+                        "Enrichment scope overridden by user message: top_n=%d",
+                        state["enrichment_top_n"],
+                    )
+                else:
+                    state.pop("enrichment_top_n", None)
+                    self.logger.info("Enrichment scope overridden by user message: top_n (count unspecified)")
+            elif not state.get("enrichment_scope") and top_bm_list and n_sig > len(top_bm_list):
+                # No cached choice and no explicit instruction — ask the user.
                 state["messages"].append({
                     "role": "assistant",
                     "content": (

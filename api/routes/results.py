@@ -13,10 +13,15 @@ from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from config.settings import get_settings
 from core.session_manager import SessionManager
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+settings = get_settings()
+
+# Resolve once at import so path-traversal checks are CWD-independent.
+_OUTPUT_BASE: Path = Path(settings.output_dir).resolve()
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -160,7 +165,7 @@ def download_excel(session_id: str):
     return FileResponse(
         path=excel_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=Path(excel_path).name,
+        filename=f"biomarkers_{session_id[:8]}.xlsx",
     )
 
 
@@ -170,25 +175,27 @@ def download_output_file(
     path: str = Query(..., description="Relative path inside outputs/"),
 ):
     """Serve any generated output file (plots, CSVs, etc.)."""
-    # Accept:  absolute path, "outputs/file.png" (as stored in state), or bare "file.png"
     candidate = Path(path)
     if candidate.is_absolute():
-        pass  # use as-is
+        # Absolute path — still validated against _OUTPUT_BASE below
+        pass
     elif candidate.parts and candidate.parts[0] == "outputs":
-        pass  # already has outputs/ prefix
+        # Stored paths typically include the "outputs/" prefix; strip it and
+        # re-anchor under the resolved output base.
+        candidate = _OUTPUT_BASE.joinpath(*candidate.parts[1:])
     else:
-        candidate = Path("outputs") / candidate
+        candidate = _OUTPUT_BASE / candidate
 
-    # Security: must resolve inside outputs/
+    # Security: resolved path must be inside the configured output directory.
+    # Use the pre-resolved _OUTPUT_BASE so this is independent of CWD.
     try:
-        candidate.resolve().relative_to(Path("outputs").resolve())
+        resolved = candidate.resolve()
+        resolved.relative_to(_OUTPUT_BASE)
     except ValueError:
         raise HTTPException(status_code=403, detail="Access denied.")
 
-    file_path = candidate
-
-    if not file_path.exists():
+    if not resolved.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {path}")
 
-    media_type, _ = mimetypes.guess_type(str(file_path))
-    return FileResponse(path=str(file_path), media_type=media_type or "application/octet-stream")
+    media_type, _ = mimetypes.guess_type(str(resolved))
+    return FileResponse(path=str(resolved), media_type=media_type or "application/octet-stream")

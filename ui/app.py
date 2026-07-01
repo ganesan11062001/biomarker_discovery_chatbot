@@ -37,13 +37,9 @@ _session = requests.Session()
 _session.verify = _VERIFY_SSL
 if _CONNECT_API_KEY:
     _session.headers.update({"Authorization": f"Key {_CONNECT_API_KEY}"})
-# Route module-level requests.get/post/etc. through the configured session
-# so every call inherits both the auth header and the verify setting.
-requests.get = _session.get        # type: ignore[assignment]
-requests.post = _session.post      # type: ignore[assignment]
-requests.put = _session.put        # type: ignore[assignment]
-requests.delete = _session.delete  # type: ignore[assignment]
-requests.patch = _session.patch    # type: ignore[assignment]
+# Use _session explicitly for all API calls rather than monkey-patching the
+# global requests module. The monkey-patch was previously propagating our auth
+# header and verify=False into third-party libraries (gseapy, openai, etc.).
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -62,7 +58,7 @@ if st.query_params.get("debug") == "1":
         "CONNECT_API_KEY_len": len(_CONNECT_API_KEY),
     })
     try:
-        r = requests.get(f"{API_BASE}/docs", timeout=10)
+        r = _session.get(f"{API_BASE}/docs", timeout=10)
         st.write({"GET /docs status": r.status_code,
                   "content_type": r.headers.get("content-type"),
                   "first_200_chars": r.text[:200]})
@@ -453,7 +449,7 @@ def _api_create_session(
     attempts = 3
     for i in range(attempts):
         try:
-            r = requests.post(
+            r = _session.post(
                 f"{API_BASE}/chat/session",
                 params=params,
                 timeout=20,
@@ -479,7 +475,7 @@ def _api_create_session(
 
 def _api_fetch_state(session_id: str) -> dict:
     try:
-        r = requests.get(f"{API_BASE}/results/{session_id}", timeout=10)
+        r = _session.get(f"{API_BASE}/results/{session_id}", timeout=10)
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -499,7 +495,7 @@ def _api_send_message(session_id: str, message: str) -> dict | None:
     if st.session_state.get("organism"):
         payload["organism"] = st.session_state["organism"]
     try:
-        r = requests.post(f"{API_BASE}/chat/", json=payload, timeout=300)
+        r = _session.post(f"{API_BASE}/chat/", json=payload, timeout=300)
         if r.status_code == 200:
             return r.json()
         st.session_state["api_error"] = f"API {r.status_code}: {r.text[:200]}"
@@ -521,7 +517,7 @@ def _api_upload_file(
             data["disease_program"] = st.session_state["disease_program"]
         if st.session_state.get("organism"):
             data["organism"] = st.session_state["organism"]
-        r = requests.post(
+        r = _session.post(
             f"{API_BASE}/upload/",
             files={"file": (filename, file_bytes, file_type)},
             data=data,
@@ -623,6 +619,12 @@ def _render_topbar(session_id: str | None, astate: dict) -> None:
 
         # New conversation button — full row below
         if st.button("＋  New Conversation", key="new_conv"):
+            old_sid = st.session_state.get("session_id")
+            if old_sid:
+                try:
+                    _session.delete(f"{API_BASE}/sessions/{old_sid}", timeout=5)
+                except Exception:
+                    pass
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.rerun()
@@ -777,7 +779,7 @@ def _render_welcome() -> str | None:
 
 def _fetch_file(session_id: str, path: str) -> bytes | None:
     try:
-        r = requests.get(
+        r = _session.get(
             f"{API_BASE}/results/{session_id}/file",
             params={"path": path},
             timeout=20,
@@ -945,25 +947,31 @@ def _render_quick_actions(session_id: str, astate: dict) -> str | None:
     if excel_path and session_id:
         dl_col, chips_col = st.columns([1, 4])
         with dl_col:
-            try:
-                r = requests.get(f"{API_BASE}/results/{session_id}/excel", timeout=20)
-                if r.status_code == 200:
-                    if enrichment_done:
-                        dl_label = "⬇ Download Enrichment"
-                        dl_name  = f"enrichment_{session_id[:8]}.csv"
-                        dl_mime  = "text/csv"
-                    else:
-                        dl_label = "⬇ Download Excel"
-                        dl_name  = f"biomarkers_{session_id[:8]}.xlsx"
-                        dl_mime  = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    st.download_button(
-                        dl_label,
-                        data=r.content,
-                        file_name=dl_name,
-                        mime=dl_mime,
-                    )
-            except Exception:
-                pass
+            # Cache Excel bytes in session_state so we don't re-fetch on every
+            # Streamlit rerun (Streamlit reruns on every interaction).
+            cache_key = f"_excel_bytes_{excel_path}"
+            if cache_key not in st.session_state:
+                try:
+                    r = _session.get(f"{API_BASE}/results/{session_id}/excel", timeout=20)
+                    st.session_state[cache_key] = r.content if r.status_code == 200 else None
+                except Exception:
+                    st.session_state[cache_key] = None
+            excel_bytes = st.session_state.get(cache_key)
+            if excel_bytes:
+                if enrichment_done:
+                    dl_label = "⬇ Download Enrichment"
+                    dl_name  = f"enrichment_{session_id[:8]}.csv"
+                    dl_mime  = "text/csv"
+                else:
+                    dl_label = "⬇ Download Excel"
+                    dl_name  = f"biomarkers_{session_id[:8]}.xlsx"
+                    dl_mime  = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                st.download_button(
+                    dl_label,
+                    data=excel_bytes,
+                    file_name=dl_name,
+                    mime=dl_mime,
+                )
         with chips_col:
             cols = st.columns(len(actions))
             for col, action in zip(cols, actions):

@@ -87,6 +87,10 @@ class SessionManager:
             # Atomic write: write to .tmp then rename
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload), encoding="utf-8")
+            try:
+                tmp.chmod(0o600)  # owner read/write only — state may contain patient data
+            except Exception:
+                pass
             tmp.replace(path)
         except Exception as exc:
             logger.debug("Session checkpoint save failed for %s: %s",

@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel
 
 from agents.ingestion_agent import IngestionAgent
@@ -49,6 +49,7 @@ class UploadResponse(BaseModel):
 
 @router.post("/", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
 async def upload_proteomics_file(
+    request:          Request,
     file:             UploadFile       = File(...),
     session_id:       Optional[str]    = Form(None),
     disease_program:  Optional[str]    = Form(None),
@@ -70,6 +71,13 @@ async def upload_proteomics_file(
             400,
             f"Unsupported file type '{suffix}'.{hint} Accepted formats: .csv, .xlsx, .xls.",
         )
+
+    # Reject oversized requests before reading the body into memory.
+    # Content-Length is advisory (clients can omit it) but provides an early
+    # cheap check; the hard size gate after read() catches the rest.
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > _MAX_BYTES:
+        raise HTTPException(413, f"File exceeds {settings.max_file_size_mb} MB limit.")
 
     content = await file.read()
     if len(content) > _MAX_BYTES:

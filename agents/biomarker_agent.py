@@ -252,6 +252,21 @@ class BiomarkerAgent(BaseAgent):
         state["qc_passed"]      = True
         state["status"]         = "analysis_complete"
 
+        # Accumulate this comparison so cross-comparison queries (e.g. overlap)
+        # can access every prior run's biomarker list, not just the last one.
+        _cmp_key = (
+            f"{state.get('group1_label') or 'G1'}"
+            f"_vs_"
+            f"{state.get('group2_label') or 'G2'}"
+        )
+        _hist = dict(state.get("comparison_history") or {})
+        _hist[_cmp_key] = {
+            "top_biomarkers": state["top_biomarkers"],
+            "n_significant":  state["n_significant"],
+            "excel_path":     result["excel_path"],
+        }
+        state["comparison_history"] = _hist
+
         # ── Plotly visualisation suite (interactive HTML + PNG) ───────────────
         # The Python helper internally skips per-plot failures, so it's safe
         # to invoke even when log2_fold_change is missing — volcano/MA will
@@ -269,7 +284,11 @@ class BiomarkerAgent(BaseAgent):
                         p for variants in plot_suite.values()
                         for p in variants.values() if p
                     ]
-                    state["plot_paths"] = flat_paths
+                    # Extend existing paths; never overwrite plots from prior
+                    # agents (e.g. enrichment dotplot already in state).
+                    existing_plots = list(state.get("plot_paths") or [])
+                    merged = existing_plots + [p for p in flat_paths if p not in existing_plots]
+                    state["plot_paths"] = merged
                     result["plot_paths"] = flat_paths
             except Exception as exc:
                 logger.warning("Plot generation failed: %s", exc)

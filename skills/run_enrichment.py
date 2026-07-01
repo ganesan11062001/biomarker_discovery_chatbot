@@ -77,6 +77,29 @@ _CONTAMINANT_PREFIXES: tuple = (
     "IGH", "IGK", "IGL",                                # immunoglobulin loci
 )
 
+_UNIPROT_ACCESSION_RE = re.compile(r'^[A-Z][0-9][A-Z0-9]{3}[0-9](-\d+)?$')
+
+
+def _normalize_organism(organism: str) -> str:
+    """Normalize a full organism name (e.g. 'Mus musculus') to the short code used in _LIBRARIES."""
+    org = organism.lower()
+    if any(k in org for k in ("mus", "mouse")):
+        return "mouse"
+    if any(k in org for k in ("rat", "rattus")):
+        return "rat"
+    if any(k in org for k in ("human", "homo", "sapiens")):
+        return "human"
+    return org
+
+
+def _symbols_are_accessions(symbols: List[str], sample_size: int = 50) -> bool:
+    """Return True if >50% of sampled symbols look like bare UniProt accession IDs."""
+    sample = symbols[:sample_size]
+    if not sample:
+        return False
+    n_acc = sum(1 for s in sample if _UNIPROT_ACCESSION_RE.match(s))
+    return n_acc / len(sample) > 0.5
+
 
 def _filter_contaminants(symbols: List[str]) -> tuple[List[str], List[str]]:
     """Return (clean_symbols, dropped_symbols). Match is case-insensitive.
@@ -224,12 +247,23 @@ class PathwaySkill:
 
         # Background: regex-only — no API needed, avoids slow batched calls for 2000+ proteins
         background_symbols: Optional[List[str]] = None
+        background_numeric: Optional[int] = None
         if background_proteins:
-            background_symbols = _extract_gene_symbols(background_proteins)
-            logger.info(
-                "Background: %d proteins → %d gene symbols (regex)",
-                len(background_proteins), len(background_symbols),
-            )
+            extracted = _extract_gene_symbols(background_proteins)
+            if extracted and _symbols_are_accessions(extracted):
+                # Protein names are bare UniProt accession IDs — using them as background
+                # would send unrecognized symbols to Enrichr; use numeric count instead.
+                background_numeric = len(background_proteins)
+                logger.info(
+                    "Background: %d proteins (accession IDs detected — using numeric count %d)",
+                    len(background_proteins), background_numeric,
+                )
+            else:
+                background_symbols = extracted or None
+                logger.info(
+                    "Background: %d proteins → %d gene symbols (regex)",
+                    len(background_proteins), len(extracted),
+                )
 
         # Up/down are subsets of protein_list — regex is consistent and avoids extra API calls
         up_symbols   = _extract_gene_symbols(up_proteins)   if up_proteins   else []
@@ -242,11 +276,13 @@ class PathwaySkill:
         except ImportError:
             raise RuntimeError("gseapy is not installed. Run: python3 -m pip install gseapy")
 
-        organism_key = organism.lower()
+        organism_key = _normalize_organism(organism)
         if organism_key == "rat":
             logger.warning("Rat Enrichr libraries unavailable; using mouse as proxy.")
         libraries    = _LIBRARIES.get(organism_key, _LIBRARIES["human"])
         enr_organism = "human" if organism_key == "human" else "mouse"
+        logger.info("Enrichment organism: '%s' → key='%s', enr_organism='%s', libraries=%s",
+                    organism, organism_key, enr_organism, libraries)
 
         # Build the list of (direction_label, symbols) to enrich
         runs: list[tuple[str, List[str]]] = []
@@ -268,7 +304,7 @@ class PathwaySkill:
                         gene_sets=lib,
                         organism=enr_organism,
                         outdir=None,
-                        background=background_symbols if background_symbols else 20000,
+                        background=background_symbols if background_symbols else (background_numeric or 20000),
                         cutoff=pval_cutoff,
                         verbose=False,
                     )
@@ -328,7 +364,7 @@ class PathwaySkill:
             "enrichment_result_path": out_path,
             "genes_submitted":        len(gene_symbols),
             "gene_symbols":           gene_symbols[:20],
-            "background_size":        len(background_symbols) if background_symbols else None,
+            "background_size":        len(background_symbols) if background_symbols else background_numeric,
             "has_directional":        bool(up_symbols or down_symbols),
             "contaminants_excluded":  dropped,
         }
