@@ -149,6 +149,20 @@ class EnrichmentAgent(BaseAgent):
             state["pathways"]               = result["top_pathways"]
             state["status"]                 = "enrichment_complete"
 
+            # Persist pathways into comparison_history so cross-comparison
+            # answer queries can access every prior enrichment, not just the last.
+            _cmp_key = (
+                f"{state.get('group1_label') or 'G1'}"
+                f"_vs_"
+                f"{state.get('group2_label') or 'G2'}"
+            )
+            _hist = dict(state.get("comparison_history") or {})
+            _hist.setdefault(_cmp_key, {}).update({
+                "pathways":              result["top_pathways"],
+                "enrichment_result_path": result["enrichment_result_path"],
+            })
+            state["comparison_history"] = _hist
+
             # Store reproducible enrichment code for "show code"
             state["analysis_code"] = self._build_enrichment_code(
                 protein_list, up_proteins, down_proteins,

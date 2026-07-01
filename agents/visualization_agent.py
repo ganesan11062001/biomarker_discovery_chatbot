@@ -127,7 +127,9 @@ class VisualizationAgent(BaseAgent):
                 stem               = stem,
             )
 
-            state["plot_paths"]  = result.get("plot_paths", [])
+            existing_plots = list(state.get("plot_paths") or [])
+            new_plots = result.get("plot_paths") or []
+            state["plot_paths"]  = existing_plots + [p for p in new_plots if p not in existing_plots]
             state["report_path"] = result.get("report_path")
             state["status"]      = "report_ready"
 

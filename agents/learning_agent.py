@@ -2292,6 +2292,14 @@ class LearningAgent(BaseAgent):
                     lfc     = b.get("log2_fold_change", b.get("rescue_score", "?"))
                     adjp    = b.get("adj_p_value", "?")
                     ctx.append(f"  - {protein}  log2FC={lfc}  adj_p={adjp}")
+                pathways = cmp_data.get("pathways") or []
+                if pathways:
+                    ctx.append(f"  Pathways ({cmp_key}):")
+                    for p in pathways[:10]:
+                        ctx.append(
+                            f"    * {p.get('pathway','')}  "
+                            f"adj_p={p.get('p_adjust', p.get('adj_p','?'))}"
+                        )
             ctx.append(
                 "To find overlap: identify proteins present in BOTH lists above. "
                 "To find unique markers: identify proteins in one list but not the other. "
