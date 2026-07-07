@@ -547,11 +547,12 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             # Data is log2-space so we just subtract; cap at ±20.
             log2fc = max(-20.0, min(20.0, float(m2 - m1)))
 
-            # Cohen's d (pooled-SD effect size)
+            # Cohen's d (pooled-SD effect size). Sign matches log2fc convention
+            # above (m2 - m1): positive means up in group2.
             n1, n2 = len(v1), len(v2)
             s1, s2 = float(v1.std(ddof=1)), float(v2.std(ddof=1))
             sp = np.sqrt(((n1 - 1) * s1**2 + (n2 - 1) * s2**2) / max(n1 + n2 - 2, 1))
-            cohens_d = float((m1 - m2) / sp) if sp > 0 else 0.0
+            cohens_d = float((m2 - m1) / sp) if sp > 0 else 0.0
 
             rows.append({
                 "protein":                    protein,
@@ -695,21 +696,41 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
 
     # ── Unsupervised: variability ranking ─────────────────────────────────────
 
+    _UNSUPERVISED_COLUMNS = [
+        "rank", "protein", "mean_expression", "std_expression", "cv_percent",
+        "median_abs_deviation", "iqr", "detection_rate", "n_samples", "significance",
+    ]
+
     def _unsupervised(
         self,
         data: pd.DataFrame,
         valid_mask: pd.DataFrame,
     ) -> pd.DataFrame:
+        """Descriptive ranking when no comparison groups are available.
+
+        CV%/MAD/IQR need ≥2 replicates to mean anything; with a single sample
+        per protein (e.g. one pooled sample) those are undefined and we rank
+        by raw abundance instead, so a true n=1 dataset still produces a
+        report rather than an empty/crashing one.
+        """
+        n_total_samples = data.shape[1]
+        can_rank_variability = n_total_samples >= 3
+
         rows = []
         for protein in data.index:
             vals = data.loc[protein].values.astype(float)
-            if len(vals) < 3:
+            n = len(vals)
+            if n == 0:
                 continue
-            m   = vals.mean()
-            sd  = vals.std(ddof=1)
-            cv  = (sd / abs(m) * 100) if m != 0 else 0.0
-            mad = float(np.median(np.abs(vals - np.median(vals))))
-            iqr = float(np.percentile(vals, 75) - np.percentile(vals, 25))
+            m = float(vals.mean())
+
+            if n >= 2:
+                sd  = float(vals.std(ddof=1))
+                cv  = (sd / abs(m) * 100) if m != 0 else 0.0
+                mad = float(np.median(np.abs(vals - np.median(vals))))
+                iqr = float(np.percentile(vals, 75) - np.percentile(vals, 25))
+            else:
+                sd = cv = mad = iqr = np.nan
 
             # Detection rate (fraction of samples with genuine measurements)
             if protein in valid_mask.index:
@@ -719,18 +740,22 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
 
             rows.append({
                 "protein":              protein,
-                "mean_expression":      round(float(m), 4),
-                "std_expression":       round(float(sd), 4),
-                "cv_percent":           round(cv, 2),
-                "median_abs_deviation": round(mad, 4),
-                "iqr":                  round(iqr, 4),
+                "mean_expression":      round(m, 4),
+                "std_expression":       round(sd, 4) if not np.isnan(sd) else None,
+                "cv_percent":           round(cv, 2) if not np.isnan(cv) else None,
+                "median_abs_deviation": round(mad, 4) if not np.isnan(mad) else None,
+                "iqr":                  round(iqr, 4) if not np.isnan(iqr) else None,
                 "detection_rate":       det,
-                "n_samples":            len(vals),
-                "significance":         "Top Variable",
+                "n_samples":            n,
+                "significance":         "Top Variable" if can_rank_variability else "Top Abundant",
             })
 
+        if not rows:
+            return pd.DataFrame(columns=self._UNSUPERVISED_COLUMNS)
+
         df = pd.DataFrame(rows)
-        df = df.sort_values("cv_percent", ascending=False).reset_index(drop=True)
+        sort_col = "cv_percent" if can_rank_variability else "mean_expression"
+        df = df.sort_values(sort_col, ascending=False, na_position="last").reset_index(drop=True)
         df.insert(0, "rank", range(1, len(df) + 1))
         return df
 

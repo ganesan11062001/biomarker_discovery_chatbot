@@ -147,7 +147,25 @@ class EnrichmentAgent(BaseAgent):
 
             state["enrichment_result_path"] = result["enrichment_result_path"]
             state["pathways"]               = result["top_pathways"]
-            state["status"]                 = "enrichment_complete"
+
+            # Every Enrichr library call errored — this is an infrastructure
+            # failure, not a genuine "zero pathways enriched" result. Report
+            # it honestly instead of letting the LLM narrate a biological
+            # explanation for a service outage.
+            if result.get("all_libraries_failed"):
+                state["status"] = "enrichment_failed"
+                msg = (
+                    "⚠ **Pathway enrichment could not run** — the Enrichr "
+                    f"service failed on all {result.get('libraries_attempted', 0)} "
+                    "library queries (network error or an unexpected response). "
+                    "This is a service issue, not a biological result — please "
+                    "don't interpret it as 'no pathways enriched'. Try again in "
+                    "a moment, or ask me to retry."
+                )
+                state["messages"].append({"role": "assistant", "content": msg})
+                return state
+
+            state["status"] = "enrichment_complete"
 
             # Persist pathways into comparison_history so cross-comparison
             # answer queries can access every prior enrichment, not just the last.

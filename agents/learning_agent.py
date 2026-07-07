@@ -2283,14 +2283,26 @@ class LearningAgent(BaseAgent):
         # This is the primary hallucination guard for session-specific claims.
         if state.get("top_biomarkers"):
             ctx.append("\n## Grounded biomarker data (cite ONLY from this list)")
+            ctx.append(
+                "NOTE: this list is ranked by |log2 fold-change|, NOT by "
+                "statistical significance — check the `sig` field per row. "
+                "Many top-ranked-by-fold-change proteins are NOT significant "
+                "(sig='NS' or 'Trend')."
+            )
             for b in (state.get("top_biomarkers") or [])[:25]:
                 protein = b.get("protein", "")
                 lfc     = b.get("log2_fold_change", b.get("rescue_score", "?"))
                 adjp    = b.get("adj_p_value", "?")
-                ctx.append(f"  - {protein}  log2FC={lfc}  adj_p={adjp}")
+                sig     = b.get("significance", "?")
+                ctx.append(f"  - {protein}  log2FC={lfc}  adj_p={adjp}  sig={sig}")
             ctx.append(
                 "CRITICAL: Do not mention any protein name, fold-change value, or "
-                "p-value that is not listed above."
+                "p-value that is not listed above. When asked for the 'most "
+                "significant' proteins specifically, rank by adj_p ascending among "
+                "rows where sig is 'Significant' or 'Highly Significant' — do not "
+                "conflate fold-change rank with statistical significance. If fewer "
+                "than the requested number are actually significant, say so rather "
+                "than padding the list with non-significant rows."
             )
 
         # ── Multi-comparison history: every prior run's full biomarker list ────
@@ -2309,7 +2321,8 @@ class LearningAgent(BaseAgent):
                     protein = b.get("protein", "")
                     lfc     = b.get("log2_fold_change", b.get("rescue_score", "?"))
                     adjp    = b.get("adj_p_value", "?")
-                    ctx.append(f"  - {protein}  log2FC={lfc}  adj_p={adjp}")
+                    sig     = b.get("significance", "?")
+                    ctx.append(f"  - {protein}  log2FC={lfc}  adj_p={adjp}  sig={sig}")
                 pathways = cmp_data.get("pathways") or []
                 if pathways:
                     ctx.append(f"  Pathways ({cmp_key}):")

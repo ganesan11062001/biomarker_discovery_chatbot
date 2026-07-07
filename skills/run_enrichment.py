@@ -295,9 +295,11 @@ class PathwaySkill:
 
         all_frames: list[pd.DataFrame] = []
         n_kegg = n_go = 0
+        n_attempted = n_failed = 0
 
         for direction, symbols in runs:
             for lib in libraries:
+                n_attempted += 1
                 try:
                     enr = gp.enrichr(
                         gene_list=symbols,
@@ -323,11 +325,24 @@ class PathwaySkill:
                         n_go += len(sig)
                     logger.info("Library %s [%s]: %d significant terms", lib, direction, len(sig))
                 except Exception as exc:
+                    n_failed += 1
                     logger.warning("Enrichr failed — lib=%s direction=%s: %s", lib, direction, exc)
 
+        # All library calls errored (network/parse failure) — this is an
+        # infrastructure failure, NOT a genuine "zero pathways enriched"
+        # result. Callers must not present it as a negative biological finding.
+        all_libraries_failed = n_attempted > 0 and n_failed == n_attempted
+
         if not all_frames:
-            logger.warning("No enrichment results from any library.")
-            return self._empty_result(output_dir, gene_symbols)
+            logger.warning(
+                "No enrichment results from any library (%d/%d libraries failed).",
+                n_failed, n_attempted,
+            )
+            result = self._empty_result(output_dir, gene_symbols)
+            result["libraries_attempted"]   = n_attempted
+            result["libraries_failed"]      = n_failed
+            result["all_libraries_failed"]  = all_libraries_failed
+            return result
 
         combined = (
             pd.concat(all_frames, ignore_index=True)
@@ -367,6 +382,9 @@ class PathwaySkill:
             "background_size":        len(background_symbols) if background_symbols else background_numeric,
             "has_directional":        bool(up_symbols or down_symbols),
             "contaminants_excluded":  dropped,
+            "libraries_attempted":    n_attempted,
+            "libraries_failed":       n_failed,
+            "all_libraries_failed":   all_libraries_failed,
         }
 
     @staticmethod
@@ -382,4 +400,7 @@ class PathwaySkill:
             "gene_symbols":           (gene_symbols or [])[:20],
             "background_size":        None,
             "has_directional":        False,
+            "libraries_attempted":    0,
+            "libraries_failed":       0,
+            "all_libraries_failed":   False,
         }

@@ -24,7 +24,7 @@ import logging
 import re
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -222,18 +222,32 @@ def _detect_data_type(df: pd.DataFrame, sample_cols: List[str]) -> str:
         return "dia_spectronaut"
     if _is_silac(df):
         return "silac_ratio"
+    if any(kw in s for s in combined for kw in ("tmt", "itraq")):
+        return "ms_tmt"
     if any(kw in s for s in combined
-           for kw in ("intensity", "lfq", "tmt", "itraq", "ms1", "spectral", "spc")):
+           for kw in ("intensity", "lfq", "ms1", "spectral", "spc")):
         return "ms_lfq"
     if not sample_cols:
         return "generic"
-    num = df[sample_cols].apply(pd.to_numeric, errors="coerce")
-    mx, mn = num.max().max(), num.min().min()
-    if pd.notna(mx):
-        if -5 <= float(mn) and float(mx) <= 20:
-            return "olink_npx"
-        if float(mx) > 1_000:
-            return "ms_lfq"
+
+    num  = df[sample_cols].apply(pd.to_numeric, errors="coerce")
+    flat = num.to_numpy().flatten()
+    flat = flat[~np.isnan(flat)]
+    if flat.size == 0:
+        return "generic"
+    # Robust to a handful of outlier / mis-parsed cells: use the 1st/99th
+    # percentile rather than absolute min/max, which one contaminated cell
+    # could otherwise dominate.
+    mn, mx = float(np.percentile(flat, 1)), float(np.percentile(flat, 99))
+    if -10 <= mn and mx <= 20:
+        # NB: this band is ambiguous with log2-transformed LFQ/TMT data that
+        # lacks informative column-name hints — range alone can't fully
+        # disambiguate NPX from log2-space intensities.
+        return "olink_npx"
+    if 20 < mx <= 1_000:
+        return "ms_tmt"
+    if mx > 1_000:
+        return "ms_lfq"
     return "generic"
 
 

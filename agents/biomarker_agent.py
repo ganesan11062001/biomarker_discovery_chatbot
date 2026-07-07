@@ -270,11 +270,11 @@ class BiomarkerAgent(BaseAgent):
             state["dual_engine_qc"] = dual["qc"]
             state["r_results_path"] = dual["r_csv"]
         else:
-            state["top_biomarkers"] = result["top_biomarkers"]
-            state["top_proteins"]   = result["top_biomarkers"]
-            state["n_significant"]  = result["n_significant"]
-        state["excel_path"]     = result["excel_path"]
-        state["qc_summary"]     = result["qc_summary"]
+            state["top_biomarkers"] = result.get("top_biomarkers") or []
+            state["top_proteins"]   = state["top_biomarkers"]
+            state["n_significant"]  = result.get("n_significant") or 0
+        state["excel_path"]     = result.get("excel_path")
+        state["qc_summary"]     = result.get("qc_summary") or {}
         state["qc_passed"]      = True
         state["status"]         = "analysis_complete"
 
@@ -289,7 +289,7 @@ class BiomarkerAgent(BaseAgent):
         _hist[_cmp_key] = {
             "top_biomarkers": state["top_biomarkers"],
             "n_significant":  state["n_significant"],
-            "excel_path":     result["excel_path"],
+            "excel_path":     state["excel_path"],
         }
         state["comparison_history"] = _hist
 
