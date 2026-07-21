@@ -57,6 +57,38 @@ _VALID_ACTIONS = {
     "answer",
 }
 
+# Side-effect actions that mutate pipeline state (used in quality gates)
+_SIDE_EFFECT_ACTIONS = frozenset({
+    "run_analysis", "run_enrichment", "run_visualization",
+    "run_all_comparisons", "run_full_pipeline", "load_data",
+})
+
+
+class ActionStep(BaseModel):
+    """A single step within a multi-action sequence returned by the decision LLM.
+
+    Used when the user issues a compound imperative such as:
+      "Compare uDys5 and mdx, identify top 10 biomarkers, then run pathway analysis"
+    The LLM returns these as an ordered list in ``action_sequence``; the
+    orchestrator executes them in order, passing state through each step.
+    """
+    action:          str           = "answer"
+    group1_label:    Optional[str] = None
+    group1_samples:  List[str]     = []
+    group2_label:    Optional[str] = None
+    group2_samples:  List[str]     = []
+    requested_plots: List[str]     = []
+    adj_pval_cutoff: Optional[float] = None
+    log2fc_cutoff:   Optional[float] = None
+    top_n:           Optional[int]   = None
+    test_method:     Optional[str]   = None
+    all_groups:      Optional[Dict[str, List[str]]] = None
+
+    @field_validator("action")
+    @classmethod
+    def _validate_action(cls, v: str) -> str:
+        return v if v in _VALID_ACTIONS else "answer"
+
 
 class DecisionSchema(BaseModel):
     """
@@ -89,6 +121,13 @@ class DecisionSchema(BaseModel):
     # Clarification question — only used when action == "ask_clarification".
     # Write a complete, kind, professional question the user sees verbatim.
     clarification_question: Optional[str]           = None
+
+    # Multi-step sequence — populated only for compound requests such as
+    # "Compare X and Y, identify top 10 biomarkers, then run pathway analysis".
+    # When present with ≥ 2 entries the orchestrator executes each step in
+    # order, passing state through. Single-intent messages leave this [] and
+    # the top-level "action" field is used as normal.
+    action_sequence: List[ActionStep] = []
 
     @field_validator("action")
     @classmethod
@@ -405,8 +444,53 @@ OUTPUT: valid JSON only — no markdown fences, no prose, no trailing text.
   "is_paired": null,
   "all_groups": null,
   "omic_type": null,
-  "clarification_question": null
+  "clarification_question": null,
+  "action_sequence": []
 }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MULTI-STEP SEQUENCES  —  compound imperatives with "then", "and then", "next"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When the user chains two or more actions in ONE message using connectors like
+"then", "and then", "next", "after that", "finally", "also", "followed by":
+
+  EXAMPLE: "Compare uDys5 and mdx, identify top 10 biomarkers, then run
+            pathway analysis and show me the volcano plot"
+
+  → Set "action" to the FIRST step's action (for backward compatibility).
+  → Populate "action_sequence" with ALL steps in order:
+    [
+      {"action": "run_analysis", "group1_label": "uDys5", "group2_label": "mdx", "top_n": 10},
+      {"action": "run_enrichment"},
+      {"action": "run_visualization", "requested_plots": ["volcano"]}
+    ]
+
+Each step in "action_sequence" is an object with:
+  "action"          — required; same valid set as the top-level action
+  "group1_label"    — for run_analysis steps
+  "group2_label"    — for run_analysis steps
+  "group1_samples"  — optional; leave [] if groups resolve from name
+  "group2_samples"  — optional
+  "requested_plots" — for run_visualization steps
+  "top_n"           — for run_analysis steps (number of proteins to report)
+  "test_method"     — for run_analysis steps
+  "adj_pval_cutoff" — threshold override
+  "log2fc_cutoff"   — threshold override
+
+RULES FOR SEQUENCE USE:
+  • Only populate "action_sequence" when the user asks for ≥ 2 distinct
+    pipeline actions in one message. Single-intent messages get [].
+  • De-duplicate: do NOT list the same (action, group pair) twice.
+  • Group names and plot names follow the same rules as the single-action case.
+  • For "compare X and Y and show me the volcano plot":
+      action_sequence = [
+        {"action": "run_analysis", "group1_label": "X", "group2_label": "Y"},
+        {"action": "run_visualization", "requested_plots": ["volcano"]}
+      ]
+  • Questions ending in "?" are NOT compound imperatives — they are handled
+    via the multi-question splitter and should NOT produce an action_sequence.
+    Only use action_sequence for imperative compound requests.
 
 For "ask_clarification": set "clarification_question" to the full question text
 (markdown supported). Leave all group/param fields null. Set confidence ≥ 0.9.
@@ -723,7 +807,7 @@ class LearningAgent(BaseAgent):
             # json_mode=True: forces valid JSON output — no markdown fences,
             # no preamble — eliminating the most common structured-output failure.
             raw = self._call_llm(
-                messages, max_tokens=350, temperature=0.0, json_mode=True
+                messages, max_tokens=600, temperature=0.0, json_mode=True
             ).strip()
 
             # Validate + coerce with Pydantic (catches unknown actions, bad types)
@@ -734,6 +818,20 @@ class LearningAgent(BaseAgent):
                 self.logger.warning(
                     "Low-confidence decision (%.2f) for action=%s — demoting to 'answer'",
                     decision_obj.confidence, decision_obj.action,
+                )
+                decision_obj.action = "answer"
+
+            # Reason-quality guard: GPT-4o self-reports ≥ 0.95 confidence on
+            # nearly every decision, so the bare confidence threshold rarely
+            # triggers.  For side-effect actions we additionally require a
+            # substantive reason (≥ 8 chars) before letting the action fire,
+            # catching cases where the model is confident-but-terse (which
+            # correlates with misrouted requests).
+            reason_text = (decision_obj.reason or "").strip()
+            if decision_obj.action in _SIDE_EFFECT_ACTIONS and len(reason_text) < 8:
+                self.logger.warning(
+                    "Thin reason (%r) for side-effect action=%s — demoting to 'answer'.",
+                    reason_text, decision_obj.action,
                 )
                 decision_obj.action = "answer"
 
@@ -1630,6 +1728,10 @@ class LearningAgent(BaseAgent):
         n = len(questions)
         parts: List[str] = [f"You asked **{n} questions** — answering each below.\n"]
 
+        # Track which pipeline actions have already been executed in this batch
+        # so we never run enrichment or visualization more than once per message.
+        _dispatched: set = set()
+
         for i, q in enumerate(questions, 1):
             self.logger.info("Multi-q [%d/%d]: %s", i, n, q[:80])
 
@@ -1652,10 +1754,40 @@ class LearningAgent(BaseAgent):
                     sub_state = self._show_code(sub_state)
                 elif sub_action == "modify_code":
                     sub_state = self._modify_code(sub_state)
+                elif (
+                    sub_action == "run_enrichment"
+                    and "run_enrichment" not in _dispatched
+                ):
+                    # Execute enrichment once if results aren't already in state;
+                    # merge pathways back to the outer state so later sub-questions
+                    # (and the combined response) can reference them.
+                    if state.get("pathways"):
+                        sub_state = self._answer(sub_state)  # already done → answer from results
+                    else:
+                        sub_state = self._specialist("enrichment").run(sub_state)
+                        if sub_state.get("pathways"):
+                            state["pathways"] = sub_state["pathways"]
+                    _dispatched.add("run_enrichment")
+                elif (
+                    sub_action == "run_visualization"
+                    and "run_visualization" not in _dispatched
+                ):
+                    # Execute visualization once; merge plot_paths back.
+                    if state.get("plot_paths") and not sub_decision.get("requested_plots"):
+                        sub_state = self._answer(sub_state)  # already done → describe them
+                    else:
+                        requested_plots = sub_decision.get("requested_plots") or []
+                        sub_state = self._specialist("visualization").run(
+                            sub_state, requested_plots=requested_plots or None
+                        )
+                        if sub_state.get("plot_paths"):
+                            state["plot_paths"] = sub_state["plot_paths"]
+                    _dispatched.add("run_visualization")
                 else:
-                    # answer, ask_clarification, run_*, load_data — all fall through
-                    # to the conversational answer path for sub-questions, since we
-                    # don't want side-effects like re-running analysis 30 times.
+                    # Heavy pipeline re-runs (run_analysis, run_full_pipeline,
+                    # load_data) and duplicate dispatches fall through to the
+                    # conversational answer path so existing results are
+                    # described rather than recomputed.
                     sub_state = self._answer(sub_state)
 
                 last = next(
@@ -2364,6 +2496,134 @@ class LearningAgent(BaseAgent):
         state["status"]       = "answered"
         return state
 
+    # ── Multi-step sequence executor ─────────────────────────────────────────
+
+    def _execute_action_sequence(
+        self,
+        state: BiomarkerState,
+        action_sequence: List[Dict[str, Any]],
+    ) -> BiomarkerState:
+        """Execute an ordered list of ActionStep dicts produced by the decision LLM.
+
+        Called when a compound imperative is detected, e.g.:
+            "Compare uDys5 and mdx, identify top 10 biomarkers, then run
+             pathway analysis and show me the volcano plot"
+
+        Steps are executed in order with state passed through. Duplicate
+        (action, group-pair) combinations are silently skipped to prevent
+        redundant pipeline runs.
+        """
+        all_cols   = state.get("sample_columns") or []
+        all_groups = state.get("all_groups") or {}
+        label_map  = state.get("label_map") or {}
+        seen: set  = set()
+
+        def _resolve_label(label: Optional[str]) -> List[str]:
+            """Best-effort expansion of a group label to sample column list."""
+            if not label:
+                return []
+            # 1. Metadata label-map (canonical 2-sheet templates)
+            wanted = str(label).strip().lower()
+            lm_hits = [
+                c for c, g in (label_map.items() if isinstance(label_map, dict) else [])
+                if str(g).strip().lower() == wanted and c in all_cols
+            ]
+            if lm_hits:
+                return [c for c in all_cols if c in set(lm_hits)]
+            # 2. all_groups exact match
+            for k, v in all_groups.items():
+                if k.lower() == wanted:
+                    return list(v)
+            # 3. Prefix-pool: "DMD" → "DMD Heart" + "DMD Quad"
+            prefix = wanted + " "
+            pooled = []
+            for k, v in all_groups.items():
+                if k.lower().startswith(prefix) or k.lower() == wanted:
+                    pooled.extend(c for c in v if c in all_cols)
+            if pooled:
+                return [c for c in all_cols if c in set(pooled)]
+            # 4. Column prefix/substring match
+            return [c for c in all_cols if c.lower().startswith(wanted)
+                    or wanted in c.lower()]
+
+        n_steps = len(action_sequence)
+        for i, step in enumerate(action_sequence):
+            action = step.get("action", "answer")
+
+            # Deduplication key: group pair for run_analysis, action otherwise
+            if action == "run_analysis":
+                g1 = (step.get("group1_label") or "").lower()
+                g2 = (step.get("group2_label") or "").lower()
+                dedup_key = f"run_analysis:{min(g1,g2)}:{max(g1,g2)}"
+            else:
+                dedup_key = action
+
+            if dedup_key in seen:
+                self.logger.info(
+                    "Sequence step %d/%d (%s) skipped — already executed this action.",
+                    i + 1, n_steps, action,
+                )
+                continue
+            seen.add(dedup_key)
+
+            self.logger.info("Sequence step %d/%d: %s", i + 1, n_steps, action)
+
+            # Merge step-level parameter overrides into session params
+            for param in ("adj_pval_cutoff", "log2fc_cutoff", "top_n", "test_method"):
+                if step.get(param) is not None:
+                    params = dict(state.get("analysis_params") or {})
+                    params[param] = step[param]
+                    state["analysis_params"] = params
+
+            if action == "run_analysis":
+                g1_label   = step.get("group1_label")
+                g2_label   = step.get("group2_label")
+                g1_samples = list(step.get("group1_samples") or [])
+                g2_samples = list(step.get("group2_samples") or [])
+                if g1_label and not g1_samples:
+                    g1_samples = _resolve_label(g1_label)
+                if g2_label and not g2_samples:
+                    g2_samples = _resolve_label(g2_label)
+                if g1_samples and g2_samples:
+                    state["group1_label"]   = g1_label or "Group1"
+                    state["group1_samples"] = g1_samples
+                    state["group2_label"]   = g2_label or "Group2"
+                    state["group2_samples"] = g2_samples
+                state = self._specialist("biomarker").run(state)
+
+            elif action == "run_enrichment":
+                state = self._specialist("enrichment").run(state)
+
+            elif action == "run_visualization":
+                requested_plots = step.get("requested_plots") or []
+                state = self._specialist("visualization").run(
+                    state, requested_plots=requested_plots or None
+                )
+
+            elif action == "run_all_comparisons":
+                state = self._run_all_comparisons(state)
+
+            elif action == "run_full_pipeline":
+                state = self._run_full_pipeline(state)
+
+            elif action == "query_data":
+                state = self._query_data(state)
+
+            elif action == "query_database":
+                state = self._query_database(state)
+
+            elif action == "show_code":
+                state = self._show_code(state)
+
+            else:  # answer, ask_clarification, unknown
+                state = self._answer(state)
+
+        last_action = action_sequence[-1].get("action", "answer") if action_sequence else "answer"
+        state["intent"]       = last_action
+        state["active_agent"] = "learning_agent"
+        state["status"]       = "pipeline_complete"
+        return state
+
     # ── Main entry point ──────────────────────────────────────────────────────
 
     @_traceable(run_type="chain", name="learning_agent",
@@ -2415,6 +2675,17 @@ class LearningAgent(BaseAgent):
         state["intent"]       = action
         state["active_agent"] = "learning_agent"
 
+        # ── Multi-step sequence: compound imperatives ("X then Y then Z") ────
+        # When the decision LLM returns ≥ 2 action steps, execute each in order
+        # rather than running only the first step and dropping the rest.
+        action_seq = decision.get("action_sequence") or []
+        if len(action_seq) >= 2:
+            self.logger.info(
+                "Multi-step sequence detected (%d steps): %s",
+                len(action_seq), [s.get("action") for s in action_seq],
+            )
+            return self._execute_action_sequence(state, action_seq)
+
         # ── Capture analysis parameter overrides from the decision ─────────────
         # Merge any non-null params from this decision into the session overrides.
         # Existing overrides are preserved so values set in earlier turns carry
@@ -2453,7 +2724,22 @@ class LearningAgent(BaseAgent):
             "show chart", "show charts", "show heatmap", "show volcano",
             "show pca",
         )
-        if action == "answer" and any(p in _uq_lower for p in _viz_phrases):
+        # Negative guard: don't override when the phrase appears inside a
+        # conceptual question (e.g. "what does a volcano plot show?",
+        # "walk me through what you'd show me on a volcano plot").
+        _conceptual_viz_re = re.compile(
+            r"what\s+(is|does|do|are)\s+.{0,50}(show|plot|chart)|"
+            r"(explain|describe|define)\s+.{0,50}(plot|chart|heatmap|volcano|pca)|"
+            r"walk.{0,20}through.{0,40}(show|plot|chart)|"
+            r"what.{0,30}would.{0,30}show|"
+            r"what\s+(represents?|means?|tells?).{0,40}(plot|chart|heatmap|volcano)",
+            re.IGNORECASE,
+        )
+        if (
+            action == "answer"
+            and any(p in _uq_lower for p in _viz_phrases)
+            and not _conceptual_viz_re.search(user_query)
+        ):
             self.logger.info("Override: 'answer' -> 'run_visualization' (user asked to show plots).")
             action = "run_visualization"
             state["intent"] = action
