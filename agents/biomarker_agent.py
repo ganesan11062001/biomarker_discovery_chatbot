@@ -115,7 +115,17 @@ class BiomarkerAgent(BaseAgent):
             )
 
         # Determine supervised vs unsupervised mode
-        mode = "supervised" if (g1 and g2) else "unsupervised"
+        _overrides_early = state.get("analysis_params") or {}
+        _method_hint = _overrides_early.get("test_method") or state.get("test_method") or "auto"
+        # New scenario-coverage methods (dose-response, repeated-measures,
+        # clinical regression) don't use group1/group2_samples — they key off
+        # all_groups / clinical_outcome instead — but are still "supervised"
+        # analyses (they produce p-values / effect sizes, not CV ranking).
+        _new_method_flag = _method_hint in (
+            "dose_response", "repeated_measures",
+            "linear_regression", "logistic_regression", "cox_regression",
+        )
+        mode = "supervised" if (g1 and g2) or _new_method_flag else "unsupervised"
         state["analysis_mode"] = mode
         state["status"] = "analyzing"
 
@@ -139,22 +149,34 @@ class BiomarkerAgent(BaseAgent):
             else:
                 _effective_label_method = _req_method
             _method_label = {
-                "limma":            "limma moderated t-test (eBayes)",
-                "paired_t":         "paired t-test",
-                "anova":            "one-way ANOVA",
-                "welch":            "Welch t-test",
-                "fold_change_only": "fold-change only (n=1, no statistical test)",
+                "limma":               "limma moderated t-test (eBayes)",
+                "paired_t":            "paired t-test",
+                "anova":               "one-way ANOVA + Tukey HSD post-hoc",
+                "welch":               "Welch t-test",
+                "fold_change_only":    "fold-change only (n=1, no statistical test)",
+                "dose_response":       "dose-response linear trend test",
+                "repeated_measures":   "repeated-measures ANOVA / mixed-effects model",
+                "linear_regression":   "linear regression vs. clinical outcome",
+                "logistic_regression": "logistic regression vs. clinical outcome (+ ROC AUC)",
+                "cox_regression":      "Cox proportional-hazards regression",
             }.get(_effective_label_method, _effective_label_method)
             _pipeline_suffix = (
                 "BH FDR." if _effective_label_method != "fold_change_only"
                 else "ranked by |log₂FC|."
             )
-            mode_label = (
-                f"differential expression analysis — **{g1_lbl}** (n={n1}) vs "
-                f"**{g2_lbl}** (n={n2}) — {_method_label}. "
-                f"Pipeline: log₂ transform → median normalisation → "
-                f"group-aware filter → half-min imputation → {_method_label} → {_pipeline_suffix}"
-            )
+            if _new_method_flag:
+                mode_label = (
+                    f"{_method_label} analysis. "
+                    f"Pipeline: log₂ transform → median normalisation → "
+                    f"group-aware filter → half-min imputation → {_method_label} → {_pipeline_suffix}"
+                )
+            else:
+                mode_label = (
+                    f"differential expression analysis — **{g1_lbl}** (n={n1}) vs "
+                    f"**{g2_lbl}** (n={n2}) — {_method_label}. "
+                    f"Pipeline: log₂ transform → median normalisation → "
+                    f"group-aware filter → half-min imputation → {_method_label} → {_pipeline_suffix}"
+                )
         else:
             mode_label = (
                 "unsupervised variability analysis (no group labels). "
@@ -193,16 +215,25 @@ class BiomarkerAgent(BaseAgent):
         _tmt_batches = state.get("tmt_batches")
 
         # Only pass all_groups when the user explicitly requested ANOVA across 3+
-        # groups. For pairwise run_analysis (group1/group2 set), all_groups is
-        # inherited from ingestion-time label detection and must NOT be forwarded —
-        # the skill's is_anova condition fires on any all_groups with ≥2 entries,
-        # causing a spurious ANOVA attempt that fails when n=1 per group.
-        _explicit_anova = _test_method == "anova"
+        # groups, or a group-based new-scenario method (dose-response /
+        # repeated-measures). For pairwise run_analysis (group1/group2 set),
+        # all_groups is inherited from ingestion-time label detection and must
+        # NOT be forwarded — the skill's is_anova condition fires on any
+        # all_groups with ≥2 entries, causing a spurious ANOVA attempt that
+        # fails when n=1 per group.
+        _group_based_method = _test_method in ("anova", "dose_response", "repeated_measures")
         _override_groups = _overrides.get("all_groups")
-        if _explicit_anova or _override_groups:
+        if _group_based_method or _override_groups:
             _all_groups = _override_groups or state.get("all_groups")
         else:
             _all_groups = None
+
+        # Dose-response (case 6): group name -> numeric dose level
+        _dose_levels = _overrides.get("dose_levels") or state.get("dose_levels")
+        # Time-course (case 7): sample column -> subject/animal ID
+        _subject_map = _overrides.get("subject_map") or state.get("subject_map")
+        # Clinical regression (case 10): sample column -> outcome value
+        _clinical_outcome = _overrides.get("clinical_outcome") or state.get("clinical_outcome")
 
         result = skill.execute(
             # Standard parameters
@@ -227,6 +258,10 @@ class BiomarkerAgent(BaseAgent):
             tmt_batches=_tmt_batches,
             # Pooled / no-replicates designs → fold-change-only ranking
             is_pooled_design=bool(state.get("is_pooled_design")),
+            # New scenario-coverage parameters (cases 6, 7, 10)
+            dose_levels=_dose_levels,
+            subject_map=_subject_map,
+            clinical_outcome=_clinical_outcome,
         )
 
         if result.get("error"):

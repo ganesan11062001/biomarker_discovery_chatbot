@@ -119,7 +119,10 @@ class SilacAnalysisSkill(BaseOmicsSkill):
         top_n, output_dir, file_name,
     ) -> Dict[str, Any]:
 
-        df_raw = pd.read_csv(data_path, index_col=0)
+        try:
+            df_raw = pd.read_csv(data_path, index_col=0)
+        except UnicodeDecodeError:
+            df_raw = pd.read_csv(data_path, index_col=0, encoding="cp1252")
         avail  = [c for c in sample_columns if c in df_raw.columns]
         if not avail:
             raise ValueError(

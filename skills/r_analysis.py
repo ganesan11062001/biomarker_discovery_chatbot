@@ -169,11 +169,17 @@ class RAnalysisSkill:
 
         expression_df[g1 + g2].to_csv(expr_csv, index=True)
         grps.to_csv(group_csv, index=False)
-        script_p.write_text(_R_SCRIPT_TEMPLATE)
+        script_p.write_text(_R_SCRIPT_TEMPLATE, encoding="utf-8")
 
         cmd = [self.rscript_path, str(script_p),
                str(expr_csv), str(group_csv), str(out_csv)]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        # Rscript's console output can contain locale-specific, non-UTF-8 bytes
+        # on Windows (e.g. curly quotes from package startup messages). Decode
+        # defensively so a stray byte never crashes an otherwise-successful run.
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=600,
+        )
 
         if proc.returncode != 0 or not out_csv.exists():
             raise RAnalysisError(
@@ -183,7 +189,7 @@ class RAnalysisSkill:
                 f"  stderr: {proc.stderr[:600]}"
             )
 
-        df = pd.read_csv(out_csv)
+        df = pd.read_csv(out_csv, encoding="utf-8", encoding_errors="replace")
 
         # Flip sign if the contrast came back as B - A (the alphabetical prefix
         # should prevent this, but guard anyway by checking mean per group).

@@ -30,3 +30,6 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Portable local tooling (Node runtime, etc.)
+.tools/

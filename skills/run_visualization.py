@@ -121,7 +121,10 @@ def _load_wide(data_path: str, cols: List[str]) -> Optional[pd.DataFrame]:
     """Load processed data CSV and return columns that exist."""
     if not data_path or not Path(data_path).exists():
         return None
-    df = pd.read_csv(data_path, index_col=0)
+    try:
+        df = pd.read_csv(data_path, index_col=0)
+    except UnicodeDecodeError:
+        df = pd.read_csv(data_path, index_col=0, encoding="cp1252")
     valid = [c for c in cols if c in df.columns]
     if not valid:
         return None

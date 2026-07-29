@@ -83,6 +83,9 @@ class ActionStep(BaseModel):
     top_n:           Optional[int]   = None
     test_method:     Optional[str]   = None
     all_groups:      Optional[Dict[str, List[str]]] = None
+    dose_levels:     Optional[Dict[str, float]] = None
+    subject_map:     Optional[Dict[str, str]]   = None
+    clinical_outcome: Optional[Dict[str, Any]]  = None
 
     @field_validator("action")
     @classmethod
@@ -113,10 +116,24 @@ class DecisionSchema(BaseModel):
     top_n:             Optional[int]   = None   # number of proteins to report
 
     # Extended test method — extracted when user explicitly requests a test type
-    test_method:  Optional[str]                     = None  # "welch"|"limma"|"paired_t"|"anova"
+    test_method:  Optional[str]                     = None  # "welch"|"limma"|"paired_t"|"anova"|"dose_response"|"repeated_measures"|"linear_regression"|"logistic_regression"|"cox_regression"
     is_paired:    Optional[bool]                    = None  # True for matched/before-after designs
-    all_groups:   Optional[Dict[str, List[str]]]    = None  # ANOVA: {group: [cols], ...}
+    all_groups:   Optional[Dict[str, List[str]]]    = None  # ANOVA/dose-response/repeated-measures: {group: [cols], ...}
     omic_type:    Optional[str]                     = None  # "proteomics" (intensity-only canonical)
+
+    # Dose-response (case 6): group name -> numeric dose level
+    dose_levels: Optional[Dict[str, float]] = None
+    # Time-course / repeated-measures (case 7): sample column -> subject/animal ID
+    subject_map: Optional[Dict[str, str]]   = None
+    # Clinical regression (case 10): sample column -> outcome value
+    # (scalar for linear/logistic; {"time":.., "event":..} dict for cox)
+    clinical_outcome: Optional[Dict[str, Any]] = None
+
+    # PTM / phosphoproteomics enrichment (case 9): true when the user's data
+    # or question concerns phosphosite / PTM biology. Drives kinase-substrate
+    # enrichment library selection without altering the omic_type used for
+    # the core DEA skill registry lookup.
+    ptm_analysis: Optional[bool] = None
 
     # Clarification question — only used when action == "ask_clarification".
     # Write a complete, kind, professional question the user sees verbatim.
@@ -187,7 +204,11 @@ class DecisionSchema(BaseModel):
     def _validate_test_method(cls, v) -> Optional[str]:
         if v is None:
             return None
-        valid = {"auto", "welch", "limma", "paired_t", "anova"}
+        valid = {
+            "auto", "welch", "limma", "paired_t", "anova",
+            "dose_response", "repeated_measures",
+            "linear_regression", "logistic_regression", "cox_regression",
+        }
         s = str(v).lower().strip()
         return s if s in valid else None
 
@@ -272,7 +293,35 @@ TEST METHOD EXTRACTION (populate "test_method" when user explicitly requests one
   "welch"    — user says "Welch t-test", "standard t-test", "regular t-test"
   "paired_t" — user says "paired", "matched samples", "before/after", "pre/post", "same subject"
   "anova"    — user says "ANOVA", "more than 2 groups", "multiple groups simultaneously", "F-test"
+              A real Tukey HSD post-hoc pairwise comparison is always run automatically
+              alongside ANOVA — no separate action needed.
+  "dose_response" — user says "dose response", "dose-dependent", "trend across doses",
+              "increasing dose", "vehicle/low/medium/high", "dose escalation". Requires
+              ordered dose groups — also populate "all_groups" (group→sample columns) and
+              "dose_levels" (group name→numeric dose, e.g. {"Vehicle":0,"Low":1,"Medium":2,"High":3}).
+  "repeated_measures" — user says "time course", "time-course", "longitudinal",
+              "repeated measures", "across time points", "Day 0/1/3/7", "same subject
+              /animal over time". Requires the time points — populate "all_groups"
+              (time-point label→sample columns) and "subject_map" (sample column→
+              subject/animal ID so the same biological unit is tracked across time).
+  "linear_regression" — user says "regress against", "correlate with a continuous
+              clinical variable", "linear model vs <lab value/score>". Populate
+              "clinical_outcome" (sample column→numeric outcome value).
+  "logistic_regression" — user says "logistic regression", "predict responder/
+              non-responder", "classify", "ROC", "AUC", "binary outcome". Populate
+              "clinical_outcome" (sample column→0/1 outcome value).
+  "cox_regression" — user says "Cox regression", "survival analysis", "hazard ratio",
+              "time to event", "progression-free survival", "overall survival". Populate
+              "clinical_outcome" (sample column→{"time": <float>, "event": 0|1} dict).
   Leave null for "auto" (default; pipeline auto-selects limma vs Welch by sample size).
+
+PTM / PHOSPHOPROTEOMICS (populate "ptm_analysis" = true when relevant):
+  User mentions "phospho", "phosphoproteomics", "phosphosite", "PTM",
+  "post-translational modification", "kinase activity", "kinase-substrate" →
+  set ptm_analysis = true. This adds kinase-enrichment libraries (KEA, GEO
+  kinase perturbations) alongside the standard KEGG/GO/Reactome pathway
+  libraries during run_enrichment — it does NOT change the DEA statistics,
+  which run identically on phosphosite intensities.
 
 MULTI-GROUP ANOVA (populate "all_groups" when user has >2 groups for ANOVA):
   When user says "compare WT, KO, and HET" or "ANOVA across all 4 groups":
@@ -443,6 +492,10 @@ OUTPUT: valid JSON only — no markdown fences, no prose, no trailing text.
   "test_method": null,
   "is_paired": null,
   "all_groups": null,
+  "dose_levels": null,
+  "subject_map": null,
+  "clinical_outcome": null,
+  "ptm_analysis": null,
   "omic_type": null,
   "clarification_question": null,
   "action_sequence": []
@@ -2569,11 +2622,16 @@ class LearningAgent(BaseAgent):
             self.logger.info("Sequence step %d/%d: %s", i + 1, n_steps, action)
 
             # Merge step-level parameter overrides into session params
-            for param in ("adj_pval_cutoff", "log2fc_cutoff", "top_n", "test_method"):
+            for param in (
+                "adj_pval_cutoff", "log2fc_cutoff", "top_n", "test_method",
+                "dose_levels", "subject_map", "clinical_outcome",
+            ):
                 if step.get(param) is not None:
                     params = dict(state.get("analysis_params") or {})
                     params[param] = step[param]
                     state["analysis_params"] = params
+            if step.get("all_groups"):
+                state["all_groups"] = step["all_groups"]
 
             if action == "run_analysis":
                 g1_label   = step.get("group1_label")
@@ -2692,7 +2750,7 @@ class LearningAgent(BaseAgent):
         # forward until the user explicitly changes them.
         _param_keys = (
             "adj_pval_cutoff", "log2fc_cutoff", "missing_threshold", "top_n",
-            "test_method",
+            "test_method", "dose_levels", "subject_map", "clinical_outcome",
         )
         new_params = {k: decision[k] for k in _param_keys
                       if k in decision and decision[k] is not None}
@@ -2709,6 +2767,14 @@ class LearningAgent(BaseAgent):
             state["all_groups"] = decision["all_groups"]
         if decision.get("omic_type"):
             state["omic_type"] = decision["omic_type"]
+        if decision.get("dose_levels"):
+            state["dose_levels"] = decision["dose_levels"]
+        if decision.get("subject_map"):
+            state["subject_map"] = decision["subject_map"]
+        if decision.get("clinical_outcome"):
+            state["clinical_outcome"] = decision["clinical_outcome"]
+        if decision.get("ptm_analysis") is not None:
+            state["ptm_analysis"] = bool(decision["ptm_analysis"])
 
         # ── Deterministic intent overrides ────────────────────────────────────
         # The LLM occasionally mis-routes a couple of recurring phrasings.

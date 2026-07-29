@@ -143,6 +143,8 @@ class EnrichmentAgent(BaseAgent):
                 down_proteins=down_proteins or None,
                 dea_result_path=results_path,
                 organism=state.get("organism", "human"),
+                omic_type=("phosphoproteomics" if state.get("ptm_analysis")
+                           else state.get("omic_type") or "proteomics"),
             )
 
             state["enrichment_result_path"] = result["enrichment_result_path"]

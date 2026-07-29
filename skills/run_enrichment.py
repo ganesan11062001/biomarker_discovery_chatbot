@@ -44,6 +44,19 @@ _LIBRARIES: dict[str, list[str]] = {
     ],
 }
 
+# Kinase-substrate / PTM-specific libraries (case 9: phosphoproteomics/PTM
+# enrichment). Added on top of the standard pathway libraries above when
+# omic_type indicates PTM data — Enrichr's kinase libraries are human-curated
+# but are commonly applied to mouse/rat phosphosite data via ortholog mapping,
+# same as the existing rat→mouse KEGG proxy convention in this file.
+_PTM_LIBRARIES: list[str] = [
+    "KEA_2015",                            # Kinase Enrichment Analysis
+    "Kinase_Perturbations_from_GEO_up",
+    "Kinase_Perturbations_from_GEO_down",
+]
+
+_PTM_OMIC_TYPES = {"phosphoproteomics", "phospho", "ptm"}
+
 _GN_RE = re.compile(r'\bGN=(\w[\w\-]*)', re.IGNORECASE)
 # MaxQuant/FASTA: sp|ACCESSION|GENENAME_SPECIES
 _SP_RE = re.compile(r'(?:sp|tr)\|[A-Z0-9\-]+\|([A-Z0-9]+)_[A-Z]+', re.IGNORECASE)
@@ -224,6 +237,7 @@ class PathwaySkill:
         organism: str = "human",
         pval_cutoff: float = 0.05,
         output_dir: str = "outputs",
+        omic_type: str = "proteomics",
     ) -> dict:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -279,7 +293,12 @@ class PathwaySkill:
         organism_key = _normalize_organism(organism)
         if organism_key == "rat":
             logger.warning("Rat Enrichr libraries unavailable; using mouse as proxy.")
-        libraries    = _LIBRARIES.get(organism_key, _LIBRARIES["human"])
+        libraries    = list(_LIBRARIES.get(organism_key, _LIBRARIES["human"]))
+        is_ptm = str(omic_type or "").strip().lower() in _PTM_OMIC_TYPES
+        if is_ptm:
+            libraries.extend(_PTM_LIBRARIES)
+            logger.info("PTM/phosphoproteomics detected — adding kinase-substrate "
+                        "enrichment libraries: %s", _PTM_LIBRARIES)
         enr_organism = "human" if organism_key == "human" else "mouse"
         logger.info("Enrichment organism: '%s' → key='%s', enr_organism='%s', libraries=%s",
                     organism, organism_key, enr_organism, libraries)
@@ -300,11 +319,16 @@ class PathwaySkill:
         for direction, symbols in runs:
             for lib in libraries:
                 n_attempted += 1
+                # Kinase-substrate libraries are human-curated only; query the
+                # main Enrichr (human) site for them even in a mouse/rat
+                # analysis (gene symbols are compared case-insensitively —
+                # same convention used for KEGG/GO libraries elsewhere).
+                lib_organism = "human" if lib in _PTM_LIBRARIES else enr_organism
                 try:
                     enr = gp.enrichr(
                         gene_list=symbols,
                         gene_sets=lib,
-                        organism=enr_organism,
+                        organism=lib_organism,
                         outdir=None,
                         background=background_symbols if background_symbols else (background_numeric or 20000),
                         cutoff=pval_cutoff,

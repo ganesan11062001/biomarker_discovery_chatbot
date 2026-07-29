@@ -352,6 +352,76 @@ def _detect_tmt_batches(
     return result
 
 
+# Preference order when the SAME physical sample is quantified through
+# multiple channels side-by-side (e.g. "A SpC" and "A Intensity" both present
+# for sample "A"). Intensity-based metrics are the modern, more precise
+# quantitative standard; spectral counting (SpC) is a cruder, older
+# semi-quantitative proxy — so intensity wins when both exist.
+_METRIC_CHANNEL_PRIORITY = [
+    "intensity", "lfq", "ibaq", "abundance", "quantity", "ratio",
+    "spectral", "spc",
+]
+
+
+def _dedupe_quant_channels(
+    sample_cols: List[str],
+) -> Tuple[List[str], Dict[str, List[str]]]:
+    """Collapse duplicate quantification channels for the same sample.
+
+    Some proteomics exports report ONE biological sample through several
+    parallel metric columns (e.g. "A SpC" and "A Intensity" for sample "A").
+    These are NOT independent biological replicates — they're the same
+    sample measured two different ways. Treating both as separate "sample
+    columns" silently doubles the apparent group size (a group reported as
+    n=2 is actually n=1 real replicate measured twice), which corrupts
+    downstream statistics (fake replication, degenerate fold-change-only
+    fallbacks, and near-identical results across supposedly different
+    comparisons).
+
+    For every base sample id that has more than one recognised metric
+    channel, keep only the highest-priority one (see
+    ``_METRIC_CHANNEL_PRIORITY``) and drop the rest.
+
+    Returns (deduped_sample_cols_in_original_order, {base_id: [dropped_cols]}).
+    """
+    groups: Dict[str, List[Tuple[str, str]]] = {}
+    for col in sample_cols:
+        tokens = re.split(r"[\s_\-]+", str(col).strip())
+        metric = None
+        base_tokens: List[str] = []
+        for tok in tokens:
+            tl = tok.lower()
+            if metric is None:
+                hit = next((m for m in _METRIC_CHANNEL_PRIORITY if tl == m or tl.startswith(m)), None)
+                if hit:
+                    metric = hit
+                    continue
+            base_tokens.append(tok)
+        base = " ".join(base_tokens).strip().lower()
+        key = base if (metric and base) else str(col).strip().lower()
+        groups.setdefault(key, []).append((col, metric or ""))
+
+    kept: set = set()
+    dropped: Dict[str, List[str]] = {}
+    for base, entries in groups.items():
+        metrics_present = {m for _, m in entries if m}
+        if len(entries) == 1 or len(metrics_present) <= 1:
+            kept.update(c for c, _ in entries)
+            continue
+        # Multiple distinct metric channels for the SAME sample — keep only
+        # the highest-priority one.
+        entries_sorted = sorted(
+            entries,
+            key=lambda ce: _METRIC_CHANNEL_PRIORITY.index(ce[1])
+            if ce[1] in _METRIC_CHANNEL_PRIORITY else 999,
+        )
+        kept.add(entries_sorted[0][0])
+        dropped[base] = [c for c, _ in entries_sorted[1:]]
+
+    kept_ordered = [c for c in sample_cols if c in kept]
+    return kept_ordered, dropped
+
+
 def _separate_columns(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     """Split columns into sample-value columns and metadata columns.
 
@@ -575,6 +645,24 @@ class DataLoadingSkill:
             len(sample_cols), len(metadata_cols), sample_cols[:5],
         )
 
+        # ── 3b. Collapse duplicate quantification channels per sample ────────
+        # e.g. "A SpC" + "A Intensity" both present for the same physical
+        # sample "A" — keep only the higher-priority metric so a sample isn't
+        # double-counted as 2 independent replicates.
+        deduped_cols, dropped_channels = _dedupe_quant_channels(sample_cols)
+        if dropped_channels:
+            logger.warning(
+                "Collapsed duplicate quantification channels for %d sample(s) "
+                "(kept higher-priority metric, dropped: %s) — these are the "
+                "SAME physical sample measured multiple ways, not independent "
+                "replicates.",
+                len(dropped_channels), dropped_channels,
+            )
+            metadata_cols = metadata_cols + [
+                c for cols in dropped_channels.values() for c in cols
+            ]
+            sample_cols = deduped_cols
+
         # ── 4. Detect data type ───────────────────────────────────────────────
         data_type = _detect_data_type(df, sample_cols)
         logger.info("Data type: %s", data_type)
@@ -592,7 +680,12 @@ class DataLoadingSkill:
         # ── 5. Persist processed CSV ──────────────────────────────────────────
         out_name = f"{path.stem}_processed_{uuid.uuid4().hex[:8]}.csv"
         out_path = str(Path(output_dir) / out_name)
-        df.to_csv(out_path)
+        # Explicit UTF-8: protein/gene names can contain non-ASCII characters
+        # (Greek letters, µ, ±, etc.). Without a pinned encoding, Windows would
+        # write with the system locale codepage (e.g. cp1252), which every
+        # downstream pd.read_csv(data_path) call (assuming UTF-8) then fails
+        # to decode.
+        df.to_csv(out_path, encoding="utf-8")
         logger.info("Saved → %s", out_path)
 
         result: dict = {
