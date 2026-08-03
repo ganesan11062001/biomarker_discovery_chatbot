@@ -90,7 +90,7 @@ def get_trace_metadata(state: dict) -> dict:
         "n_pathways":      len(state.get("pathways") or []),
         "n_plots":         len(state.get("plot_paths") or []),
         "excel_ready":     bool(state.get("excel_path")),
-        "enrichment_done": bool(state.get("pathways")),
+        "enrichment_done": bool(state.get("enrichment_ran")),
         # Orchestration
         "status":          state.get("status"),
         "active_agent":    state.get("active_agent"),

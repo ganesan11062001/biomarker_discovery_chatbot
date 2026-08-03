@@ -149,6 +149,9 @@ class EnrichmentAgent(BaseAgent):
 
             state["enrichment_result_path"] = result["enrichment_result_path"]
             state["pathways"]               = result["top_pathways"]
+            # Pipeline actually executed — set regardless of hit count so a
+            # genuine zero-pathway result isn't later mistaken for "never run".
+            state["enrichment_ran"]         = True
 
             # Every Enrichr library call errored — this is an infrastructure
             # failure, not a genuine "zero pathways enriched" result. Report

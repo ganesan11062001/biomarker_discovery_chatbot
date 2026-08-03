@@ -596,7 +596,7 @@ def _render_topbar(session_id: str | None, astate: dict) -> None:
             # Pipeline status strip — compact dots in the top bar
             data_done     = bool(astate.get("data_type"))
             analysis_done = astate.get("n_significant") is not None
-            enrich_done   = bool(astate.get("pathways"))
+            enrich_done   = bool(astate.get("enrichment_ran"))
             plots_done    = bool(astate.get("plot_paths"))
 
             def _dot(label: str, icon: str, done: bool) -> str:

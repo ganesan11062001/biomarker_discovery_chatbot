@@ -198,6 +198,7 @@ class SessionManager:
             # ── Enrichment ────────────────────────────────────────────────────
             enrichment_result_path = None,
             pathways               = None,
+            enrichment_ran         = None,
             # ── Visualisation ─────────────────────────────────────────────────
             plot_paths           = None,
             report_path          = None,

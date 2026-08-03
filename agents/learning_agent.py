@@ -767,7 +767,7 @@ class LearningAgent(BaseAgent):
         ctx += f"  analysis_mode: {state.get('analysis_mode', 'none')}\n"
         ctx += f"  has_analysis_code: {bool(state.get('analysis_code'))}\n"
         ctx += f"  has_plots: {bool(state.get('plot_paths'))}\n"
-        ctx += f"  enrichment_done: {bool(state.get('pathways'))}\n"
+        ctx += f"  enrichment_done: {bool(state.get('enrichment_ran'))}\n"
         ctx += f"  status: {state.get('status', 'ready')}\n"
         ctx += f"  is_paired: {state.get('is_paired', False)}\n"
         ctx += f"  test_method_set: {(state.get('analysis_params') or {}).get('test_method', 'auto')}\n"
@@ -2454,9 +2454,12 @@ class LearningAgent(BaseAgent):
                 ]
             else:
                 ctx.append("- Analysis complete: NO — analysis has not been run yet")
-            if state.get("pathways"):
-                top3pw = [p.get("pathway","") for p in state["pathways"][:3]]
-                ctx.append(f"- Enrichment done: YES — top pathways: {top3pw}")
+            if state.get("enrichment_ran"):
+                top3pw = [p.get("pathway","") for p in (state.get("pathways") or [])[:3]]
+                if top3pw:
+                    ctx.append(f"- Enrichment done: YES — top pathways: {top3pw}")
+                else:
+                    ctx.append("- Enrichment done: YES — ran successfully, but found ZERO significant pathways (do not fabricate pathway names)")
             else:
                 ctx.append("- Enrichment done: NO")
             if state.get("plot_paths"):

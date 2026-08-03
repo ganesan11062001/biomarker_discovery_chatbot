@@ -159,6 +159,10 @@ class BiomarkerState(TypedDict, total=False):
     enrichment_scope:       Optional[str]   # "top_n" | "all" — user choice for gene set
     enrichment_top_n:       Optional[int]   # explicit N when scope is "top_n"
     pathways:               Optional[List[Dict]]
+    # True once enrichment has actually executed, even if it found zero
+    # significant pathways — distinguishes "ran, no hits" from "never run"
+    # since an empty pathways list is falsy just like the unset default.
+    enrichment_ran:         Optional[bool]
 
     # ── Visualization output ──────────────────────────────────────────────────
     plot_paths:  Optional[List[str]]
