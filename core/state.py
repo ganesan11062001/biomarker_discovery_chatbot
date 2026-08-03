@@ -158,7 +158,8 @@ class BiomarkerState(TypedDict, total=False):
     # Per-session analysis parameter overrides (set when user asks to change thresholds)
     # These override the global defaults from config/settings.py for THIS session.
     # Keys: adj_pval_cutoff, log2fc_cutoff, missing_threshold, top_n,
-    #       test_method, is_paired, all_groups, tmt_batches
+    #       test_method, is_paired, all_groups, tmt_batches,
+    #       dose_levels, subject_map, clinical_outcome
     analysis_params: Optional[Dict[str, Any]]
 
     # Statistical test selection
@@ -166,19 +167,44 @@ class BiomarkerState(TypedDict, total=False):
     # "welch"   → Welch two-sample t-test (default for n≥5)
     # "limma"   → empirical Bayes moderated t-test (recommended for n<5)
     # "paired_t"→ paired t-test (before/after, matched pairs)
-    # "anova"   → one-way ANOVA for >2 groups simultaneously
+    # "anova"   → one-way ANOVA for >2 groups simultaneously + Tukey HSD post-hoc
+    # "dose_response"       → linear trend test across ordered dose groups (requires dose_levels)
+    # "repeated_measures"   → repeated-measures ANOVA / mixed-effects model across
+    #                         time points, subjects blocked (requires all_groups + subject_map)
+    # "linear_regression"   → OLS regression of protein vs. a continuous clinical outcome
+    # "logistic_regression" → logistic regression vs. a binary clinical outcome (+ ROC AUC)
+    # "cox_regression"      → Cox proportional-hazards regression vs. a survival outcome
     test_method: Optional[str]
 
     # Paired design — g1_samples[i] is the same biological unit as g2_samples[i]
     is_paired:    Optional[bool]
 
-    # Multi-group ANOVA: {"GroupA": ["col1","col2"], "GroupB": [...], "GroupC": [...]}
+    # Multi-group ANOVA / dose-response / repeated-measures: {"GroupA": ["col1","col2"], ...}
     # Used when the user specifies >2 groups for simultaneous testing
     all_groups:   Optional[Dict[str, List[str]]]
 
     # TMT multi-batch structure for IRS normalisation
     # {"plex1": {"samples": ["ch1","ch2",...], "reference": "ref_col"}, ...}
     tmt_batches:  Optional[Dict[str, Any]]
+
+    # Dose-response (test_method="dose_response"): group name → numeric dose
+    # level, e.g. {"Vehicle": 0, "Low": 1, "Medium": 2, "High": 3}
+    dose_levels: Optional[Dict[str, float]]
+
+    # Time-course / repeated-measures (test_method="repeated_measures"):
+    # sample column → subject/animal ID, so the same biological unit is
+    # tracked across the time points defined in all_groups.
+    subject_map: Optional[Dict[str, str]]
+
+    # Clinical regression (test_method="linear_regression"|"logistic_regression"|
+    # "cox_regression"): sample column → outcome value. Scalar for linear
+    # (continuous) / logistic (0|1); {"time": float, "event": 0|1} dict for cox.
+    clinical_outcome: Optional[Dict[str, Any]]
+
+    # PTM / phosphoproteomics enrichment (case 9): when True, run_enrichment
+    # adds kinase-substrate libraries (KEA, GEO kinase perturbations) on top
+    # of the standard KEGG/GO/Reactome libraries. Does not affect DEA stats.
+    ptm_analysis: Optional[bool]
 
     # Legacy fields — kept for backward compatibility with enrichment/viz agents
     sample_group_col: Optional[str]       # column containing group label
@@ -205,9 +231,21 @@ class BiomarkerState(TypedDict, total=False):
     top_proteins:    Optional[List[Dict]]   # mirrors top_biomarkers
     dea_result_path: Optional[str]          # legacy CSV path
 
+    # Accumulated results across all comparisons run in this session.
+    # Keyed by "Group1_vs_Group2"; each value holds the full biomarker list,
+    # significance count, and excel path so cross-comparison questions (e.g.
+    # overlap) can access every prior run, not just the last one.
+    comparison_history: Optional[Dict[str, Any]]
+
     # ── Enrichment results (most-recent mirror) ───────────────────────────────
     enrichment_result_path: Optional[str]
+    enrichment_scope:       Optional[str]   # "top_n" | "all" — user choice for gene set
+    enrichment_top_n:       Optional[int]   # explicit N when scope is "top_n"
     pathways:               Optional[List[Dict]]
+    # True once enrichment has actually executed, even if it found zero
+    # significant pathways — distinguishes "ran, no hits" from "never run"
+    # since an empty pathways list is falsy just like the unset default.
+    enrichment_ran:         Optional[bool]
 
     # ── Visualization output (most-recent mirror) ─────────────────────────────
     plot_paths:  Optional[List[str]]

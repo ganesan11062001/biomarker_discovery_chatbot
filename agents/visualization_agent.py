@@ -140,8 +140,9 @@ class VisualizationAgent(BaseAgent):
                 stem               = stem,
             )
 
-            new_plot_paths = result.get("plot_paths", []) or []
-            state["plot_paths"]  = new_plot_paths
+            existing_plots = list(state.get("plot_paths") or [])
+            new_plot_paths = result.get("plot_paths") or []
+            state["plot_paths"]  = existing_plots + [p for p in new_plot_paths if p not in existing_plots]
             state["report_path"] = result.get("report_path")
             state["status"]      = "report_ready"
             # Persist plots back to the matching analysis entry so future
@@ -152,7 +153,11 @@ class VisualizationAgent(BaseAgent):
             if fallback_notice:
                 state["messages"].append({"role": "assistant", "content": fallback_notice})
             msg = self._llm_visualization_summary(result, state, view)
-            state["messages"].append({"role": "assistant", "content": msg})
+            state["messages"].append({
+                "role": "assistant",
+                "content": msg,
+                "has_plots": bool(result.get("plot_paths")),
+            })
 
             logger.info(
                 "Visualization complete | session=%s plots=%d",

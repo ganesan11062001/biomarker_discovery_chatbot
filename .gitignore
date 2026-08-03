@@ -16,6 +16,7 @@ data/processed/
 data/sessions/
 outputs/
 logs/
+*.log
 
 # Claude Code per-user settings
 .claude/settings.local.json
@@ -30,3 +31,6 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Portable local tooling (Node runtime, etc.)
+.tools/

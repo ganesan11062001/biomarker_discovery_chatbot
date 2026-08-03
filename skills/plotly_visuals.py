@@ -190,15 +190,22 @@ def build_pca(
     title:            str = "PCA — samples",
 ) -> Dict[str, str]:
     """Sample-level PCA scatter. Rows = proteins, cols = samples."""
-    from sklearn.decomposition import PCA
-
     samples = [s for s in expression_df.columns if s in sample_to_group]
     if len(samples) < 3:
         raise ValueError("PCA requires ≥3 samples mapped to a group.")
 
     X = expression_df[samples].T.fillna(expression_df[samples].T.mean())
-    pca = PCA(n_components=2)
-    coords = pca.fit_transform(X.values)
+
+    # SVD-based PCA — no sklearn dependency (matches skills/run_visualization.py).
+    mat = X.values.astype(float)
+    mat = mat - mat.mean(axis=0)
+    std = mat.std(axis=0)
+    mat = mat[:, std > 0]
+    if mat.shape[1] < 2:
+        raise ValueError("Not enough variable proteins for PCA.")
+    U, S, _ = np.linalg.svd(mat, full_matrices=False)
+    coords = U[:, :2] * S[:2]
+    ev = (S[:2] ** 2) / (S ** 2).sum()
 
     df = pd.DataFrame({
         "Sample": samples,
@@ -206,7 +213,6 @@ def build_pca(
         "PC2":    coords[:, 1],
         "Group":  [sample_to_group.get(s, "?") for s in samples],
     })
-    ev = pca.explained_variance_ratio_
 
     fig = px.scatter(
         df, x="PC1", y="PC2", color="Group", text="Sample",

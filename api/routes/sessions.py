@@ -175,3 +175,14 @@ def get_session(session_id: str):
         messages      = messages,
         files         = files,
     )
+
+
+@router.delete("/{session_id}", status_code=204)
+def delete_session(session_id: str):
+    """Delete a session and its disk checkpoint. Called by the UI on 'New Conversation'."""
+    try:
+        SessionManager.get_session(session_id)
+    except KeyError:
+        raise HTTPException(404, f"Session {session_id!r} not found")
+    SessionManager.delete_session(session_id)
+    logger.info("Session %s deleted by client.", session_id)

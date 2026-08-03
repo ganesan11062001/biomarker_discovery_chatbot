@@ -327,7 +327,7 @@ class TestJsonSidecar:
         )
         json_path = str(path).replace(".png", ".json").replace(".html", ".json")
         if Path(json_path).exists():
-            with open(json_path) as f:
+            with open(json_path, encoding="utf-8") as f:
                 data = json.load(f)
             assert "data" in data or "layout" in data
 
@@ -343,7 +343,7 @@ class TestJsonSidecar:
         )
         json_path = str(path).replace(".png", ".json").replace(".html", ".json")
         if Path(json_path).exists():
-            with open(json_path) as f:
+            with open(json_path, encoding="utf-8") as f:
                 data = json.load(f)
             assert "data" in data
 

@@ -11,7 +11,8 @@ Design:
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -90,6 +91,24 @@ class EnrichmentAgent(BaseAgent):
             state["messages"].append({"role": "assistant", "content": fallback_notice})
 
         protein_source = view.get("top_biomarkers") or []
+
+        # If user chose "all", read the full results from the Excel file
+        if state.get("enrichment_scope") == "all" and view.get("excel_path"):
+            protein_source = self._load_all_significant(view["excel_path"]) or protein_source
+
+        # If user specified an explicit top-N, slice protein_source to that count
+        enrichment_top_n = state.get("enrichment_top_n")
+        if (
+            enrichment_top_n
+            and state.get("enrichment_scope") == "top_n"
+            and protein_source
+            and len(protein_source) > enrichment_top_n
+        ):
+            protein_source = protein_source[:enrichment_top_n]
+            logger.info(
+                "Enrichment: sliced to top %d proteins per user request (was %d)",
+                enrichment_top_n, len(view.get("top_biomarkers") or []),
+            )
         if not protein_source:
             msg = self._llm_no_data()
             state["status"]        = "error"
@@ -134,21 +153,72 @@ class EnrichmentAgent(BaseAgent):
                 down_proteins=down_proteins or None,
                 dea_result_path=results_path,
                 organism=state.get("organism", "human"),
+                omic_type=("phosphoproteomics" if state.get("ptm_analysis")
+                           else state.get("omic_type") or "proteomics"),
             )
 
             state["enrichment_result_path"] = result["enrichment_result_path"]
             state["pathways"]               = result["top_pathways"]
-            state["status"]                 = "enrichment_complete"
+            # Pipeline actually executed — set regardless of hit count so a
+            # genuine zero-pathway result isn't later mistaken for "never run".
+            state["enrichment_ran"]         = True
+
+            # Every Enrichr library call errored — this is an infrastructure
+            # failure, not a genuine "zero pathways enriched" result. Report
+            # it honestly instead of letting the LLM narrate a biological
+            # explanation for a service outage.
+            if result.get("all_libraries_failed"):
+                state["status"] = "enrichment_failed"
+                msg = (
+                    "⚠ **Pathway enrichment could not run** — the Enrichr "
+                    f"service failed on all {result.get('libraries_attempted', 0)} "
+                    "library queries (network error or an unexpected response). "
+                    "This is a service issue, not a biological result — please "
+                    "don't interpret it as 'no pathways enriched'. Try again in "
+                    "a moment, or ask me to retry."
+                )
+                state["messages"].append({"role": "assistant", "content": msg})
+                return state
+
+            state["status"] = "enrichment_complete"
+
             # Persist enrichment back to the matching analysis entry so future
             # "show enrichment for X vs Y" calls return the same set.
             if analysis_entry is not None:
                 analysis_entry["pathways"]               = result["top_pathways"]
                 analysis_entry["enrichment_result_path"] = result["enrichment_result_path"]
 
+            # Persist pathways into comparison_history so cross-comparison
+            # answer queries can access every prior enrichment, not just the last.
+            _cmp_key = (
+                f"{view.get('group1_label') or 'G1'}"
+                f"_vs_"
+                f"{view.get('group2_label') or 'G2'}"
+            )
+            _hist = dict(state.get("comparison_history") or {})
+            _hist.setdefault(_cmp_key, {}).update({
+                "pathways":              result["top_pathways"],
+                "enrichment_result_path": result["enrichment_result_path"],
+            })
+            state["comparison_history"] = _hist
+
+            # Store reproducible enrichment code for "show code"
+            state["analysis_code"] = self._build_enrichment_code(
+                protein_list, up_proteins, down_proteins,
+                background_proteins, state,
+            )
+
+            # Generate pathway dotplot
+            self._generate_pathway_plot(state, result)
+
             msg = self._llm_enrichment_summary(result, state, sig_proteins,
                                                up_proteins, down_proteins,
                                                background_proteins, view)
-            state["messages"].append({"role": "assistant", "content": msg})
+            state["messages"].append({
+                "role": "assistant",
+                "content": msg,
+                "has_plots": bool(state.get("plot_paths")),
+            })
 
             logger.info(
                 "Enrichment complete | session=%s sig=%d up=%d down=%d kegg=%d go=%d bg=%s",
@@ -220,6 +290,34 @@ class EnrichmentAgent(BaseAgent):
             "group2_label":   entry.get("group2_label", "Group2"),
         }
         return view, entry, notice
+
+    # ── Load all significant proteins from Excel ─────────────────────────────
+
+    @staticmethod
+    def _load_all_significant(excel_path: Optional[str]) -> Optional[List[Dict]]:
+        """Read the 'All Results' sheet from the analysis Excel and return
+        all proteins that passed significance filters."""
+        if not excel_path:
+            return None
+        try:
+            xl = pd.ExcelFile(excel_path)
+            if "All Results" not in xl.sheet_names:
+                logger.warning("'All Results' sheet not found in %s (available: %s)",
+                               excel_path, xl.sheet_names)
+                return None
+            df = xl.parse("All Results")
+            sig = df[df["significance"].notna() & (df["significance"] != "NS")]
+            if sig.empty:
+                sig = df
+            records = sig.to_dict("records")
+            logger.info(
+                "Enrichment scope=all: loaded %d significant proteins from Excel",
+                len(records),
+            )
+            return records
+        except Exception as exc:
+            logger.warning("Could not read All Results from Excel: %s", exc)
+            return None
 
     # ── Background extraction ─────────────────────────────────────────────────
 
@@ -337,6 +435,78 @@ class EnrichmentAgent(BaseAgent):
             return self._call_llm(messages, max_tokens=150)
         except Exception:
             return f"Pathway enrichment failed: {error_text}"
+
+    # ── Pathway dotplot ──────────────────────────────────────────────────────
+
+    def _generate_pathway_plot(self, state: BiomarkerState, result: Dict) -> None:
+        """Generate a pathway dotplot and store paths in state."""
+        try:
+            from skills.run_visualization import plot_pathway_dot
+            stem = state.get("session_id") or "session"
+            out_dir = str(Path(settings.output_dir) / "plots" / stem)
+            path = plot_pathway_dot(
+                pathways=result.get("top_pathways", []),
+                stem=stem,
+                output_dir=out_dir,
+            )
+            if path:
+                plot_paths = list(state.get("plot_paths") or [])
+                plot_paths.append(path)
+                state["plot_paths"] = plot_paths
+                logger.info("Pathway dotplot generated: %s", path)
+        except Exception as exc:
+            logger.warning("Pathway dotplot generation failed: %s", exc)
+
+    # ── Reproducible code ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_enrichment_code(
+        protein_list: List[str],
+        up_proteins: List[str],
+        down_proteins: List[str],
+        background: Optional[List[str]],
+        state: BiomarkerState,
+    ) -> str:
+        from skills.run_enrichment import _normalize_organism, _LIBRARIES
+
+        organism = state.get("organism", "human")
+        g1 = state.get("group1_label", "Group1")
+        g2 = state.get("group2_label", "Group2")
+
+        organism_key = _normalize_organism(organism)
+        libs = _LIBRARIES.get(organism_key, _LIBRARIES["human"])
+        enr_organism = "human" if organism_key == "human" else "mouse"
+
+        # Build gene-list + optional background block separately to avoid
+        # Python's ternary-inside-implicit-string-concat precedence bug.
+        data_block = f"gene_list = {protein_list[:10]!r}  # ... ({len(protein_list)} total)\n"
+        if background:
+            data_block += (
+                f"background = {background[:5]!r}  # ... ({len(background)} total)\n"
+            )
+        data_block += "\n"
+
+        return (
+            f"import gseapy as gp\n\n"
+            f"# Pathway enrichment: {g1} vs {g2}\n"
+            f"# Organism: {organism} (key: {organism_key})\n"
+            f"# Significant proteins submitted: {len(protein_list)}\n"
+            f"#   Up-regulated (higher in {g2}):   {len(up_proteins)}\n"
+            f"#   Down-regulated (higher in {g1}): {len(down_proteins)}\n"
+            f"# Background: {len(background) if background else 'genome-wide'} proteins\n\n"
+            + data_block
+            + f"libraries = {libs!r}\n\n"
+            f"for lib in libraries:\n"
+            f"    enr = gp.enrichr(\n"
+            f"        gene_list=gene_list,\n"
+            f"        gene_sets=lib,\n"
+            f"        organism='{enr_organism}',\n"
+            f"        background=background if background else 20000,\n"
+            f"        cutoff=0.05,\n"
+            f"    )\n"
+            f"    sig = enr.results[enr.results['Adjusted P-value'] <= 0.05]\n"
+            f"    print(f'{{lib}}: {{len(sig)}} significant terms')\n"
+        )
 
     # ── Fallback ──────────────────────────────────────────────────────────────
 
