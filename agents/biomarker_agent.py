@@ -220,11 +220,19 @@ class BiomarkerAgent(BaseAgent):
         # all_groups is inherited from ingestion-time label detection and must
         # NOT be forwarded — the skill's is_anova condition fires on any
         # all_groups with ≥2 entries, causing a spurious ANOVA attempt that
-        # fails when n=1 per group.
+        # fails when n=1 per group. A resolved pairwise ask this turn (g1 and
+        # g2 both set) takes precedence over a stale "anova" test_method left
+        # over from an earlier multi-group turn in the same session — without
+        # this, e.g. "compare BL6 heart and DMD heart" after an earlier
+        # all-groups ANOVA would still forward all 12 groups instead of the
+        # two just resolved.
         _group_based_method = _test_method in ("anova", "dose_response", "repeated_measures")
         _override_groups = _overrides.get("all_groups")
-        if _group_based_method or _override_groups:
-            _all_groups = _override_groups or state.get("all_groups")
+        _resolved_pairwise = bool(g1 and g2)
+        if _override_groups:
+            _all_groups = _override_groups
+        elif _group_based_method and not _resolved_pairwise:
+            _all_groups = state.get("all_groups")
         else:
             _all_groups = None
 
