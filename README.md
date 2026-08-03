@@ -144,16 +144,28 @@ Accepted file formats: `.csv`, `.xlsx`, `.xls`
 
 ## Analysis Methods
 
-### Supervised (groups with replicates)
+`BiomarkerAgent` picks a `test_method` (auto-detected or LLM/user-specified) and dispatches to the matching routine in `skills/proteomics_analysis.py`:
+
+| test_method | Scenario | Method |
+|---|---|---|
+| `welch` (default) | 2 groups, unpaired replicates | Welch t-test + BH FDR + Cohen's d |
+| `limma` | 2 groups, unpaired replicates | limma eBayes (moderated t-stat) + BH FDR |
+| `paired_t` | Pre/post, matched samples | Paired t-test on per-subject differences + Cohen's d_z |
+| `anova` | ≥3 groups | One-way ANOVA + **Tukey HSD post-hoc** (flags which specific group pairs differ) |
+| `dose_response` | Ordered dose/concentration groups | Linear trend test across ordered levels (monotonicity, not just omnibus significance) |
+| `repeated_measures` | Time-course, same subjects across timepoints | Repeated-measures ANOVA, falls back to a mixed-effects model (`MixedLM`) for unbalanced designs |
+| `linear_regression` / `logistic_regression` / `cox_regression` | Continuous / binary / survival clinical outcome | Per-protein regression vs. `clinical_outcome`; logistic adds ROC AUC |
+
+Shared preprocessing for all supervised paths:
 
 | Step | Method |
 |------|--------|
-| Missing value filter | Proteins with > 50% NaN removed |
+| Missing value filter | Proteins with > 50% NaN removed (group-aware — kept if present in ≥ threshold of samples in *either* group) |
 | Log₂ transform | Applied when max intensity > 100 |
-| Imputation | Half-minimum per protein |
-| Differential analysis | Welch t-test (unequal variance) |
+| Imputation | Half-minimum per protein (computed per row, after saving the pre-imputation detection mask) |
 | Multiple testing | Benjamini-Hochberg FDR |
 | Log₂FC cap | ±20 (prevents Excel/downstream issues) |
+| Effect size | Cohen's d (unpaired) / Cohen's d_z (paired) — sign always matches the log₂FC direction (m2 − m1) |
 
 Significance tiers:
 
@@ -169,10 +181,14 @@ Significance tiers:
 - All pairwise contrasts auto-generated from the label map
 - Generic rescue score: sum of positive fold-changes across all contrasts
 
-### Unsupervised
+### Phosphoproteomics / PTM
 
-- Coefficient of variation (CV%) ranking
-- No group assignment needed
+- When `ptm_analysis=True`, enrichment adds kinase-substrate libraries (e.g. KEA2021, PhosphoSitePlus) alongside the standard pathway libraries.
+
+### Unsupervised (no comparison groups)
+
+- Ranks by coefficient of variation (CV%) when ≥ 3 total samples are available (variability is meaningful).
+- **Single pooled sample (n=1) fallback**: when there aren't enough replicates to compute CV/MAD/IQR, those fields are `None` and proteins are instead ranked by raw `mean_expression` — so a true n=1 dataset still returns a descriptive ranking report instead of an empty result or a `KeyError`.
 
 ---
 
@@ -211,8 +227,11 @@ Request specific plots in chat: *"show me a volcano plot"*, *"give me PCA and he
 ## Hallucination Guards
 
 1. **json_mode=True** — forces `response_format={"type":"json_object"}` on every decision call.
-2. **DecisionSchema** (Pydantic) — validates action names, clamps confidence to [0,1], demotes low-confidence decisions to `"answer"`.
-3. **Grounding anchors** — `_answer()` injects the actual `top_biomarkers` and `pathways` lists into the LLM system prompt with explicit citation constraints.
+2. **DecisionSchema** (Pydantic) — validates action names, clamps confidence to [0,1], demotes decisions with `confidence < 0.7` to `"answer"`.
+3. **Reason-quality guard** — GPT-4o self-reports ≥0.95 confidence almost every time, so the raw confidence gate rarely fires. Side-effect actions (`run_analysis`, `run_enrichment`, ...) additionally require a reason ≥ 8 characters, or they're demoted to `"answer"` too — catches confident-but-terse (likely misrouted) decisions.
+4. **Multi-step routing** — compound imperatives ("compare X vs Y, then run pathway analysis and show the volcano plot") are returned as an ordered `action_sequence` and executed step-by-step (deduplicated per group-pair) instead of only running the first action and dropping the rest.
+5. **Viz-override negative guard** — a deterministic override forces `"show volcano/heatmap/PCA"` phrases to `run_visualization`, but a regex exclusion prevents it from misfiring on conceptual questions like *"what does a volcano plot show?"*.
+6. **Grounding anchors** — `_answer()` injects the actual `top_biomarkers` and `pathways` lists into the LLM system prompt with explicit citation constraints.
 
 ---
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -91,6 +92,24 @@ _CONTAMINANT_PREFIXES: tuple = (
 )
 
 _UNIPROT_ACCESSION_RE = re.compile(r'^[A-Z][0-9][A-Z0-9]{3}[0-9](-\d+)?$')
+
+# Enrichr occasionally has transient network/service hiccups; retry each
+# library call a couple of times with backoff before treating it as failed.
+_ENRICHR_MAX_RETRIES = 2
+_ENRICHR_RETRY_BACKOFF_SEC = 2.0
+
+
+def _enrichr_with_retry(gp, **kwargs):
+    """Call gp.enrichr, retrying on transient errors before raising."""
+    last_exc: Exception | None = None
+    for attempt in range(_ENRICHR_MAX_RETRIES + 1):
+        try:
+            return gp.enrichr(**kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _ENRICHR_MAX_RETRIES:
+                time.sleep(_ENRICHR_RETRY_BACKOFF_SEC * (attempt + 1))
+    raise last_exc
 
 
 def _normalize_organism(organism: str) -> str:
@@ -325,7 +344,8 @@ class PathwaySkill:
                 # same convention used for KEGG/GO libraries elsewhere).
                 lib_organism = "human" if lib in _PTM_LIBRARIES else enr_organism
                 try:
-                    enr = gp.enrichr(
+                    enr = _enrichr_with_retry(
+                        gp,
                         gene_list=symbols,
                         gene_sets=lib,
                         organism=lib_organism,
