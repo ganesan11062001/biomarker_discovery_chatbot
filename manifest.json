@@ -19,148 +19,208 @@
   },
   "files": {
     ".env.example": {
-      "checksum": "2c6f0e770d177412e366154d8fff96d1"
+      "checksum": "8fcf3e0a13b53ece46a1703f2790dc5f"
     },
     ".gitignore": {
-      "checksum": "c5e9989f7980ecf6a977c3bb2d4b776e"
+      "checksum": "ec5bdfe77cbaa6d479b91acfe5cc8ceb"
     },
     ".python-version": {
-      "checksum": "7e127c0fccc27fd6e8ce8caf8ba41aa2"
+      "checksum": "0885a8b0e7355de614d6685033e058f6"
     },
     "DEPLOYMENT.md": {
-      "checksum": "52f281d3cc224852bb339ebd0a1a78ce"
+      "checksum": "c18475c07d2b87181f9014429a32fe10"
     },
     "Makefile": {
-      "checksum": "5767687cd682f8d46df2c3ed8644f764"
+      "checksum": "bfe3457af06b8c07b76e02a56003cf6f"
     },
     "README.md": {
-      "checksum": "68b7200bad9004cd1e6dfe1ba26c48ce"
+      "checksum": "55174683698ccbce8e9ac318eb82123d"
     },
     "agents/__init__.py": {
-      "checksum": "3edbd31b69fb184594d7109e682db463"
+      "checksum": "907a6b09d0c4dbe96b2ef35996c59e00"
     },
     "agents/base_agent.py": {
-      "checksum": "1ad49c6a0ff3fc482e611d8adf85d7e9"
+      "checksum": "52f33eea0b289d465e80b9c174f15fc7"
     },
     "agents/biomarker_agent.py": {
-      "checksum": "3a93386134946ab2fcfb3a91f635b908"
+      "checksum": "74c3ed61953a8a87b0729f89d1428426"
+    },
+    "agents/chat_agent.py": {
+      "checksum": "8a788507b2b967d8af41c979ba671fc3"
     },
     "agents/code_reviewer.py": {
-      "checksum": "dd41dd7b77b3f53b6c704fc5447db574"
+      "checksum": "405f823be8dce04825e6791439e6e9d8"
     },
     "agents/domain_expert.py": {
-      "checksum": "a9f039c3a8e953d12df6dbf0e00bb202"
+      "checksum": "cb7bd10b7831b87065b5798e056fd987"
     },
     "agents/enrichment_agent.py": {
-      "checksum": "c4d8027d58834e8a53e58bfe3bb23fcc"
+      "checksum": "25600bf827aafd509015b8e7697afb8b"
     },
     "agents/ingestion_agent.py": {
-      "checksum": "b24fcac42f695ec5a74039971498fd07"
+      "checksum": "02641154be773ded895bae4023b6d805"
     },
     "agents/learning_agent.py": {
-      "checksum": "242b96d11c1bc8d12e924b7e1098d632"
+      "checksum": "648529785371d9a2434966c828ce2328"
     },
     "agents/visualization_agent.py": {
-      "checksum": "9e540731dd2b6deb20bcf755c690899b"
+      "checksum": "9241a69d55664cf259b0172af8d3c019"
     },
     "api/__init__.py": {
       "checksum": "d41d8cd98f00b204e9800998ecf8427e"
     },
     "api/main.py": {
-      "checksum": "26e620dc3e9ad1b9e7727ca82d8cd444"
+      "checksum": "ee4603c96841a6f853676976ac38a59a"
     },
     "api/manifest.json": {
-      "checksum": "f50d3d71c8ecf3b8a1f7c3a801cb2e34"
+      "checksum": "0d1ac7935d16d45b269706533059faf7"
+    },
+    "api/middleware/__init__.py": {
+      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
+    },
+    "api/middleware/error_handler.py": {
+      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
+    },
+    "api/middleware/logging.py": {
+      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
     },
     "api/requirements.txt": {
-      "checksum": "e8ae0132915ebf1b6a1c6414eebfb8e8"
+      "checksum": "73d05eddfff17d9a45cd3ba85a954482"
     },
     "api/routes/__init__.py": {
       "checksum": "d41d8cd98f00b204e9800998ecf8427e"
     },
     "api/routes/chat.py": {
-      "checksum": "c568e367433d9a873a4f2c2a950a9a6d"
+      "checksum": "6b9b003db3212dc64c4046cf7c87206e"
     },
     "api/routes/results.py": {
-      "checksum": "a9fdd8c88895fb24416acf71d774083c"
+      "checksum": "0b8c094daf8d7ea6f66623df6c3b53f4"
     },
     "api/routes/sessions.py": {
-      "checksum": "f0a7157a9009b0322e9e26387649899b"
+      "checksum": "4a749b6dfd9f25fa4b1968e8de5e27e4"
     },
     "api/routes/upload.py": {
-      "checksum": "747cfe2227222cfec5db0c8ce0568b83"
+      "checksum": "77d32873eb472b154a7ad8ddb00a2986"
+    },
+    "api/schemas/__init__.py": {
+      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
+    },
+    "api/schemas/chat_schema.py": {
+      "checksum": "628266aaadf1ed412eeee51903ea146d"
+    },
+    "api/schemas/result_schema.py": {
+      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
+    },
+    "api/schemas/upload_schema.py": {
+      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
     },
     "config/__init__.py": {
       "checksum": "d41d8cd98f00b204e9800998ecf8427e"
     },
+    "config/azure_keyvault.py": {
+      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
+    },
+    "config/logging_config.py": {
+      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
+    },
     "config/settings.py": {
-      "checksum": "3297b9b680be3901cae10f19d29aa9f3"
+      "checksum": "e5af082ba8a92df8ed9af85837ea8cc2"
     },
     "core/__init__.py": {
-      "checksum": "7a0d547f9c132eee61e6acc76db3a50d"
+      "checksum": "131136381b505340af59382edaff528d"
     },
     "core/action_units.py": {
-      "checksum": "4944673505a477b2a0c41ad563d73c3f"
+      "checksum": "9a619eccdbdc9d673f0e10768b654ff8"
+    },
+    "core/context_builder.py": {
+      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
     },
     "core/data_store.py": {
-      "checksum": "930531e6409553a5df7cd20301626407"
+      "checksum": "1861701e1f6050bbc0df16b164ca5954"
+    },
+    "core/io_utils.py": {
+      "checksum": "9e207edd4562b862ce996921f633ac7e"
     },
     "core/langgraph_workflow.py": {
-      "checksum": "d5aa8f2d5f711c9e804b1e2654401e10"
+      "checksum": "fc605d6dfde6061125aa477600abd3a5"
     },
     "core/llm_tools.py": {
-      "checksum": "b823f3c14ef590102a537a5f5a6f0f0a"
+      "checksum": "b235cee9a2589f828f28d819c57e7e45"
     },
     "core/maxquant_filters.py": {
-      "checksum": "f1902e98c094bb0273d7807e0b60ab30"
+      "checksum": "6397983eaecf6a1908b7b692d09e06d6"
     },
     "core/proteomics_tools.py": {
-      "checksum": "de5b648dfa905d27be3b5904172d506d"
+      "checksum": "09d390649bbcaed65f7bf0f367d1b5f8"
+    },
+    "core/registry.py": {
+      "checksum": "c055dfbf0599153be6b2032c37d241de"
     },
     "core/safe_exec.py": {
-      "checksum": "61f94634418e07789ff9ae06438b76e8"
+      "checksum": "cfbee1e0589b2f2ff2e47622f55ef41a"
     },
     "core/session_manager.py": {
-      "checksum": "4ce550f1acd6a6eed616268a9978bd49"
+      "checksum": "6da0ccc845ec8d0af5c8a662dd40ebdd"
     },
     "core/state.py": {
-      "checksum": "2b5f08f4593342b019e890dae88dd1f9"
+      "checksum": "c936f45d2c229627366cd8f2fe7578e2"
     },
     "core/tracing.py": {
-      "checksum": "2014d8bf580ab28ffa3b64765ad6a224"
+      "checksum": "2f0a6457cfef930bf5ab71c9b3872941"
     },
     "prompts/action_units/biomarker_action_units.json": {
-      "checksum": "eba7bdce8af21fdfe9e12f6060d50ed7"
+      "checksum": "065909bc9b597ecd2e1f43910161ea3a"
     },
     "prompts/action_units/ingestion_action_units.json": {
-      "checksum": "57ba0cca696b3c66060a234aaac3056f"
+      "checksum": "df11829f2ef3c8de303aab6cdfc40aa1"
     },
     "prompts/action_units/query_data_action_units.json": {
-      "checksum": "3d8b5978b244a6954a9b73f64bd7f2a1"
+      "checksum": "06cda9c585c0b748e1a631e04364f15a"
     },
     "prompts/biomarker_agent.txt": {
-      "checksum": "34ed18ea445604cad9592b7bbbc2d1ea"
+      "checksum": "af9aeb737c79a5ee3f97aa94e8c977cb"
     },
     "prompts/chat_agent.txt": {
-      "checksum": "fa095a6a080813da345cbbdc32cc4fb9"
+      "checksum": "fe4f1021449068d43b59216a6035bb70"
     },
     "prompts/code_reviewer.txt": {
-      "checksum": "dbe6ca52e1f7676dbdaa8e5ffc3d92f5"
+      "checksum": "3332cef57cb66299cc5a8f39738ccea1"
+    },
+    "prompts/domain_expert.txt": {
+      "checksum": "8493355e3ea7dd1a4db74a61c0906b97"
     },
     "prompts/enrichment_agent.txt": {
-      "checksum": "b3384387c540aa92bf11861bfa4b1e3f"
+      "checksum": "b2ffe4f5678af764cb06fd9c8e8bd7e1"
     },
     "prompts/ingestion_agent.txt": {
-      "checksum": "422915d957495db034293f09667607da"
+      "checksum": "d79d1459980facfb617d5827a9d13277"
     },
     "prompts/visualization_agent.txt": {
-      "checksum": "284230445863bc37ba72003cc7853d1f"
+      "checksum": "ff8898babd87b13aa9236ce57ab675b1"
     },
     "pytest.ini": {
-      "checksum": "18bec8fce06313aee04fb2d55ee5a8f2"
+      "checksum": "aa8ffb9905fd199cbcae0459541a944b"
     },
     "requirements.txt": {
-      "checksum": "e547967fbf89cd15cd61f16c50a37321"
+      "checksum": "73d05eddfff17d9a45cd3ba85a954482"
+    },
+    "run_analysis.py": {
+      "checksum": "a833b9058668873053b1e0568ea742af"
+    },
+    "scripts/debug_ingest.py": {
+      "checksum": "51f7be51a93676316621c79e30b82ec2"
+    },
+    "scripts/gen_root_fastapi_manifest.py": {
+      "checksum": "ee32eb832bfad148c798d7bd52d141e2"
+    },
+    "scripts/smoke_test_pipeline.py": {
+      "checksum": "eda22d90928789df8c21aa845b43aeb5"
+    },
+    "scripts/verify_pipeline.py": {
+      "checksum": "d5d0d0d02ec67d8d5fb84a0d988e693e"
+    },
+    "test_connection.py": {
+      "checksum": "bab338f3897fc2e116de75380c2528f1"
     }
   }
 }

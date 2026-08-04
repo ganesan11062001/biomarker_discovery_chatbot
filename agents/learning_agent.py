@@ -57,6 +57,41 @@ _VALID_ACTIONS = {
     "answer",
 }
 
+# Side-effect actions that mutate pipeline state (used in quality gates)
+_SIDE_EFFECT_ACTIONS = frozenset({
+    "run_analysis", "run_enrichment", "run_visualization",
+    "run_all_comparisons", "run_full_pipeline", "load_data",
+})
+
+
+class ActionStep(BaseModel):
+    """A single step within a multi-action sequence returned by the decision LLM.
+
+    Used when the user issues a compound imperative such as:
+      "Compare uDys5 and mdx, identify top 10 biomarkers, then run pathway analysis"
+    The LLM returns these as an ordered list in ``action_sequence``; the
+    orchestrator executes them in order, passing state through each step.
+    """
+    action:          str           = "answer"
+    group1_label:    Optional[str] = None
+    group1_samples:  List[str]     = []
+    group2_label:    Optional[str] = None
+    group2_samples:  List[str]     = []
+    requested_plots: List[str]     = []
+    adj_pval_cutoff: Optional[float] = None
+    log2fc_cutoff:   Optional[float] = None
+    top_n:           Optional[int]   = None
+    test_method:     Optional[str]   = None
+    all_groups:      Optional[Dict[str, List[str]]] = None
+    dose_levels:     Optional[Dict[str, float]] = None
+    subject_map:     Optional[Dict[str, str]]   = None
+    clinical_outcome: Optional[Dict[str, Any]]  = None
+
+    @field_validator("action")
+    @classmethod
+    def _validate_action(cls, v: str) -> str:
+        return v if v in _VALID_ACTIONS else "answer"
+
 
 class DecisionSchema(BaseModel):
     """
@@ -81,14 +116,44 @@ class DecisionSchema(BaseModel):
     top_n:             Optional[int]   = None   # number of proteins to report
 
     # Extended test method — extracted when user explicitly requests a test type
-    test_method:  Optional[str]                     = None  # "welch"|"limma"|"paired_t"|"anova"
+    test_method:  Optional[str]                     = None  # "welch"|"limma"|"paired_t"|"anova"|"dose_response"|"repeated_measures"|"linear_regression"|"logistic_regression"|"cox_regression"
     is_paired:    Optional[bool]                    = None  # True for matched/before-after designs
-    all_groups:   Optional[Dict[str, List[str]]]    = None  # ANOVA: {group: [cols], ...}
+    all_groups:   Optional[Dict[str, List[str]]]    = None  # ANOVA/dose-response/repeated-measures: {group: [cols], ...}
     omic_type:    Optional[str]                     = None  # "proteomics" (intensity-only canonical)
+
+    # Dose-response (case 6): group name -> numeric dose level
+    dose_levels: Optional[Dict[str, float]] = None
+    # Time-course / repeated-measures (case 7): sample column -> subject/animal ID
+    subject_map: Optional[Dict[str, str]]   = None
+    # Clinical regression (case 10): sample column -> outcome value
+    # (scalar for linear/logistic; {"time":.., "event":..} dict for cox)
+    clinical_outcome: Optional[Dict[str, Any]] = None
+
+    # PTM / phosphoproteomics enrichment (case 9): true when the user's data
+    # or question concerns phosphosite / PTM biology. Drives kinase-substrate
+    # enrichment library selection without altering the omic_type used for
+    # the core DEA skill registry lookup.
+    ptm_analysis: Optional[bool] = None
 
     # Clarification question — only used when action == "ask_clarification".
     # Write a complete, kind, professional question the user sees verbatim.
     clarification_question: Optional[str]           = None
+
+    # Target comparison — used by follow-up actions (run_visualization,
+    # run_enrichment, query_data, show_code) to disambiguate which past
+    # analysis the user is asking about in a multi-comparison session.
+    # Accepts a canonical comparison_id ("DMD_Quad_vs_BL6_Quad") OR a
+    # free-text label like "DMD vs BL6" — find_analysis() handles fuzzy match.
+    # Leave null when the user has not specified, or when the action does not
+    # reference a prior analysis.
+    target_comparison: Optional[str]                = None
+
+    # Multi-step sequence — populated only for compound requests such as
+    # "Compare X and Y, identify top 10 biomarkers, then run pathway analysis".
+    # When present with ≥ 2 entries the orchestrator executes each step in
+    # order, passing state through. Single-intent messages leave this [] and
+    # the top-level "action" field is used as normal.
+    action_sequence: List[ActionStep] = []
 
     @field_validator("action")
     @classmethod
@@ -148,7 +213,11 @@ class DecisionSchema(BaseModel):
     def _validate_test_method(cls, v) -> Optional[str]:
         if v is None:
             return None
-        valid = {"auto", "welch", "limma", "paired_t", "anova"}
+        valid = {
+            "auto", "welch", "limma", "paired_t", "anova",
+            "dose_response", "repeated_measures",
+            "linear_regression", "logistic_regression", "cox_regression",
+        }
         s = str(v).lower().strip()
         return s if s in valid else None
 
@@ -203,22 +272,26 @@ that drives the pipeline. Choose exactly one action:
                              • "what is the molecular weight of <protein X>?"
                              • "how many sheets does this file have?"
                              • "what is the largest / smallest / highest-MW protein?"
-                             • "what is the most up/down-regulated protein in X vs Y?"
-                             • "what is the fold change of <X> in <group A> vs <group B>?"
-                             • "top N proteins by intensity in <group>?"
-                           For "most up/down in X vs Y" questions: this is a SQL
-                           fold-change computation, NOT a full analysis. Route here,
-                           NOT to run_analysis or run_full_pipeline. The bot writes
-                           SQL like SELECT protein, LOG2((A+1)/(B+1)) AS fc
-                           ORDER BY fc DESC LIMIT 1.
+                             • "what is the raw intensity of <protein X> in sample <Y>?"
+                             • "top N proteins by raw intensity in <group>?" (raw values, no stats)
+                           IMPORTANT — do NOT use query_data for these; use run_analysis instead:
+                             • "top N hits / biomarkers / differentially expressed proteins comparing X vs Y"
+                             • "most up/down-regulated proteins in X vs Y"
+                             • "what is the fold change of <X> in <group A> vs <group B>?" when
+                               that implies running a comparison pipeline, not a raw lookup
+                           For raw single-protein lookups ("what is the intensity of protein X in
+                           sample Y?") route here. For RANKED DIFFERENTIAL LISTS across two groups,
+                           use run_analysis.
   "ask_clarification"   — ask the user a focused, professional question before proceeding
   "answer"              — answer a question, explain something, or have a conversation
 
 Analysis routing — the canonical template is intensity-only proteomics:
   • Two-sheet template (Sheet 1 metadata: Sample ID | Group; Sheet 2 proteins:
     Protein Name | Accession | Gene | sample columns) is the supported format.
-  • Test method auto-selected: limma eBayes for n≤4 per group, Welch t-test for n≥5.
+  • Test method auto-selected: fold-change only for n=1 per group; limma eBayes
+    for 2≤n≤4 per group; Welch t-test for n≥5.
     ≥2 samples per group → supervised differential expression (log₂FC, Cohen's d, adj. p-value).
+    n=1 per group → fold-change-only ranking (no statistical test is valid).
     No group labels → unsupervised CV/MAD/IQR variability ranking.
   • The Python pipeline is paired with an R + limma engine; the dual-engine
     combiner intersects significant proteins from both to produce the final list.
@@ -229,7 +302,35 @@ TEST METHOD EXTRACTION (populate "test_method" when user explicitly requests one
   "welch"    — user says "Welch t-test", "standard t-test", "regular t-test"
   "paired_t" — user says "paired", "matched samples", "before/after", "pre/post", "same subject"
   "anova"    — user says "ANOVA", "more than 2 groups", "multiple groups simultaneously", "F-test"
+              A real Tukey HSD post-hoc pairwise comparison is always run automatically
+              alongside ANOVA — no separate action needed.
+  "dose_response" — user says "dose response", "dose-dependent", "trend across doses",
+              "increasing dose", "vehicle/low/medium/high", "dose escalation". Requires
+              ordered dose groups — also populate "all_groups" (group→sample columns) and
+              "dose_levels" (group name→numeric dose, e.g. {"Vehicle":0,"Low":1,"Medium":2,"High":3}).
+  "repeated_measures" — user says "time course", "time-course", "longitudinal",
+              "repeated measures", "across time points", "Day 0/1/3/7", "same subject
+              /animal over time". Requires the time points — populate "all_groups"
+              (time-point label→sample columns) and "subject_map" (sample column→
+              subject/animal ID so the same biological unit is tracked across time).
+  "linear_regression" — user says "regress against", "correlate with a continuous
+              clinical variable", "linear model vs <lab value/score>". Populate
+              "clinical_outcome" (sample column→numeric outcome value).
+  "logistic_regression" — user says "logistic regression", "predict responder/
+              non-responder", "classify", "ROC", "AUC", "binary outcome". Populate
+              "clinical_outcome" (sample column→0/1 outcome value).
+  "cox_regression" — user says "Cox regression", "survival analysis", "hazard ratio",
+              "time to event", "progression-free survival", "overall survival". Populate
+              "clinical_outcome" (sample column→{"time": <float>, "event": 0|1} dict).
   Leave null for "auto" (default; pipeline auto-selects limma vs Welch by sample size).
+
+PTM / PHOSPHOPROTEOMICS (populate "ptm_analysis" = true when relevant):
+  User mentions "phospho", "phosphoproteomics", "phosphosite", "PTM",
+  "post-translational modification", "kinase activity", "kinase-substrate" →
+  set ptm_analysis = true. This adds kinase-enrichment libraries (KEA, GEO
+  kinase perturbations) alongside the standard KEGG/GO/Reactome pathway
+  libraries during run_enrichment — it does NOT change the DEA statistics,
+  which run identically on phosphosite intensities.
 
 MULTI-GROUP ANOVA (populate "all_groups" when user has >2 groups for ANOVA):
   When user says "compare WT, KO, and HET" or "ANOVA across all 4 groups":
@@ -241,39 +342,121 @@ PAIRED DESIGN (set is_paired = true when user describes matched samples):
   "compare before and after treatment for each patient" → is_paired = true
   "paired t-test with samples matched by patient ID" → is_paired = true, test_method = "paired_t"
 
-Decision rules (in priority order):
-1.  Questions ("what is X", "explain X", "how does Y work", "what did the analysis find") → "answer"
-2.  Off-topic messages → "answer"
-3.  No data loaded yet → "answer" (tell user to upload a file first)
-4.  "show code" / "give me the code" / "what code was used" / "show me the query" /
-    "what query did you run" / "how did you get that answer" / "show the SQL" → "show_code"
-    (The handler picks between the analysis script and the most recent
+TARGET COMPARISON EXTRACTION — RARELY USED. Leave "target_comparison" null
+by default. The system always operates on the LATEST analysis: biomarkers,
+plots, pathways, and biological interpretation refer to whatever was just
+computed. Only populate "target_comparison" in the narrow case where the
+user EXPLICITLY references a past comparison by its group names AND a
+different analysis has since been run.
+
+  Populate examples (rare):
+    "show me the volcano plot for the WT vs KO analysis we did earlier"
+      → target_comparison = "WT vs KO"
+    "go back to the mdx vs WT results and show me enrichment"
+      → target_comparison = "mdx vs WT"
+
+  Leave null (the common case):
+    "show plots" / "show the volcano"          → null (uses latest)
+    "run enrichment"                            → null (uses latest)
+    "what are the top biomarkers?"              → null (uses latest)
+    "compare DMD Quad vs BL6 Quad"              → null (run_analysis with the
+                                                  groups; new analysis, not
+                                                  an addressing query)
+    "what is the most up-regulated protein"     → null (query_data on file)
+
+  Default behavior: target_comparison = null → all downstream operations use
+  the most recent completed analysis. This is what the user almost always
+  wants. Setting target_comparison without explicit reference is an error.
+
+Decision rules — evaluate IN ORDER and stop at the first match.
+Action-specific rules come BEFORE the generic "answer" fallback so questions
+that reference the user's actual file get routed to query_data, not answer.
+
+1.  No data loaded yet AND user asks anything that requires data → "answer"
+    (tell them to upload a file first). Skip every other rule.
+
+2.  File-grounded questions — anything that asks for a concrete value, cell,
+    sheet structure, or ranking that lives IN the user's file → "query_data".
+    Triggers: "what is the <metric/value> of X?", "fold change of X in A vs B?",
+    "most up/down-regulated protein in X vs Y?", "is X detected in Y?",
+    "top N proteins by intensity in <group>?", "how many sheets/columns/rows?",
+    "what is the MW / accession of X?", "which proteins have value 0 in Y?".
+    Even if phrased as a question, file-grounded questions are NEVER "answer".
+
+3.  Code or query inspection — "show code", "give me the code", "what code
+    was used", "show me the query", "what query did you run", "how did you
+    get that answer", "show the SQL" → "show_code".
+    (Handler picks between the analysis script and the most recent
     data-query snippet based on the user's phrasing.)
-5.  Re-run with new parameter values (see below) → "run_analysis" + fill parameter fields
-6.  "change the code to use X method" / "add a step to the script" → "modify_code"
-7.  "look up proteins" / "get gene names" / "annotate" / "UniProt" / "convert IDs" → "query_database"
-7b. Specific values, sheet structure, cell content, accession lookups, MW, intensity counts,
-    or detection-of-X-in-sample-Y questions about the uploaded FILE → "query_data"
-    (Distinguish from "answer": if the question is about a concrete value in the file
-    rather than a concept, definition, or analysis result, prefer "query_data".)
-7c. MULTI-QUESTION MESSAGES: Note — when the user pastes 2+ questions in one message,
-    the orchestrator splits them automatically and routes each question through this
-    same decision step. So just answer for the SINGLE question you receive; do not
-    worry about "the rest".
-8.  Pathway / enrichment / KEGG / GO → "run_enrichment"
-9.  Plot / visualize / chart / heatmap / volcano / report → "run_visualization"
-10. Data uploaded but NO analysis yet AND user says "run analysis", "analyse the
-    data", "do the analysis", "full analysis", "run all", "give me everything",
-    "comprehensive analysis" — anything generic without a named group pair →
-    "run_full_pipeline"
-11. After a full pipeline has already run, "run analysis" with no specific pair
-    repeats the pipeline (still "run_full_pipeline").
-12. "run analysis" / "analyze" with SPECIFIC group names (e.g. "Disease vs Control",
-    "DMD Quad vs BL6 Quad") → "run_analysis"
-    - Set group1_label, group1_samples, group2_label, group2_samples from available_columns.
-    - Leave sample lists empty if you cannot confidently match column names.
-13. "run all pairwise comparisons WITHOUT enrichment / plots" (explicit, rare) →
-    "run_all_comparisons"
+4.  Re-run with explicit threshold values ("re-run with p<0.01", "change
+    threshold to 0.01 and re-analyse", "use stricter cutoffs and run again")
+    → "run_analysis" + populate parameter fields (see PARAMETER EXTRACTION).
+    Use "modify_code" ONLY when the user wants a code-level change that
+    cannot be expressed as a threshold value.
+
+5.  External lookup — "look up proteins online", "annotate", "get gene names
+    from UniProt", "convert IDs" → "query_database".
+    If the user mentions a protein that IS in the loaded file, prefer
+    query_data — the file already carries names, accessions, gene symbols, MW.
+
+6.  Enrichment — "pathway", "enrichment", "KEGG", "GO", "Reactome",
+    "WikiPathways" → "run_enrichment".
+    Precondition: significant biomarkers exist (top_5_biomarkers present in
+    context). Otherwise ask_clarification.
+
+7.  Visualisation — "plot", "visualise", "chart", "heatmap", "volcano", "PCA",
+    "boxplot", "report" → "run_visualization". Populate requested_plots with
+    the specific plot names the user mentioned; leave [] for "all plots" /
+    unspecified.
+
+8.  Specific comparison — "run analysis" / "compare" / "analyse" with named
+    group(s) ("Disease vs Control", "DMD Quad vs BL6 Quad", "WT vs KO") →
+    "run_analysis".
+    Sample-list population:
+      • If `sample_to_group_map_present: YES` and `all_groups_assigned`
+        contains the named groups, COPY the sample lists from that map into
+        group1_samples / group2_samples. Do not leave them empty.
+      • Otherwise, populate from all_sample_columns only when you can match
+        column-name patterns to the group labels with high confidence; leave
+        empty if uncertain (ingestion will fill them in).
+
+8b. Questions asking for a RANKED LIST of hits / biomarkers / differentially
+    expressed proteins from a comparison — even when phrased as a question
+    rather than a command:
+      • "What are the top N hits for <X> vs <Y>?"
+      • "Show me the top N biomarkers comparing <X> and <Y>"
+      • "What proteins are most up/down-regulated in <X> vs <Y>?"
+      • "List the top hits between <X> and <Y> tissues"
+    → "run_analysis" (not query_data, not answer — a full DEA pipeline is required)
+
+8c. "Pool / combine all <X> samples into one group vs all <Y> samples" — even
+    when the user says "across all tissues", "combined analysis", "as a
+    whole", or is responding to a clarification that offered a combined
+    option:
+    → "run_analysis" with group1_label=<X>, group2_label=<Y>.
+    Do NOT route to run_all_comparisons — that runs every tissue pair
+    separately. Leave group1_samples/group2_samples empty; the resolver will
+    pool all sub-groups whose name starts with <X> or <Y> automatically.
+
+9.  Multi-group ANOVA — "ANOVA across all groups", "compare WT, KO, and HET",
+    "test all groups simultaneously" → "run_analysis" with test_method="anova"
+    and populate all_groups (NOT group1_samples / group2_samples).
+
+10. Generic analysis request — "run analysis", "analyse the data", "do the
+    analysis", "full analysis", "run all", "give me everything",
+    "comprehensive analysis" with NO named group pair → "run_full_pipeline".
+    Applies whether or not a pipeline has already run.
+
+11. Explicit pairwise-only — "run all pairwise comparisons WITHOUT enrichment
+    / plots" (rare; user has to be explicit) → "run_all_comparisons".
+
+12. Conceptual / general-knowledge questions ("what is a t-test?", "explain
+    KEGG", "how does limma work?", "what is FDR?") and off-topic chat →
+    "answer". Use this as the FALLBACK when no specific action matches.
+
+MULTI-QUESTION MESSAGES: when the user pastes 2+ questions in one message,
+the orchestrator splits them automatically and routes each through this same
+decision step. Decide for the SINGLE question you receive; ignore "the rest".
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CLARIFICATION PHILOSOPHY  —  ask the user rather than assume anything uncertain
@@ -369,6 +552,100 @@ that CANNOT be done by adjusting a threshold value.
 
 For "run_analysis" populate groups only when you can confidently match column names to group labels.
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONFIDENCE CALIBRATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  0.95–1.00 — Schema-anchored: an action verb + explicit group names match
+               groups present in all_groups_assigned, or the message is a
+               clear conceptual question.
+  0.80–0.94 — Clear intent with one minor uncertainty (e.g. group name needs
+               fuzzy match; threshold mentioned but units unclear).
+  0.70–0.79 — Borderline. Prefer "ask_clarification" over guessing — running
+               the wrong analysis costs the user more than one extra turn.
+  < 0.70   — Auto-demoted to "answer". If you arrive here, you should
+              probably have routed to ask_clarification instead.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DISAMBIGUATION EXAMPLES  (commonly-misrouted patterns)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Pattern                                              | Action
+─────────────────────────────────────────────────────|─────────────────────
+"what is the most up-regulated protein in A vs B?"   | query_data
+"fold change of TTN in WT vs KO?"                    | query_data
+"is dystrophin detected in the DMD samples?"         | query_data
+"top 10 proteins by intensity in mdx group"          | query_data
+"explain what fold change means"                     | answer
+"how does limma differ from Welch?"                  | answer
+"what did the analysis find?"  (results in state)    | answer
+"run analysis"  (no groups named, no analysis yet)   | run_full_pipeline
+"give me a comprehensive analysis"                   | run_full_pipeline
+"compare DMD Quad vs BL6 Quad"                       | run_analysis
+"re-run with p<0.01"                                 | run_analysis (+adj_pval_cutoff=0.01)
+"add a step to the pipeline that filters by MW"      | modify_code
+"show me the code that produced this"                | show_code
+"look up SERPINA1 in UniProt"  (not in file)         | query_database
+"look up SERPINA1"  (IS in loaded file)              | query_data
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FEW-SHOT JSON OUTPUTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Example A — specific comparison with groups present in context
+Context excerpt: data_loaded=True, all_groups_assigned={"DMD_Quad":["s1","s2","s3"], "BL6_Quad":["s4","s5","s6"]}
+User: "Compare DMD Quad vs BL6 Quad"
+Output:
+{"action":"run_analysis","group1_label":"DMD_Quad","group1_samples":["s1","s2","s3"],
+ "group2_label":"BL6_Quad","group2_samples":["s4","s5","s6"],"requested_plots":[],
+ "confidence":0.97,"reason":"Named pair matches all_groups_assigned exactly.",
+ "adj_pval_cutoff":null,"log2fc_cutoff":null,"missing_threshold":null,"top_n":null,
+ "test_method":null,"is_paired":null,"all_groups":null,"omic_type":null,
+ "clarification_question":null}
+
+Example B — re-run with stricter threshold
+Context excerpt: analysis_complete=true
+User: "Re-run with p<0.01 and at least 2-fold change"
+Output:
+{"action":"run_analysis","group1_label":null,"group1_samples":[],"group2_label":null,
+ "group2_samples":[],"requested_plots":[],"confidence":0.95,
+ "reason":"Threshold override; reuse last analysis groups.",
+ "adj_pval_cutoff":0.01,"log2fc_cutoff":1.0,"missing_threshold":null,"top_n":null,
+ "test_method":null,"is_paired":null,"all_groups":null,"omic_type":null,
+ "clarification_question":null}
+
+Example C — file-grounded value question
+Context excerpt: data_loaded=True
+User: "What is the most up-regulated protein in mdx vs WT?"
+Output:
+{"action":"query_data","group1_label":null,"group1_samples":[],"group2_label":null,
+ "group2_samples":[],"requested_plots":[],"confidence":0.96,
+ "reason":"Ranking question computable from the file via fold-change SQL.",
+ "adj_pval_cutoff":null,"log2fc_cutoff":null,"missing_threshold":null,"top_n":null,
+ "test_method":null,"is_paired":null,"all_groups":null,"omic_type":null,
+ "clarification_question":null}
+
+Example D — generic full pipeline
+Context excerpt: data_loaded=True, analysis_complete=false
+User: "Just run the analysis"
+Output:
+{"action":"run_full_pipeline","group1_label":null,"group1_samples":[],"group2_label":null,
+ "group2_samples":[],"requested_plots":[],"confidence":0.92,
+ "reason":"Generic request, no named pair — run all pairwise + enrichment + plots.",
+ "adj_pval_cutoff":null,"log2fc_cutoff":null,"missing_threshold":null,"top_n":null,
+ "test_method":null,"is_paired":null,"all_groups":null,"omic_type":null,
+ "clarification_question":null}
+
+Example E — ambiguous comparison → clarify
+Context excerpt: data_loaded=True, all_groups_assigned={"WT":[...],"mdx":[...],"uDys5":[...],"H2":[...]}
+User: "Compare the groups"
+Output:
+{"action":"ask_clarification","group1_label":null,"group1_samples":[],"group2_label":null,
+ "group2_samples":[],"requested_plots":[],"confidence":0.95,
+ "reason":"Four groups present; user did not specify which pair or ANOVA.",
+ "adj_pval_cutoff":null,"log2fc_cutoff":null,"missing_threshold":null,"top_n":null,
+ "test_method":null,"is_paired":null,"all_groups":null,"omic_type":null,
+ "clarification_question":"I can see four groups in your data: **WT**, **mdx**, **uDys5**, **H2**. Which comparison would you like? Options:\n\n1. A specific pairwise comparison (e.g. *mdx vs WT*) — supervised DEA.\n2. **All pairwise comparisons** — produces a separate result for every pair.\n3. **One-way ANOVA across all four groups** — single F-test, good when you want to ask whether ANY group differs.\n\nJust let me know which fits your experiment!"}
+
 OUTPUT: valid JSON only — no markdown fences, no prose, no trailing text.
 {
   "action": "<action>",
@@ -386,19 +663,72 @@ OUTPUT: valid JSON only — no markdown fences, no prose, no trailing text.
   "test_method": null,
   "is_paired": null,
   "all_groups": null,
+  "dose_levels": null,
+  "subject_map": null,
+  "clinical_outcome": null,
+  "ptm_analysis": null,
   "omic_type": null,
-  "clarification_question": null
+  "clarification_question": null,
+  "target_comparison": null,
+  "action_sequence": []
 }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MULTI-STEP SEQUENCES  —  compound imperatives with "then", "and then", "next"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When the user chains two or more actions in ONE message using connectors like
+"then", "and then", "next", "after that", "finally", "also", "followed by":
+
+  EXAMPLE: "Compare uDys5 and mdx, identify top 10 biomarkers, then run
+            pathway analysis and show me the volcano plot"
+
+  → Set "action" to the FIRST step's action (for backward compatibility).
+  → Populate "action_sequence" with ALL steps in order:
+    [
+      {"action": "run_analysis", "group1_label": "uDys5", "group2_label": "mdx", "top_n": 10},
+      {"action": "run_enrichment"},
+      {"action": "run_visualization", "requested_plots": ["volcano"]}
+    ]
+
+Each step in "action_sequence" is an object with:
+  "action"          — required; same valid set as the top-level action
+  "group1_label"    — for run_analysis steps
+  "group2_label"    — for run_analysis steps
+  "group1_samples"  — optional; leave [] if groups resolve from name
+  "group2_samples"  — optional
+  "requested_plots" — for run_visualization steps
+  "top_n"           — for run_analysis steps (number of proteins to report)
+  "test_method"     — for run_analysis steps
+  "adj_pval_cutoff" — threshold override
+  "log2fc_cutoff"   — threshold override
+
+RULES FOR SEQUENCE USE:
+  • Only populate "action_sequence" when the user asks for ≥ 2 distinct
+    pipeline actions in one message. Single-intent messages get [].
+  • De-duplicate: do NOT list the same (action, group pair) twice.
+  • Group names and plot names follow the same rules as the single-action case.
+  • For "compare X and Y and show me the volcano plot":
+      action_sequence = [
+        {"action": "run_analysis", "group1_label": "X", "group2_label": "Y"},
+        {"action": "run_visualization", "requested_plots": ["volcano"]}
+      ]
+  • Questions ending in "?" are NOT compound imperatives — they are handled
+    via the multi-question splitter and should NOT produce an action_sequence.
+    Only use action_sequence for imperative compound requests.
 
 For "ask_clarification": set "clarification_question" to the full question text
 (markdown supported). Leave all group/param fields null. Set confidence ≥ 0.9.
 
-"confidence" is a float 0.0–1.0. Decisions with confidence < 0.7 are auto-demoted to "answer".
+For "run_visualization": populate "requested_plots" with canonical plot names
+the user asked for. Leave it empty [] if the user wants all standard plots
+or was not specific.
+Available plot names: volcano, ma_plot, heatmap, pca, boxplot,
+sample_correlation, cv_distribution, fc_heatmap, topn_bar, rescue_bar,
+pathway_dotplot.
 
-For "run_visualization": populate "requested_plots" with canonical plot names the user asked for.
-Leave it empty [] if the user wants all standard plots or was not specific.
-Available plot names: volcano, ma_plot, heatmap, pca, boxplot, sample_correlation,
-cv_distribution, fc_heatmap, topn_bar, rescue_bar, pathway_dotplot.
+omic_type accepts ONLY "proteomics" (other values will be silently dropped).
+Leave it null unless the user explicitly asserts the omic type.
 """
 
 _ANSWER_SYSTEM_PROMPT = """\
@@ -443,7 +773,15 @@ RULE 4 — NO INVENTED IDENTIFIERS:
   Do NOT invent protein names, gene symbols, accession IDs, or pathway names
   that are not grounded in the session context or your verified training knowledge.
 
-RULE 5 — FORMAT:
+RULE 5 — COMPUTATIONAL NEXT STEPS ONLY:
+  This is a computational pipeline. When suggesting follow-up actions, only
+  recommend in-silico steps the platform can perform: additional comparisons,
+  alternate statistical tests, threshold sweeps, pathway enrichment, additional
+  plots, UniProt cross-reference, sub-group re-analysis. Do NOT suggest wet-lab
+  follow-up (Western blot, qPCR, IHC, ELISA, knockout, animal study, MS
+  re-acquisition) unless the user explicitly asks for experimental validation.
+
+RULE 6 — FORMAT:
   Use markdown formatting. Be concise and precise. For session-data summaries,
   present actual numbers from the context (n_proteins, n_samples, sample_columns, etc.)
   rather than generic descriptions.
@@ -515,7 +853,7 @@ def _extract_questions(text: str) -> List[str]:
 
     # Fallback: paragraph with multiple "?" on a single line
     if len(questions) < 2 and text.count("?") >= 2:
-        parts = [p.strip() for p in re.split(r"(?<=\?)\s+", text) if p.strip()]
+        parts = [p.strip() for p in re.split(r"(?<=\?)\s*", text) if p.strip()]
         questions = [_QUESTION_TAG_RE.sub("", p).strip()
                      for p in parts if p.endswith("?")]
 
@@ -607,13 +945,12 @@ class LearningAgent(BaseAgent):
         ctx += f"  n_proteins: {state.get('n_proteins', 0)}\n"
         ctx += f"  n_samples: {state.get('n_samples', 0)}\n"
         ctx += f"  omic_type: {state.get('omic_type', 'none')}\n"
-        ctx += f"  data_type: {state.get('data_type', 'none')}\n"
         ctx += f"  analysis_complete: {state.get('n_significant') is not None}\n"
         ctx += f"  n_significant: {state.get('n_significant', 'none')}\n"
         ctx += f"  analysis_mode: {state.get('analysis_mode', 'none')}\n"
         ctx += f"  has_analysis_code: {bool(state.get('analysis_code'))}\n"
         ctx += f"  has_plots: {bool(state.get('plot_paths'))}\n"
-        ctx += f"  enrichment_done: {bool(state.get('pathways'))}\n"
+        ctx += f"  enrichment_done: {bool(state.get('enrichment_ran'))}\n"
         ctx += f"  status: {state.get('status', 'ready')}\n"
         ctx += f"  is_paired: {state.get('is_paired', False)}\n"
         ctx += f"  test_method_set: {(state.get('analysis_params') or {}).get('test_method', 'auto')}\n"
@@ -687,6 +1024,28 @@ class LearningAgent(BaseAgent):
         if top_bm:
             ctx += f"  top_5_biomarkers: {[b.get('protein','') for b in top_bm[:5]]}\n"
 
+        # Multi-comparison history — for awareness only. By default, all
+        # follow-up actions (viz, enrichment, query, answer) act on the
+        # LATEST analysis (the last entry here). target_comparison should
+        # remain null unless the user explicitly references a past comparison.
+        analyses_state = state.get("analyses") or []
+        if analyses_state:
+            latest = analyses_state[-1]
+            ctx += (
+                f"  latest_analysis: {latest.get('comparison_id','?')} "
+                f"(n_sig={latest.get('n_significant',0)}, "
+                f"method={latest.get('test_method') or 'auto'})\n"
+            )
+            older = analyses_state[:-1]
+            if older:
+                ids = [a.get('comparison_id','?') for a in older[-6:]]
+                ctx += f"  previous_analyses ({len(older)} earlier): {ids}\n"
+                ctx += (
+                    "  → ALL downstream actions default to latest_analysis. "
+                    "Only set target_comparison when the user EXPLICITLY "
+                    "asks to revisit a previous comparison by name.\n"
+                )
+
         # Include last 5 conversation turns so the LLM knows what was recently discussed
         recent = _recent_messages(state.get("messages") or [], n=5)
         if recent:
@@ -706,7 +1065,7 @@ class LearningAgent(BaseAgent):
             # json_mode=True: forces valid JSON output — no markdown fences,
             # no preamble — eliminating the most common structured-output failure.
             raw = self._call_llm(
-                messages, max_tokens=350, temperature=0.0, json_mode=True
+                messages, max_tokens=600, temperature=0.0, json_mode=True
             ).strip()
 
             # Validate + coerce with Pydantic (catches unknown actions, bad types)
@@ -717,6 +1076,20 @@ class LearningAgent(BaseAgent):
                 self.logger.warning(
                     "Low-confidence decision (%.2f) for action=%s — demoting to 'answer'",
                     decision_obj.confidence, decision_obj.action,
+                )
+                decision_obj.action = "answer"
+
+            # Reason-quality guard: GPT-4o self-reports ≥ 0.95 confidence on
+            # nearly every decision, so the bare confidence threshold rarely
+            # triggers.  For side-effect actions we additionally require a
+            # substantive reason (≥ 8 chars) before letting the action fire,
+            # catching cases where the model is confident-but-terse (which
+            # correlates with misrouted requests).
+            reason_text = (decision_obj.reason or "").strip()
+            if decision_obj.action in _SIDE_EFFECT_ACTIONS and len(reason_text) < 8:
+                self.logger.warning(
+                    "Thin reason (%r) for side-effect action=%s — demoting to 'answer'.",
+                    reason_text, decision_obj.action,
                 )
                 decision_obj.action = "answer"
 
@@ -944,6 +1317,14 @@ class LearningAgent(BaseAgent):
         biomarker = self._specialist("biomarker")
         summary_lines: List[str] = []
 
+        # Snapshot group fields so we can restore them after the loop;
+        # writing each pair's labels into state during iteration would leave
+        # the last comparison's values visible to downstream enrichment/viz.
+        _saved_g1_label   = state.get("group1_label")
+        _saved_g1_samples = state.get("group1_samples")
+        _saved_g2_label   = state.get("group2_label")
+        _saved_g2_samples = state.get("group2_samples")
+
         for g1_name, g2_name in pairs:
             state["group1_label"]   = g1_name
             state["group1_samples"] = groups[g1_name]
@@ -960,6 +1341,13 @@ class LearningAgent(BaseAgent):
                 f"- **{g1_name} vs {g2_name}**: {n_sig} significant | "
                 f"top: {', '.join(top3)}"
             )
+
+        # Restore the pre-loop group fields so downstream agents (enrichment,
+        # viz, answer) see the original comparison context, not the last pair.
+        state["group1_label"]   = _saved_g1_label
+        state["group1_samples"] = _saved_g1_samples
+        state["group2_label"]   = _saved_g2_label
+        state["group2_samples"] = _saved_g2_samples
 
         state["messages"].append({
             "role": "assistant",
@@ -1598,6 +1986,10 @@ class LearningAgent(BaseAgent):
         n = len(questions)
         parts: List[str] = [f"You asked **{n} questions** — answering each below.\n"]
 
+        # Track which pipeline actions have already been executed in this batch
+        # so we never run enrichment or visualization more than once per message.
+        _dispatched: set = set()
+
         for i, q in enumerate(questions, 1):
             self.logger.info("Multi-q [%d/%d]: %s", i, n, q[:80])
 
@@ -1620,11 +2012,44 @@ class LearningAgent(BaseAgent):
                     sub_state = self._show_code(sub_state)
                 elif sub_action == "modify_code":
                     sub_state = self._modify_code(sub_state)
+                elif (
+                    sub_action == "run_enrichment"
+                    and "run_enrichment" not in _dispatched
+                ):
+                    # Execute enrichment once if results aren't already in state;
+                    # merge pathways back to the outer state so later sub-questions
+                    # (and the combined response) can reference them.
+                    if state.get("pathways"):
+                        sub_state = self._answer(sub_state)  # already done → answer from results
+                    else:
+                        sub_state = self._specialist("enrichment").run(sub_state)
+                        if sub_state.get("pathways"):
+                            state["pathways"] = sub_state["pathways"]
+                    _dispatched.add("run_enrichment")
+                elif (
+                    sub_action == "run_visualization"
+                    and "run_visualization" not in _dispatched
+                ):
+                    # Execute visualization once; merge plot_paths back.
+                    if state.get("plot_paths") and not sub_decision.get("requested_plots"):
+                        sub_state = self._answer(sub_state)  # already done → describe them
+                    else:
+                        requested_plots = sub_decision.get("requested_plots") or []
+                        sub_state = self._specialist("visualization").run(
+                            sub_state, requested_plots=requested_plots or None
+                        )
+                        if sub_state.get("plot_paths"):
+                            state["plot_paths"] = sub_state["plot_paths"]
+                    _dispatched.add("run_visualization")
                 else:
-                    # answer, ask_clarification, run_*, load_data — all fall through
-                    # to the conversational answer path for sub-questions, since we
-                    # don't want side-effects like re-running analysis 30 times.
-                    sub_state = self._answer(sub_state)
+                    # Heavy pipeline re-runs (run_analysis, run_full_pipeline,
+                    # load_data) and duplicate dispatches fall through to the
+                    # conversational answer path so existing results are
+                    # described rather than recomputed.
+                    sub_state = self._answer(
+                        sub_state,
+                        target_comparison=sub_decision.get("target_comparison"),
+                    )
 
                 last = next(
                     (m["content"] for m in reversed(sub_state.get("messages") or [])
@@ -2169,7 +2594,11 @@ class LearningAgent(BaseAgent):
 
     @_traceable(run_type="chain", name="orchestrator.answer",
                 tags=["biomarker-discovery", "answer"])
-    def _answer(self, state: BiomarkerState) -> BiomarkerState:
+    def _answer(
+        self,
+        state: BiomarkerState,
+        target_comparison: Optional[str] = None,
+    ) -> BiomarkerState:
         """
         Answer any question using full session context + LLM knowledge.
 
@@ -2177,8 +2606,22 @@ class LearningAgent(BaseAgent):
           • Injects actual biomarker list as a grounding anchor so the LLM
             cannot fabricate protein names or statistics that differ from what
             was computed.
+          • When ``target_comparison`` is supplied (and matches a stored
+            analysis), the grounding biomarker/pathway list is read from that
+            specific entry in state["analyses"] — so "top 10 in WT vs KO"
+            doesn't accidentally surface results from the most-recent run.
         """
+        # Resolve which past analysis (if any) the user is asking about.
+        from core.state import find_analysis as _find_analysis
+        target_entry = _find_analysis(state, target_comparison) if target_comparison else None
+
         ctx = ["## Session context (ONLY use this when answering questions about the user's data)"]
+        if target_comparison and target_entry is None and (state.get("analyses") or []):
+            ctx.append(
+                f"_Note: the user mentioned '**{target_comparison}**' but no "
+                f"saved analysis matched. Falling back to the most recent run._"
+            )
+            target_entry = (state.get("analyses") or [])[-1]
         if state.get("data_type"):
             sample_cols  = state.get("sample_columns") or []
             meta_cols    = state.get("metadata_columns") or []
@@ -2237,9 +2680,12 @@ class LearningAgent(BaseAgent):
                 ]
             else:
                 ctx.append("- Analysis complete: NO — analysis has not been run yet")
-            if state.get("pathways"):
-                top3pw = [p.get("pathway","") for p in state["pathways"][:3]]
-                ctx.append(f"- Enrichment done: YES — top pathways: {top3pw}")
+            if state.get("enrichment_ran"):
+                top3pw = [p.get("pathway","") for p in (state.get("pathways") or [])[:3]]
+                if top3pw:
+                    ctx.append(f"- Enrichment done: YES — top pathways: {top3pw}")
+                else:
+                    ctx.append("- Enrichment done: YES — ran successfully, but found ZERO significant pathways (do not fabricate pathway names)")
             else:
                 ctx.append("- Enrichment done: NO")
             if state.get("plot_paths"):
@@ -2247,27 +2693,102 @@ class LearningAgent(BaseAgent):
         else:
             ctx.append("- Data loaded: NO — user has not uploaded a file yet")
 
-        # ── Grounding anchor: inject actual values so LLM cannot hallucinate ──
-        # This is the primary hallucination guard for session-specific claims.
-        if state.get("top_biomarkers"):
-            ctx.append("\n## Grounded biomarker data (cite ONLY from this list)")
-            for b in (state.get("top_biomarkers") or [])[:25]:
+        # ── Grounding anchor: inject ONLY the latest analysis's data ──────────
+        # Single source of truth for the active session context. Pathways and
+        # biomarkers must come from the SAME analysis or the LLM will mix them.
+        # Resolution priority:
+        #   1. target_entry — only set when user EXPLICITLY named a past comparison
+        #   2. The last entry in state["analyses"] — the most recent analysis
+        #   3. The legacy mirror fields (top_biomarkers, pathways) as a final fallback
+        analyses_state = state.get("analyses") or []
+        active_entry   = target_entry or (analyses_state[-1] if analyses_state else None)
+
+        if active_entry is not None:
+            ground_biomarkers = active_entry.get("top_biomarkers") or []
+            ground_pathways   = active_entry.get("pathways") or []
+            active_cmp_id     = active_entry.get("comparison_id")
+        else:
+            ground_biomarkers = state.get("top_biomarkers") or []
+            ground_pathways   = state.get("pathways") or []
+            active_cmp_id     = None
+
+        if ground_biomarkers:
+            label = (
+                f"\n## Grounded biomarker data — latest analysis `{active_cmp_id}` "
+                "(cite ONLY from this list)"
+                if active_cmp_id
+                else "\n## Grounded biomarker data (cite ONLY from this list)"
+            )
+            ctx.append(label)
+            ctx.append(
+                "NOTE: this list is ranked by |log2 fold-change|, NOT by "
+                "statistical significance — check the `sig` field per row. "
+                "Many top-ranked-by-fold-change proteins are NOT significant "
+                "(sig='NS' or 'Trend')."
+            )
+            for b in ground_biomarkers[:25]:
                 protein = b.get("protein", "")
                 lfc     = b.get("log2_fold_change", b.get("rescue_score", "?"))
                 adjp    = b.get("adj_p_value", "?")
-                ctx.append(f"  - {protein}  log2FC={lfc}  adj_p={adjp}")
+                sig     = b.get("significance", "?")
+                ctx.append(f"  - {protein}  log2FC={lfc}  adj_p={adjp}  sig={sig}")
             ctx.append(
                 "CRITICAL: Do not mention any protein name, fold-change value, or "
-                "p-value that is not listed above."
+                "p-value that is not listed above. All current results refer to "
+                "the LATEST analysis. Do not surface biomarkers or pathways from "
+                "older comparisons unless the user explicitly asked for them. When "
+                "asked for the 'most significant' proteins specifically, rank by "
+                "adj_p ascending among rows where sig is 'Significant' or 'Highly "
+                "Significant' — do not conflate fold-change rank with statistical "
+                "significance. If fewer than the requested number are actually "
+                "significant, say so rather than padding the list with "
+                "non-significant rows."
             )
 
-        if state.get("pathways"):
-            ctx.append("\n## Grounded pathway data (cite ONLY from this list)")
-            for p in (state.get("pathways") or [])[:10]:
+        # ── Multi-comparison history: every prior run's full biomarker list ────
+        # Required for cross-comparison questions (overlap, unique-to-group, etc.)
+        cmp_hist = state.get("comparison_history") or {}
+        if len(cmp_hist) > 1:
+            ctx.append(
+                "\n## Comparison history — ALL analyses run this session "
+                "(use these for overlap / intersection questions)"
+            )
+            for cmp_key, cmp_data in cmp_hist.items():
+                top = (cmp_data.get("top_biomarkers") or [])
+                n_sig = cmp_data.get("n_significant", "?")
+                ctx.append(f"\n### {cmp_key}  (n_significant={n_sig})")
+                for b in top[:50]:
+                    protein = b.get("protein", "")
+                    lfc     = b.get("log2_fold_change", b.get("rescue_score", "?"))
+                    adjp    = b.get("adj_p_value", "?")
+                    sig     = b.get("significance", "?")
+                    ctx.append(f"  - {protein}  log2FC={lfc}  adj_p={adjp}  sig={sig}")
+                pathways = cmp_data.get("pathways") or []
+                if pathways:
+                    ctx.append(f"  Pathways ({cmp_key}):")
+                    for p in pathways[:10]:
+                        ctx.append(
+                            f"    * {p.get('pathway','')}  "
+                            f"adj_p={p.get('p_adjust', p.get('adj_p','?'))}"
+                        )
+            ctx.append(
+                "To find overlap: identify proteins present in BOTH lists above. "
+                "To find unique markers: identify proteins in one list but not the other. "
+                "Base ALL overlap/intersection answers on the actual protein names listed above."
+            )
+
+        if ground_pathways:
+            ctx.append("\n## Grounded pathway data (from the same latest analysis)")
+            for p in ground_pathways[:10]:
                 ctx.append(
                     f"  - {p.get('pathway','')}  "
                     f"adj_p={p.get('p_adjust', p.get('adj_p','?'))}"
                 )
+        elif ground_biomarkers:
+            ctx.append(
+                "\n_Pathway enrichment has not been run for the latest analysis. "
+                "Suggest running enrichment if the user asks about pathways._"
+            )
 
         # Last 20 messages, with long content truncated to avoid token overflow
         history = _recent_messages(state.get("messages") or [], n=20, truncate_at=600)
@@ -2288,6 +2809,139 @@ class LearningAgent(BaseAgent):
         state["status"]       = "answered"
         return state
 
+    # ── Multi-step sequence executor ─────────────────────────────────────────
+
+    def _execute_action_sequence(
+        self,
+        state: BiomarkerState,
+        action_sequence: List[Dict[str, Any]],
+    ) -> BiomarkerState:
+        """Execute an ordered list of ActionStep dicts produced by the decision LLM.
+
+        Called when a compound imperative is detected, e.g.:
+            "Compare uDys5 and mdx, identify top 10 biomarkers, then run
+             pathway analysis and show me the volcano plot"
+
+        Steps are executed in order with state passed through. Duplicate
+        (action, group-pair) combinations are silently skipped to prevent
+        redundant pipeline runs.
+        """
+        all_cols   = state.get("sample_columns") or []
+        all_groups = state.get("all_groups") or {}
+        label_map  = state.get("label_map") or {}
+        seen: set  = set()
+
+        def _resolve_label(label: Optional[str]) -> List[str]:
+            """Best-effort expansion of a group label to sample column list."""
+            if not label:
+                return []
+            # 1. Metadata label-map (canonical 2-sheet templates)
+            wanted = str(label).strip().lower()
+            lm_hits = [
+                c for c, g in (label_map.items() if isinstance(label_map, dict) else [])
+                if str(g).strip().lower() == wanted and c in all_cols
+            ]
+            if lm_hits:
+                return [c for c in all_cols if c in set(lm_hits)]
+            # 2. all_groups exact match
+            for k, v in all_groups.items():
+                if k.lower() == wanted:
+                    return list(v)
+            # 3. Prefix-pool: "DMD" → "DMD Heart" + "DMD Quad"
+            prefix = wanted + " "
+            pooled = []
+            for k, v in all_groups.items():
+                if k.lower().startswith(prefix) or k.lower() == wanted:
+                    pooled.extend(c for c in v if c in all_cols)
+            if pooled:
+                return [c for c in all_cols if c in set(pooled)]
+            # 4. Column prefix/substring match
+            return [c for c in all_cols if c.lower().startswith(wanted)
+                    or wanted in c.lower()]
+
+        n_steps = len(action_sequence)
+        for i, step in enumerate(action_sequence):
+            action = step.get("action", "answer")
+
+            # Deduplication key: group pair for run_analysis, action otherwise
+            if action == "run_analysis":
+                g1 = (step.get("group1_label") or "").lower()
+                g2 = (step.get("group2_label") or "").lower()
+                dedup_key = f"run_analysis:{min(g1,g2)}:{max(g1,g2)}"
+            else:
+                dedup_key = action
+
+            if dedup_key in seen:
+                self.logger.info(
+                    "Sequence step %d/%d (%s) skipped — already executed this action.",
+                    i + 1, n_steps, action,
+                )
+                continue
+            seen.add(dedup_key)
+
+            self.logger.info("Sequence step %d/%d: %s", i + 1, n_steps, action)
+
+            # Merge step-level parameter overrides into session params
+            for param in (
+                "adj_pval_cutoff", "log2fc_cutoff", "top_n", "test_method",
+                "dose_levels", "subject_map", "clinical_outcome",
+            ):
+                if step.get(param) is not None:
+                    params = dict(state.get("analysis_params") or {})
+                    params[param] = step[param]
+                    state["analysis_params"] = params
+            if step.get("all_groups"):
+                state["all_groups"] = step["all_groups"]
+
+            if action == "run_analysis":
+                g1_label   = step.get("group1_label")
+                g2_label   = step.get("group2_label")
+                g1_samples = list(step.get("group1_samples") or [])
+                g2_samples = list(step.get("group2_samples") or [])
+                if g1_label and not g1_samples:
+                    g1_samples = _resolve_label(g1_label)
+                if g2_label and not g2_samples:
+                    g2_samples = _resolve_label(g2_label)
+                if g1_samples and g2_samples:
+                    state["group1_label"]   = g1_label or "Group1"
+                    state["group1_samples"] = g1_samples
+                    state["group2_label"]   = g2_label or "Group2"
+                    state["group2_samples"] = g2_samples
+                state = self._specialist("biomarker").run(state)
+
+            elif action == "run_enrichment":
+                state = self._specialist("enrichment").run(state)
+
+            elif action == "run_visualization":
+                requested_plots = step.get("requested_plots") or []
+                state = self._specialist("visualization").run(
+                    state, requested_plots=requested_plots or None
+                )
+
+            elif action == "run_all_comparisons":
+                state = self._run_all_comparisons(state)
+
+            elif action == "run_full_pipeline":
+                state = self._run_full_pipeline(state)
+
+            elif action == "query_data":
+                state = self._query_data(state)
+
+            elif action == "query_database":
+                state = self._query_database(state)
+
+            elif action == "show_code":
+                state = self._show_code(state)
+
+            else:  # answer, ask_clarification, unknown
+                state = self._answer(state)
+
+        last_action = action_sequence[-1].get("action", "answer") if action_sequence else "answer"
+        state["intent"]       = last_action
+        state["active_agent"] = "learning_agent"
+        state["status"]       = "pipeline_complete"
+        return state
+
     # ── Main entry point ──────────────────────────────────────────────────────
 
     @_traceable(run_type="chain", name="learning_agent",
@@ -2305,6 +2959,25 @@ class LearningAgent(BaseAgent):
         user_query = state.get("user_query", "")
         state["messages"].append({"role": "user", "content": user_query})
 
+        # ── Handle pending enrichment scope response ─────────────────────────
+        if state.get("status") == "awaiting_enrichment_scope":
+            uq = user_query.lower()
+            if any(w in uq for w in ("all", "2", "every", "full", "complete")):
+                state["enrichment_scope"] = "all"
+                state.pop("enrichment_top_n", None)
+                self.logger.info("Enrichment scope: all significant proteins")
+            else:
+                state["enrichment_scope"] = "top_n"
+                _topn_m = re.search(r"top\s*(\d+)", uq)
+                if _topn_m:
+                    state["enrichment_top_n"] = int(_topn_m.group(1))
+                else:
+                    state.pop("enrichment_top_n", None)
+                self.logger.info("Enrichment scope: top N biomarkers only")
+            state["status"] = "ready"
+            state["intent"] = "run_enrichment"
+            return self._specialist("enrichment").run(state)
+
         # ── Multi-question split ──────────────────────────────────────────────
         # If the user pasted ≥2 questions, split them and answer each one
         # individually — each question gets its own routing decision and
@@ -2320,13 +2993,24 @@ class LearningAgent(BaseAgent):
         state["intent"]       = action
         state["active_agent"] = "learning_agent"
 
+        # ── Multi-step sequence: compound imperatives ("X then Y then Z") ────
+        # When the decision LLM returns ≥ 2 action steps, execute each in order
+        # rather than running only the first step and dropping the rest.
+        action_seq = decision.get("action_sequence") or []
+        if len(action_seq) >= 2:
+            self.logger.info(
+                "Multi-step sequence detected (%d steps): %s",
+                len(action_seq), [s.get("action") for s in action_seq],
+            )
+            return self._execute_action_sequence(state, action_seq)
+
         # ── Capture analysis parameter overrides from the decision ─────────────
         # Merge any non-null params from this decision into the session overrides.
         # Existing overrides are preserved so values set in earlier turns carry
         # forward until the user explicitly changes them.
         _param_keys = (
             "adj_pval_cutoff", "log2fc_cutoff", "missing_threshold", "top_n",
-            "test_method",
+            "test_method", "dose_levels", "subject_map", "clinical_outcome",
         )
         new_params = {k: decision[k] for k in _param_keys
                       if k in decision and decision[k] is not None}
@@ -2343,6 +3027,101 @@ class LearningAgent(BaseAgent):
             state["all_groups"] = decision["all_groups"]
         if decision.get("omic_type"):
             state["omic_type"] = decision["omic_type"]
+        if decision.get("dose_levels"):
+            state["dose_levels"] = decision["dose_levels"]
+        if decision.get("subject_map"):
+            state["subject_map"] = decision["subject_map"]
+        if decision.get("clinical_outcome"):
+            state["clinical_outcome"] = decision["clinical_outcome"]
+        if decision.get("ptm_analysis") is not None:
+            state["ptm_analysis"] = bool(decision["ptm_analysis"])
+
+        # ── Deterministic intent overrides ────────────────────────────────────
+        # The LLM occasionally mis-routes a couple of recurring phrasings.
+        # Patch them here so the answer is always grounded in the right source.
+        _uq_lower = (user_query or "").lower()
+
+        # "show / generate / render plots" must go to the visualization agent
+        # — not to the answer step (which would just describe plots in text).
+        _viz_phrases = (
+            "show plot", "show the plot", "show plots", "show the plots",
+            "generate plot", "make plot", "render plot", "draw plot",
+            "show me the plot", "give me the plot", "display plot",
+            "show chart", "show charts", "show heatmap", "show volcano",
+            "show pca",
+        )
+        # Negative guard: don't override when the phrase appears inside a
+        # conceptual question (e.g. "what does a volcano plot show?",
+        # "walk me through what you'd show me on a volcano plot").
+        _conceptual_viz_re = re.compile(
+            r"what\s+(is|does|do|are)\s+.{0,50}(show|plot|chart)|"
+            r"(explain|describe|define)\s+.{0,50}(plot|chart|heatmap|volcano|pca)|"
+            r"walk.{0,20}through.{0,40}(show|plot|chart)|"
+            r"what.{0,30}would.{0,30}show|"
+            r"what\s+(represents?|means?|tells?).{0,40}(plot|chart|heatmap|volcano)",
+            re.IGNORECASE,
+        )
+        if (
+            action == "answer"
+            and any(p in _uq_lower for p in _viz_phrases)
+            and not _conceptual_viz_re.search(user_query)
+        ):
+            self.logger.info("Override: 'answer' -> 'run_visualization' (user asked to show plots).")
+            action = "run_visualization"
+            state["intent"] = action
+
+        # "top N biomarkers / biomarker list / ranked biomarkers" must come from
+        # the differential-analysis results (state['top_biomarkers']), NOT from
+        # a raw-data query that would rank by SpC / intensity.
+        _top_phrases = ("top biomarker", "top biomarkers", "ranked biomarker",
+                        "biomarker list", "list of biomarkers", "best biomarker",
+                        "most different", "most differential", "most significant",
+                        "biggest difference", "largest difference", "highest fold",
+                        "most dysregulated", "most changed", "most altered")
+        _top_re = re.search(
+            r"top\s*\d*\s*biomarker"          # "top10 biomarkers", "top biomarker"
+            r"|most\s+\w+\s+biomarker"         # "most different biomarkers"
+            r"|top\s*\d+\s+most",              # "top 10 most ..."
+            _uq_lower,
+        )
+        if (
+            action in {"query_data", "answer"}
+            and (any(p in _uq_lower for p in _top_phrases) or _top_re)
+            and state.get("top_biomarkers")
+        ):
+            requested_top_n = decision.get("top_n") or 0
+            stored_count = len(state.get("top_biomarkers") or [])
+            if requested_top_n > stored_count:
+                self.logger.info(
+                    "Override: '%s' -> 'run_analysis' (user wants top %d but only %d stored).",
+                    action, requested_top_n, stored_count,
+                )
+                action = "run_analysis"
+            else:
+                self.logger.info("Override: '%s' -> 'answer' (top biomarkers grounded in analysis results).", action)
+                action = "answer"
+            state["intent"] = action
+
+        # When analysis is complete, never let query_data answer ranking/comparison
+        # questions — the raw file has accession IDs without fold-changes, so it
+        # always returns Unknown/NaN for anything about differential expression.
+        _ranking_re = re.search(
+            r"most\s+\w+\s*(protein|biomarker)|"
+            r"(highest|largest|biggest|most)\s+(fold|change|differ|express|regulat)|"
+            r"rank(ed)?\s+(protein|biomarker)|"
+            r"(list|show|give).{0,20}(protein|biomarker)",
+            _uq_lower,
+        )
+        if (
+            action == "query_data"
+            and _ranking_re
+            and state.get("top_biomarkers")
+        ):
+            self.logger.info(
+                "Override: 'query_data' -> 'answer' (ranking question, analysis results available)."
+            )
+            action = "answer"
+            state["intent"] = action
 
         # ── Deterministic intent overrides ────────────────────────────────────
         # The LLM occasionally mis-routes a couple of recurring phrasings.
@@ -2440,7 +3219,23 @@ class LearningAgent(BaseAgent):
                 for known, cols in all_groups.items():
                     if known.lower() == label.lower() and len(cols) >= len(current):
                         return list(cols)
-                # 2. If the current sample list still looks short, widen via
+                # 2. Prefix pooling: "DMD" should pool "DMD Heart", "DMD Quad", etc.
+                #    Matches sub-groups whose name starts with "<label> " (space-delimited
+                #    to avoid "DMD" matching "DMDx" or similar).
+                prefix = label.lower() + " "
+                prefix_cols = []
+                for known, cols in all_groups.items():
+                    if known.lower().startswith(prefix) or known.lower() == label.lower():
+                        prefix_cols.extend(c for c in cols if c in all_cols)
+                if prefix_cols:
+                    # Preserve data-column order
+                    pooled = [c for c in all_cols if c in prefix_cols]
+                    if len(pooled) > len(current):
+                        self.logger.info(
+                            "Prefix-pooled '%s' from sub-groups → %s", label, pooled
+                        )
+                        return pooled
+                # 3. If the current sample list still looks short, widen via
                 #    prefix/substring match against actual columns.
                 if len(current) < 2:
                     matched = self._match_columns_by_label(label, all_cols)
@@ -2499,12 +3294,72 @@ class LearningAgent(BaseAgent):
 
         # ── Enrichment ────────────────────────────────────────────────────────
         if action == "run_enrichment":
-            return self._specialist("enrichment").run(state)
+            top_bm_list = state.get("top_biomarkers") or []
+            n_sig       = state.get("n_significant") or 0
+
+            # Parse user's current message for an explicit scope instruction.
+            # This takes priority over any previously cached enrichment_scope.
+            _eq = _uq_lower
+            _explicit_all  = bool(re.search(
+                r"\ball\b|\beverything\b|\bfull\b|\bcomplete\b|\bevery\b"
+                r"|\ball\s+(significant|differential|expressed|proteins?)",
+                _eq,
+            ))
+            _explicit_topn = bool(re.search(
+                r"top\s*\d+\s*(biomarkers?|proteins?|only|just)"
+                r"|\bonly\s+top\b|\bjust\s+top\b"
+                r"|\btop\s+\d+\s+only\b",
+                _eq,
+            ))
+
+            if _explicit_all:
+                state["enrichment_scope"] = "all"
+                state.pop("enrichment_top_n", None)
+                self.logger.info("Enrichment scope overridden by user message: all")
+            elif _explicit_topn:
+                state["enrichment_scope"] = "top_n"
+                # Capture the specific N the user requested (e.g. "top10" → 10)
+                _topn_match = re.search(r"top\s*(\d+)", _eq)
+                if _topn_match:
+                    state["enrichment_top_n"] = int(_topn_match.group(1))
+                    self.logger.info(
+                        "Enrichment scope overridden by user message: top_n=%d",
+                        state["enrichment_top_n"],
+                    )
+                else:
+                    state.pop("enrichment_top_n", None)
+                    self.logger.info("Enrichment scope overridden by user message: top_n (count unspecified)")
+            elif not state.get("enrichment_scope") and top_bm_list and n_sig > len(top_bm_list):
+                # No cached choice and no explicit instruction — ask the user.
+                state["messages"].append({
+                    "role": "assistant",
+                    "content": (
+                        f"Before running pathway enrichment, I'd like to confirm "
+                        f"which protein set to use:\n\n"
+                        f"1. **Top {len(top_bm_list)} biomarkers** — the ranked list "
+                        f"from your differential analysis\n"
+                        f"2. **All {n_sig} differentially expressed proteins** — "
+                        f"every protein that passed significance thresholds\n\n"
+                        f"Option 2 is generally recommended for pathway enrichment "
+                        f"as it gives a more complete biological picture. "
+                        f"Which would you prefer?"
+                    ),
+                })
+                state["status"] = "awaiting_enrichment_scope"
+                return state
+
+            target = decision.get("target_comparison")
+            return self._specialist("enrichment").run(state, target_comparison=target)
 
         # ── Visualisation ──────────────────────────────────────────────────────
         if action == "run_visualization":
             requested_plots = decision.get("requested_plots") or []
-            return self._specialist("visualization").run(state, requested_plots=requested_plots or None)
+            target          = decision.get("target_comparison")
+            return self._specialist("visualization").run(
+                state,
+                requested_plots=requested_plots or None,
+                target_comparison=target,
+            )
 
         # ── Code display ──────────────────────────────────────────────────────
         if action == "show_code":
@@ -2523,4 +3378,4 @@ class LearningAgent(BaseAgent):
             return self._query_data(state)
 
         # ── Answer (default) ──────────────────────────────────────────────────
-        return self._answer(state)
+        return self._answer(state, target_comparison=decision.get("target_comparison"))

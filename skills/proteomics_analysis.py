@@ -40,11 +40,13 @@ from scipy import stats
 from scipy.special import digamma, polygamma
 from scipy.optimize import brentq
 from statsmodels.stats.multitest import multipletests
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from core.io_utils import read_csv_safe
 from skills.base_skill import BaseOmicsSkill, OmicsAnalysisResult
 
 
@@ -99,11 +101,21 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         output_dir: str = "outputs",
         file_name: str = "analysis",
         # Extended test method selection
-        test_method: str = "auto",          # "auto"|"welch"|"limma"|"paired_t"|"anova"|"fold_change"
+        # "auto"|"welch"|"limma"|"paired_t"|"anova"|"fold_change"|
+        # "dose_response"|"repeated_measures"|"linear_regression"|
+        # "logistic_regression"|"cox_regression"
+        test_method: str = "auto",
         is_paired: bool = False,
         all_groups: Optional[Dict[str, List[str]]] = None,
         tmt_batches: Optional[Dict[str, Any]] = None,
         is_pooled_design: bool = False,
+        # Dose-response (case 6): group name -> numeric dose level
+        dose_levels: Optional[Dict[str, float]] = None,
+        # Time-course / repeated-measures (case 7): sample column -> subject/animal ID
+        subject_map: Optional[Dict[str, str]] = None,
+        # Clinical regression (case 10): sample column -> outcome value
+        # (scalar for linear/logistic; {"time":.., "event":..} dict for cox)
+        clinical_outcome: Optional[Dict[str, Any]] = None,
         **_kwargs,
     ) -> Dict[str, Any]:
         try:
@@ -117,6 +129,9 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
                 all_groups=all_groups,
                 tmt_batches=tmt_batches,
                 is_pooled_design=is_pooled_design,
+                dose_levels=dose_levels,
+                subject_map=subject_map,
+                clinical_outcome=clinical_outcome,
             )
             result["omic_type"] = self.omic_type
             return result
@@ -144,10 +159,15 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         all_groups: Optional[Dict[str, List[str]]] = None,
         tmt_batches: Optional[Dict[str, Any]] = None,
         is_pooled_design: bool = False,
+        dose_levels: Optional[Dict[str, float]] = None,
+        subject_map: Optional[Dict[str, str]] = None,
+        clinical_outcome: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
 
-        # 1. Load
-        df_raw = pd.read_csv(data_path, index_col=0)
+        # 1. Load — use encoding-robust reader so files with µ / Greek letters
+        # in headers (common in MaxQuant + Excel-on-Windows exports) decode
+        # cleanly instead of raising UnicodeDecodeError on the default utf-8.
+        df_raw = read_csv_safe(data_path, index_col=0)
         avail = [c for c in sample_columns if c in df_raw.columns]
         if not avail:
             raise ValueError(
@@ -191,7 +211,8 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         # because there are no true biological replicates within each "group" —
         # within-group spread is dominated by between-sample variation. We run
         # fold-change-only ranking instead, with NO p-values.
-        if (is_pooled_design or test_method == "fold_change"
+        if (is_pooled_design or effective_method == "fold_change_only"
+                or test_method == "fold_change"
             ) and group1_samples and group2_samples:
             results_df = self._fold_change_only(
                 data_qc, valid_mask,
@@ -222,10 +243,56 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
 
         is_anova = (
             effective_method == "anova"
-            or (all_groups and len(all_groups) >= 2)
+            and all_groups and len(all_groups) >= 2
+        )
+        is_dose_response = (
+            effective_method == "dose_response"
+            and all_groups and dose_levels
+        )
+        is_repeated_measures = (
+            effective_method == "repeated_measures"
+            and all_groups and subject_map
+        )
+        is_clinical_regression = (
+            effective_method in ("linear_regression", "logistic_regression", "cox_regression")
+            and clinical_outcome
         )
 
-        if is_anova and all_groups and len(all_groups) >= 2:
+        if is_dose_response:
+            results_df = self._dose_response(
+                data_qc, valid_mask, all_groups, dose_levels,
+                log2fc_cutoff=log2fc_cutoff,
+                adj_pval_cutoff=adj_pval_cutoff,
+                missing_threshold=missing_threshold,
+            )
+            sig_mask = (
+                (results_df["adj_p_value"] < adj_pval_cutoff)
+                & (results_df["total_log2fc_across_range"].abs() >= log2fc_cutoff)
+            )
+            n_sig = int(sig_mask.sum())
+        elif is_repeated_measures:
+            results_df = self._repeated_measures(
+                data_qc, valid_mask, all_groups, subject_map,
+                log2fc_cutoff=log2fc_cutoff,
+                adj_pval_cutoff=adj_pval_cutoff,
+                missing_threshold=missing_threshold,
+            )
+            sig_mask = (
+                (results_df["adj_p_value"] < adj_pval_cutoff)
+                & (results_df["max_log2fc"].abs() >= log2fc_cutoff)
+            )
+            n_sig = int(sig_mask.sum())
+        elif is_clinical_regression:
+            regression_type = effective_method.replace("_regression", "")  # "linear"|"logistic"|"cox"
+            regression_samples = list(clinical_outcome.keys())
+            results_df = self._clinical_regression(
+                data_qc, valid_mask, regression_samples, clinical_outcome,
+                regression_type=regression_type,
+                adj_pval_cutoff=adj_pval_cutoff,
+                missing_threshold=missing_threshold,
+            )
+            n_sig = int((results_df["adj_p_value"] < adj_pval_cutoff).sum())
+        elif is_anova and all_groups and len(all_groups) >= 2:
             results_df = self._anova_multigroup(
                 data_qc, valid_mask, all_groups,
                 log2fc_cutoff=log2fc_cutoff,
@@ -546,11 +613,12 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             # Data is log2-space so we just subtract; cap at ±20.
             log2fc = max(-20.0, min(20.0, float(m2 - m1)))
 
-            # Cohen's d (pooled-SD effect size)
+            # Cohen's d (pooled-SD effect size). Sign matches log2fc convention
+            # above (m2 - m1): positive means up in group2.
             n1, n2 = len(v1), len(v2)
             s1, s2 = float(v1.std(ddof=1)), float(v2.std(ddof=1))
             sp = np.sqrt(((n1 - 1) * s1**2 + (n2 - 1) * s2**2) / max(n1 + n2 - 2, 1))
-            cohens_d = float((m1 - m2) / sp) if sp > 0 else 0.0
+            cohens_d = float((m2 - m1) / sp) if sp > 0 else 0.0
 
             rows.append({
                 "protein":                    protein,
@@ -694,21 +762,41 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
 
     # ── Unsupervised: variability ranking ─────────────────────────────────────
 
+    _UNSUPERVISED_COLUMNS = [
+        "rank", "protein", "mean_expression", "std_expression", "cv_percent",
+        "median_abs_deviation", "iqr", "detection_rate", "n_samples", "significance",
+    ]
+
     def _unsupervised(
         self,
         data: pd.DataFrame,
         valid_mask: pd.DataFrame,
     ) -> pd.DataFrame:
+        """Descriptive ranking when no comparison groups are available.
+
+        CV%/MAD/IQR need ≥2 replicates to mean anything; with a single sample
+        per protein (e.g. one pooled sample) those are undefined and we rank
+        by raw abundance instead, so a true n=1 dataset still produces a
+        report rather than an empty/crashing one.
+        """
+        n_total_samples = data.shape[1]
+        can_rank_variability = n_total_samples >= 3
+
         rows = []
         for protein in data.index:
             vals = data.loc[protein].values.astype(float)
-            if len(vals) < 3:
+            n = len(vals)
+            if n == 0:
                 continue
-            m   = vals.mean()
-            sd  = vals.std(ddof=1)
-            cv  = (sd / abs(m) * 100) if m != 0 else 0.0
-            mad = float(np.median(np.abs(vals - np.median(vals))))
-            iqr = float(np.percentile(vals, 75) - np.percentile(vals, 25))
+            m = float(vals.mean())
+
+            if n >= 2:
+                sd  = float(vals.std(ddof=1))
+                cv  = (sd / abs(m) * 100) if m != 0 else 0.0
+                mad = float(np.median(np.abs(vals - np.median(vals))))
+                iqr = float(np.percentile(vals, 75) - np.percentile(vals, 25))
+            else:
+                sd = cv = mad = iqr = np.nan
 
             # Detection rate (fraction of samples with genuine measurements)
             if protein in valid_mask.index:
@@ -718,18 +806,22 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
 
             rows.append({
                 "protein":              protein,
-                "mean_expression":      round(float(m), 4),
-                "std_expression":       round(float(sd), 4),
-                "cv_percent":           round(cv, 2),
-                "median_abs_deviation": round(mad, 4),
-                "iqr":                  round(iqr, 4),
+                "mean_expression":      round(m, 4),
+                "std_expression":       round(sd, 4) if not np.isnan(sd) else None,
+                "cv_percent":           round(cv, 2) if not np.isnan(cv) else None,
+                "median_abs_deviation": round(mad, 4) if not np.isnan(mad) else None,
+                "iqr":                  round(iqr, 4) if not np.isnan(iqr) else None,
                 "detection_rate":       det,
-                "n_samples":            len(vals),
-                "significance":         "Top Variable",
+                "n_samples":            n,
+                "significance":         "Top Variable" if can_rank_variability else "Top Abundant",
             })
 
+        if not rows:
+            return pd.DataFrame(columns=self._UNSUPERVISED_COLUMNS)
+
         df = pd.DataFrame(rows)
-        df = df.sort_values("cv_percent", ascending=False).reset_index(drop=True)
+        sort_col = "cv_percent" if can_rank_variability else "mean_expression"
+        df = df.sort_values(sort_col, ascending=False, na_position="last").reset_index(drop=True)
         df.insert(0, "rank", range(1, len(df) + 1))
         return df
 
@@ -749,6 +841,8 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             return test_method
         n1 = len([c for c in g1_cols if c in data.columns])
         n2 = len([c for c in g2_cols if c in data.columns])
+        if min(n1, n2) <= 1:
+            return "fold_change_only"  # no valid statistical test with n=1
         return "limma" if min(n1, n2) <= 4 else "welch"
 
     # ── eBayes prior estimation (Smyth 2004) ──────────────────────────────────
@@ -1042,6 +1136,421 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         df_res.loc[hi,  "significance"] = "Highly Significant"
         df_res = df_res.sort_values("adj_p_value").reset_index(drop=True)
         df_res.insert(0, "rank", range(1, len(df_res) + 1))
+
+        # ── Tukey HSD post-hoc (real pairwise adjusted p-values) ─────────────
+        # Computed only for proteins that pass the overall ANOVA significance
+        # gate — running Tukey HSD on every protein (often thousands) would be
+        # needlessly slow and the non-significant rows don't need pairwise
+        # detail. Replaces the crude "max pairwise log2FC" placeholder with a
+        # real multiple-comparison-corrected pairwise result (case 5: TMT
+        # multiplex, one-way ANOVA + Tukey post-hoc).
+        df_res["tukey_significant_pairs"] = ""
+        sig_proteins = df_res.loc[df_res["significance"] != "NS", "protein"].tolist()
+        for protein in sig_proteins:
+            values, labels = [], []
+            for gname, cols in grp.items():
+                v = data.loc[protein, cols].values.astype(float)
+                v = v[~np.isnan(v)]
+                values.extend(v.tolist())
+                labels.extend([gname] * len(v))
+            if len(set(labels)) < 2 or len(values) < 4:
+                continue
+            try:
+                tukey = pairwise_tukeyhsd(
+                    endog=np.asarray(values), groups=np.asarray(labels), alpha=adj_pval_cutoff,
+                )
+                pair_strs = []
+                for row in tukey.summary().data[1:]:
+                    g1_name, g2_name, meandiff, p_adj, lo, hi_, reject = row
+                    if bool(reject):
+                        pair_strs.append(f"{g1_name} vs {g2_name} (Δ={float(meandiff):.2f}, p_adj={float(p_adj):.4f})")
+                if pair_strs:
+                    idx = df_res.index[df_res["protein"] == protein]
+                    df_res.loc[idx, "tukey_significant_pairs"] = "; ".join(pair_strs)
+            except Exception as exc:
+                logger.debug("Tukey HSD failed for protein %s: %s", protein, exc)
+
+        return df_res
+
+    # ── Dose-response trend test ──────────────────────────────────────────────
+
+    def _dose_response(
+        self,
+        data: pd.DataFrame,
+        valid_mask: pd.DataFrame,
+        all_groups: Dict[str, List[str]],
+        dose_levels: Dict[str, float],
+        log2fc_cutoff: float = 1.0,
+        adj_pval_cutoff: float = 0.05,
+        missing_threshold: float = 0.5,
+    ) -> pd.DataFrame:
+        """
+        Linear trend test across ordered dose groups (case 6: dose-response).
+
+        For each protein, regresses intensity against the numeric dose level
+        assigned to each group (e.g. Vehicle=0, Low=1, Medium=2, High=3) using
+        ordinary least squares. Reports the trend slope (effect size analog to
+        log2FC), R², and the regression p-value for the slope != 0 test.
+        A monotonic dose-dependent protein will have a large |slope| and a
+        small p-value; non-monotonic or flat proteins will not.
+        """
+        grp = {name: [c for c in cols if c in data.columns]
+               for name, cols in all_groups.items()
+               if name in dose_levels}
+        grp = {k: v for k, v in grp.items() if len(v) >= 1}
+        if len(grp) < 3:
+            raise ValueError(
+                "Dose-response trend test requires ≥3 dose levels with dose "
+                f"values assigned. Valid groups: {list(grp.keys())}"
+            )
+
+        vm = valid_mask.reindex(data.index, fill_value=True)
+        keep = pd.Series(False, index=data.index)
+        for cols in grp.values():
+            keep |= (vm[cols].mean(axis=1) >= missing_threshold)
+        data = data[keep]
+
+        rows = []
+        for protein in data.index:
+            doses, values = [], []
+            for gname, cols in grp.items():
+                dose = float(dose_levels[gname])
+                v = data.loc[protein, cols].values.astype(float)
+                v = v[~np.isnan(v)]
+                doses.extend([dose] * len(v))
+                values.extend(v.tolist())
+            if len(set(doses)) < 3 or len(values) < 4:
+                continue
+            try:
+                slope, intercept, r_value, p_value, std_err = stats.linregress(doses, values)
+            except Exception:
+                continue
+            if np.isnan(p_value):
+                continue
+            rows.append({
+                "protein":         protein,
+                "dose_slope":      round(float(slope), 5),
+                "r_squared":       round(float(r_value ** 2), 4),
+                "p_value":         float(p_value),
+                "trend_direction": "increasing" if slope > 0 else "decreasing",
+                "n_dose_levels":   len(set(doses)),
+                "n_observations":  len(values),
+            })
+
+        if not rows:
+            raise ValueError("No proteins survived dose-response trend analysis.")
+        df_res = pd.DataFrame(rows)
+        _, adj_p, _, _ = multipletests(df_res["p_value"].values, method="fdr_bh")
+        df_res["adj_p_value"] = adj_p
+
+        # Effect size proxy: normalize slope by the dose range so it's
+        # comparable in magnitude to a log2FC cutoff (total change across the
+        # full dose range, in log2 units since intensities are pre-log2'd).
+        dose_span = max(dose_levels.values()) - min(dose_levels.values())
+        df_res["total_log2fc_across_range"] = (df_res["dose_slope"] * dose_span).round(4)
+
+        hi_pval    = min(0.01, adj_pval_cutoff / 5.0)
+        trend_pval = adj_pval_cutoff * 2.0
+        df_res["significance"] = "NS"
+        hi  = (df_res["adj_p_value"] < hi_pval)        & (df_res["total_log2fc_across_range"].abs() >= log2fc_cutoff)
+        sig = (df_res["adj_p_value"] < adj_pval_cutoff) & (df_res["total_log2fc_across_range"].abs() >= log2fc_cutoff)
+        trn = (df_res["adj_p_value"] < trend_pval)      & ~sig
+        df_res.loc[trn, "significance"] = "Trend"
+        df_res.loc[sig, "significance"] = "Significant"
+        df_res.loc[hi,  "significance"] = "Highly Significant"
+        df_res = df_res.sort_values("adj_p_value").reset_index(drop=True)
+        df_res.insert(0, "rank", range(1, len(df_res) + 1))
+        return df_res
+
+    # ── Repeated-measures / time-course analysis ──────────────────────────────
+
+    def _repeated_measures(
+        self,
+        data: pd.DataFrame,
+        valid_mask: pd.DataFrame,
+        all_groups: Dict[str, List[str]],
+        subject_map: Dict[str, str],
+        log2fc_cutoff: float = 1.0,
+        adj_pval_cutoff: float = 0.05,
+        missing_threshold: float = 0.5,
+    ) -> pd.DataFrame:
+        """
+        Repeated-measures ANOVA across time points, with subjects blocked
+        (case 7: time-course experiments — Day 0, 1, 3, 7, 14, etc).
+
+        ``all_groups``  maps time-point label → sample columns at that time.
+        ``subject_map``  maps sample column → subject/animal ID so the same
+        biological unit is tracked across time points.
+
+        Tries a balanced repeated-measures ANOVA (statsmodels AnovaRM) first;
+        falls back to a linear mixed-effects model (subject as random
+        intercept) when the design is unbalanced (AnovaRM requires every
+        subject to have a value at every time point).
+        """
+        from statsmodels.stats.anova import AnovaRM
+        import statsmodels.formula.api as smf
+
+        grp = {name: [c for c in cols if c in data.columns]
+               for name, cols in all_groups.items()}
+        grp = {k: v for k, v in grp.items() if len(v) >= 2}
+        if len(grp) < 2:
+            raise ValueError(
+                f"Repeated-measures analysis requires ≥2 time points with "
+                f"≥2 samples each. Valid time points: {list(grp.keys())}"
+            )
+
+        vm = valid_mask.reindex(data.index, fill_value=True)
+        keep = pd.Series(False, index=data.index)
+        for cols in grp.values():
+            keep |= (vm[cols].mean(axis=1) >= missing_threshold)
+        data = data[keep]
+
+        rows = []
+        for protein in data.index:
+            long_rows = []
+            for time_label, cols in grp.items():
+                for col in cols:
+                    subj = subject_map.get(col)
+                    val  = data.loc[protein, col]
+                    if subj is None or pd.isna(val):
+                        continue
+                    long_rows.append({"subject": subj, "time": time_label, "value": float(val)})
+            if len(long_rows) < 4:
+                continue
+            long_df = pd.DataFrame(long_rows)
+            if long_df["time"].nunique() < 2 or long_df["subject"].nunique() < 2:
+                continue
+
+            method_used = "repeated_measures_anova"
+            f_stat = p_value = np.nan
+            try:
+                # AnovaRM requires a fully balanced design (every subject
+                # present at every time point exactly once).
+                counts = long_df.groupby(["subject", "time"]).size()
+                is_balanced = bool((counts == 1).all()) and (
+                    long_df.groupby("subject")["time"].nunique() == long_df["time"].nunique()
+                ).all()
+                if is_balanced:
+                    aov = AnovaRM(long_df, depvar="value", subject="subject", within=["time"]).fit()
+                    f_stat  = float(aov.anova_table["F Value"].iloc[0])
+                    p_value = float(aov.anova_table["Pr > F"].iloc[0])
+                else:
+                    raise ValueError("unbalanced design")
+            except Exception:
+                # Fallback: linear mixed-effects model, subject as random intercept.
+                # Wald test on the time-factor coefficients approximates the
+                # repeated-measures F-test for unbalanced longitudinal data.
+                try:
+                    mdl = smf.mixedlm("value ~ C(time)", long_df, groups=long_df["subject"])
+                    fit = mdl.fit(reml=False, disp=False)
+                    time_params = [p for p in fit.params.index if p.startswith("C(time)")]
+                    if not time_params:
+                        continue
+                    wald = fit.wald_test(
+                        np.eye(len(fit.params))[[fit.params.index.get_loc(p) for p in time_params]],
+                        use_f=True,
+                        scalar=True,
+                    )
+                    f_stat  = float(np.asarray(wald.statistic).ravel()[0])
+                    p_value = float(np.asarray(wald.pvalue).ravel()[0])
+                    method_used = "mixed_effects_model"
+                except Exception as exc:
+                    logger.debug("Repeated-measures fallback failed for %s: %s", protein, exc)
+                    continue
+
+            if np.isnan(p_value):
+                continue
+
+            means = long_df.groupby("time")["value"].mean()
+            row = {
+                "protein":       protein,
+                "f_statistic":   round(f_stat, 4) if not np.isnan(f_stat) else None,
+                "p_value":       float(p_value),
+                "method_used":   method_used,
+                "max_log2fc":    round(float(means.max() - means.min()), 4),
+                "n_time_points": long_df["time"].nunique(),
+                "n_subjects":    long_df["subject"].nunique(),
+            }
+            for t_label, m in means.items():
+                row[f"mean_{t_label}"] = round(float(m), 4)
+            rows.append(row)
+
+        if not rows:
+            raise ValueError(
+                "No proteins survived repeated-measures analysis. Check that "
+                "subject_map covers the sample columns in all_groups."
+            )
+        df_res = pd.DataFrame(rows)
+        _, adj_p, _, _ = multipletests(df_res["p_value"].values, method="fdr_bh")
+        df_res["adj_p_value"] = adj_p
+
+        hi_pval    = min(0.01, adj_pval_cutoff / 5.0)
+        trend_pval = adj_pval_cutoff * 2.0
+        df_res["significance"] = "NS"
+        hi  = (df_res["adj_p_value"] < hi_pval)        & (df_res["max_log2fc"].abs() >= log2fc_cutoff)
+        sig = (df_res["adj_p_value"] < adj_pval_cutoff) & (df_res["max_log2fc"].abs() >= log2fc_cutoff)
+        trn = (df_res["adj_p_value"] < trend_pval)      & ~sig
+        df_res.loc[trn, "significance"] = "Trend"
+        df_res.loc[sig, "significance"] = "Significant"
+        df_res.loc[hi,  "significance"] = "Highly Significant"
+        df_res = df_res.sort_values("adj_p_value").reset_index(drop=True)
+        df_res.insert(0, "rank", range(1, len(df_res) + 1))
+        return df_res
+
+    # ── Clinical regression: linear / logistic / Cox ──────────────────────────
+
+    def _clinical_regression(
+        self,
+        data: pd.DataFrame,
+        valid_mask: pd.DataFrame,
+        sample_cols: List[str],
+        clinical_outcome: Dict[str, Any],
+        regression_type: str,
+        adj_pval_cutoff: float = 0.05,
+        missing_threshold: float = 0.5,
+    ) -> pd.DataFrame:
+        """
+        Per-protein univariate regression against a clinical outcome
+        (case 10: large clinical biomarker cohort).
+
+        ``regression_type``:
+          "linear"   — continuous outcome (e.g. a lab value or score);
+                       fits OLS, reports beta coefficient + R².
+          "logistic" — binary outcome (e.g. responder/non-responder);
+                       fits Logit, reports odds ratio + ROC AUC
+                       (AUC computed via the Mann-Whitney U / rank-sum
+                       relationship: AUC = U / (n_pos * n_neg) — this is
+                       mathematically identical to the AUC under the ROC
+                       curve for a single continuous predictor and needs no
+                       extra dependency).
+          "cox"      — survival outcome; clinical_outcome values must be
+                       dicts {"time": float, "event": 0|1}; fits a Cox
+                       proportional-hazards model (statsmodels PHReg),
+                       reports hazard ratio.
+
+        ``clinical_outcome`` maps sample column → outcome value (or dict for cox).
+        """
+        import statsmodels.api as sm
+
+        regression_type = (regression_type or "linear").lower()
+        cols = [c for c in sample_cols if c in data.columns and c in clinical_outcome]
+        if len(cols) < 4:
+            raise ValueError(
+                f"Clinical regression requires ≥4 samples with both protein "
+                f"data and an outcome value. Found {len(cols)}."
+            )
+
+        vm = valid_mask.reindex(data.index, fill_value=True)
+        keep = vm[cols].mean(axis=1) >= missing_threshold
+        data = data[keep]
+
+        if regression_type == "cox":
+            times  = np.array([float(clinical_outcome[c]["time"])  for c in cols])
+            events = np.array([int(clinical_outcome[c]["event"])   for c in cols])
+        else:
+            outcomes = np.array([float(clinical_outcome[c]) for c in cols])
+
+        rows = []
+        for protein in data.index:
+            x = data.loc[protein, cols].values.astype(float)
+            mask = ~np.isnan(x)
+            if mask.sum() < 4:
+                continue
+            x_valid = x[mask]
+            if np.std(x_valid) == 0:
+                continue
+
+            try:
+                if regression_type == "logistic":
+                    y_valid = outcomes[mask]
+                    if len(set(y_valid.tolist())) < 2:
+                        continue
+                    X = sm.add_constant(x_valid)
+                    model = sm.Logit(y_valid, X).fit(disp=0)
+                    coef    = float(model.params[1])
+                    p_value = float(model.pvalues[1])
+                    odds_ratio = float(np.exp(coef))
+                    # AUC via Mann-Whitney U (rank-sum) relationship — avoids
+                    # requiring scikit-learn for a single-predictor ROC curve.
+                    pos = x_valid[y_valid == 1]
+                    neg = x_valid[y_valid == 0]
+                    if len(pos) == 0 or len(neg) == 0:
+                        auc = np.nan
+                    else:
+                        u_stat, _ = stats.mannwhitneyu(pos, neg, alternative="two-sided")
+                        auc = float(u_stat / (len(pos) * len(neg)))
+                    row = {
+                        "protein":     protein,
+                        "odds_ratio":  round(odds_ratio, 4),
+                        "beta_coefficient": round(coef, 5),
+                        "p_value":     p_value,
+                        "auc":         round(auc, 4) if not np.isnan(auc) else None,
+                        "n_samples":   int(mask.sum()),
+                    }
+
+                elif regression_type == "cox":
+                    t_valid = times[mask]
+                    e_valid = events[mask]
+                    if e_valid.sum() < 2:
+                        continue
+                    model = sm.PHReg(t_valid, x_valid.reshape(-1, 1), status=e_valid).fit(disp=0)
+                    coef    = float(model.params[0])
+                    p_value = float(model.pvalues[0])
+                    hazard_ratio = float(np.exp(coef))
+                    row = {
+                        "protein":      protein,
+                        "hazard_ratio": round(hazard_ratio, 4),
+                        "beta_coefficient": round(coef, 5),
+                        "p_value":      p_value,
+                        "n_samples":    int(mask.sum()),
+                        "n_events":     int(e_valid.sum()),
+                    }
+
+                else:  # linear
+                    y_valid = outcomes[mask]
+                    X = sm.add_constant(x_valid)
+                    model = sm.OLS(y_valid, X).fit()
+                    coef    = float(model.params[1])
+                    p_value = float(model.pvalues[1])
+                    row = {
+                        "protein":     protein,
+                        "beta_coefficient": round(coef, 5),
+                        "r_squared":   round(float(model.rsquared), 4),
+                        "p_value":     p_value,
+                        "n_samples":   int(mask.sum()),
+                    }
+            except Exception as exc:
+                logger.debug("Clinical regression (%s) failed for %s: %s", regression_type, protein, exc)
+                continue
+
+            if np.isnan(row.get("p_value", np.nan)):
+                continue
+            rows.append(row)
+
+        if not rows:
+            raise ValueError(
+                f"No proteins survived {regression_type} regression against the clinical outcome."
+            )
+        df_res = pd.DataFrame(rows)
+        _, adj_p, _, _ = multipletests(df_res["p_value"].values, method="fdr_bh")
+        df_res["adj_p_value"] = adj_p
+
+        effect_col = {
+            "logistic": "odds_ratio",
+            "cox":      "hazard_ratio",
+            "linear":   "beta_coefficient",
+        }.get(regression_type, "beta_coefficient")
+
+        df_res["significance"] = "NS"
+        sig = df_res["adj_p_value"] < adj_pval_cutoff
+        hi  = df_res["adj_p_value"] < min(0.01, adj_pval_cutoff / 5.0)
+        trn = (df_res["adj_p_value"] < adj_pval_cutoff * 2.0) & ~sig
+        df_res.loc[trn, "significance"] = "Trend"
+        df_res.loc[sig, "significance"] = "Significant"
+        df_res.loc[hi,  "significance"] = "Highly Significant"
+        df_res = df_res.sort_values("adj_p_value").reset_index(drop=True)
+        df_res.insert(0, "rank", range(1, len(df_res) + 1))
+        df_res.attrs["effect_column"] = effect_col
         return df_res
 
     # ── IRS normalisation (multi-batch TMT) ───────────────────────────────────
@@ -1392,10 +1901,15 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
                 "Adj P-value Cut":    adj_pval_cutoff,
                 "Log2 FC Cut":        log2fc_cutoff,
                 "Statistical Test":   {
-                    "welch":    "Welch two-sample t-test",
-                    "limma":    "Limma moderated t-test (eBayes)",
-                    "paired_t": "Paired t-test",
-                    "anova":    "One-way ANOVA",
+                    "welch":              "Welch two-sample t-test",
+                    "limma":              "Limma moderated t-test (eBayes)",
+                    "paired_t":           "Paired t-test",
+                    "anova":              "One-way ANOVA + Tukey HSD post-hoc",
+                    "dose_response":      "Linear dose-response trend test (OLS)",
+                    "repeated_measures":  "Repeated-measures ANOVA / mixed-effects model",
+                    "linear_regression":  "Linear regression (OLS) vs. clinical outcome",
+                    "logistic_regression":"Logistic regression vs. clinical outcome (+ ROC AUC)",
+                    "cox_regression":     "Cox proportional-hazards regression",
                 }.get(test_method, "CV ranking") if analysis_mode == "supervised" else "CV ranking",
                 "FDR Method":         ("Benjamini-Hochberg" if analysis_mode == "supervised"
                                        else "N/A"),

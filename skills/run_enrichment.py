@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -43,6 +44,19 @@ _LIBRARIES: dict[str, list[str]] = {
         "GO_Biological_Process_2023",
     ],
 }
+
+# Kinase-substrate / PTM-specific libraries (case 9: phosphoproteomics/PTM
+# enrichment). Added on top of the standard pathway libraries above when
+# omic_type indicates PTM data — Enrichr's kinase libraries are human-curated
+# but are commonly applied to mouse/rat phosphosite data via ortholog mapping,
+# same as the existing rat→mouse KEGG proxy convention in this file.
+_PTM_LIBRARIES: list[str] = [
+    "KEA_2015",                            # Kinase Enrichment Analysis
+    "Kinase_Perturbations_from_GEO_up",
+    "Kinase_Perturbations_from_GEO_down",
+]
+
+_PTM_OMIC_TYPES = {"phosphoproteomics", "phospho", "ptm"}
 
 _GN_RE = re.compile(r'\bGN=(\w[\w\-]*)', re.IGNORECASE)
 # MaxQuant/FASTA: sp|ACCESSION|GENENAME_SPECIES
@@ -76,6 +90,47 @@ _CONTAMINANT_PREFIXES: tuple = (
     "KRT",                                              # keratins (skin/hair)
     "IGH", "IGK", "IGL",                                # immunoglobulin loci
 )
+
+_UNIPROT_ACCESSION_RE = re.compile(r'^[A-Z][0-9][A-Z0-9]{3}[0-9](-\d+)?$')
+
+# Enrichr occasionally has transient network/service hiccups; retry each
+# library call a couple of times with backoff before treating it as failed.
+_ENRICHR_MAX_RETRIES = 2
+_ENRICHR_RETRY_BACKOFF_SEC = 2.0
+
+
+def _enrichr_with_retry(gp, **kwargs):
+    """Call gp.enrichr, retrying on transient errors before raising."""
+    last_exc: Exception | None = None
+    for attempt in range(_ENRICHR_MAX_RETRIES + 1):
+        try:
+            return gp.enrichr(**kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _ENRICHR_MAX_RETRIES:
+                time.sleep(_ENRICHR_RETRY_BACKOFF_SEC * (attempt + 1))
+    raise last_exc
+
+
+def _normalize_organism(organism: str) -> str:
+    """Normalize a full organism name (e.g. 'Mus musculus') to the short code used in _LIBRARIES."""
+    org = organism.lower()
+    if any(k in org for k in ("mus", "mouse")):
+        return "mouse"
+    if any(k in org for k in ("rat", "rattus")):
+        return "rat"
+    if any(k in org for k in ("human", "homo", "sapiens")):
+        return "human"
+    return org
+
+
+def _symbols_are_accessions(symbols: List[str], sample_size: int = 50) -> bool:
+    """Return True if >50% of sampled symbols look like bare UniProt accession IDs."""
+    sample = symbols[:sample_size]
+    if not sample:
+        return False
+    n_acc = sum(1 for s in sample if _UNIPROT_ACCESSION_RE.match(s))
+    return n_acc / len(sample) > 0.5
 
 
 def _filter_contaminants(symbols: List[str]) -> tuple[List[str], List[str]]:
@@ -201,6 +256,7 @@ class PathwaySkill:
         organism: str = "human",
         pval_cutoff: float = 0.05,
         output_dir: str = "outputs",
+        omic_type: str = "proteomics",
     ) -> dict:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -224,12 +280,23 @@ class PathwaySkill:
 
         # Background: regex-only — no API needed, avoids slow batched calls for 2000+ proteins
         background_symbols: Optional[List[str]] = None
+        background_numeric: Optional[int] = None
         if background_proteins:
-            background_symbols = _extract_gene_symbols(background_proteins)
-            logger.info(
-                "Background: %d proteins → %d gene symbols (regex)",
-                len(background_proteins), len(background_symbols),
-            )
+            extracted = _extract_gene_symbols(background_proteins)
+            if extracted and _symbols_are_accessions(extracted):
+                # Protein names are bare UniProt accession IDs — using them as background
+                # would send unrecognized symbols to Enrichr; use numeric count instead.
+                background_numeric = len(background_proteins)
+                logger.info(
+                    "Background: %d proteins (accession IDs detected — using numeric count %d)",
+                    len(background_proteins), background_numeric,
+                )
+            else:
+                background_symbols = extracted or None
+                logger.info(
+                    "Background: %d proteins → %d gene symbols (regex)",
+                    len(background_proteins), len(extracted),
+                )
 
         # Up/down are subsets of protein_list — regex is consistent and avoids extra API calls
         up_symbols   = _extract_gene_symbols(up_proteins)   if up_proteins   else []
@@ -242,11 +309,18 @@ class PathwaySkill:
         except ImportError:
             raise RuntimeError("gseapy is not installed. Run: python3 -m pip install gseapy")
 
-        organism_key = organism.lower()
+        organism_key = _normalize_organism(organism)
         if organism_key == "rat":
             logger.warning("Rat Enrichr libraries unavailable; using mouse as proxy.")
-        libraries    = _LIBRARIES.get(organism_key, _LIBRARIES["human"])
+        libraries    = list(_LIBRARIES.get(organism_key, _LIBRARIES["human"]))
+        is_ptm = str(omic_type or "").strip().lower() in _PTM_OMIC_TYPES
+        if is_ptm:
+            libraries.extend(_PTM_LIBRARIES)
+            logger.info("PTM/phosphoproteomics detected — adding kinase-substrate "
+                        "enrichment libraries: %s", _PTM_LIBRARIES)
         enr_organism = "human" if organism_key == "human" else "mouse"
+        logger.info("Enrichment organism: '%s' → key='%s', enr_organism='%s', libraries=%s",
+                    organism, organism_key, enr_organism, libraries)
 
         # Build the list of (direction_label, symbols) to enrich
         runs: list[tuple[str, List[str]]] = []
@@ -259,16 +333,24 @@ class PathwaySkill:
 
         all_frames: list[pd.DataFrame] = []
         n_kegg = n_go = 0
+        n_attempted = n_failed = 0
 
         for direction, symbols in runs:
             for lib in libraries:
+                n_attempted += 1
+                # Kinase-substrate libraries are human-curated only; query the
+                # main Enrichr (human) site for them even in a mouse/rat
+                # analysis (gene symbols are compared case-insensitively —
+                # same convention used for KEGG/GO libraries elsewhere).
+                lib_organism = "human" if lib in _PTM_LIBRARIES else enr_organism
                 try:
-                    enr = gp.enrichr(
+                    enr = _enrichr_with_retry(
+                        gp,
                         gene_list=symbols,
                         gene_sets=lib,
-                        organism=enr_organism,
+                        organism=lib_organism,
                         outdir=None,
-                        background=background_symbols if background_symbols else 20000,
+                        background=background_symbols if background_symbols else (background_numeric or 20000),
                         cutoff=pval_cutoff,
                         verbose=False,
                     )
@@ -287,11 +369,24 @@ class PathwaySkill:
                         n_go += len(sig)
                     logger.info("Library %s [%s]: %d significant terms", lib, direction, len(sig))
                 except Exception as exc:
+                    n_failed += 1
                     logger.warning("Enrichr failed — lib=%s direction=%s: %s", lib, direction, exc)
 
+        # All library calls errored (network/parse failure) — this is an
+        # infrastructure failure, NOT a genuine "zero pathways enriched"
+        # result. Callers must not present it as a negative biological finding.
+        all_libraries_failed = n_attempted > 0 and n_failed == n_attempted
+
         if not all_frames:
-            logger.warning("No enrichment results from any library.")
-            return self._empty_result(output_dir, gene_symbols)
+            logger.warning(
+                "No enrichment results from any library (%d/%d libraries failed).",
+                n_failed, n_attempted,
+            )
+            result = self._empty_result(output_dir, gene_symbols)
+            result["libraries_attempted"]   = n_attempted
+            result["libraries_failed"]      = n_failed
+            result["all_libraries_failed"]  = all_libraries_failed
+            return result
 
         combined = (
             pd.concat(all_frames, ignore_index=True)
@@ -328,9 +423,12 @@ class PathwaySkill:
             "enrichment_result_path": out_path,
             "genes_submitted":        len(gene_symbols),
             "gene_symbols":           gene_symbols[:20],
-            "background_size":        len(background_symbols) if background_symbols else None,
+            "background_size":        len(background_symbols) if background_symbols else background_numeric,
             "has_directional":        bool(up_symbols or down_symbols),
             "contaminants_excluded":  dropped,
+            "libraries_attempted":    n_attempted,
+            "libraries_failed":       n_failed,
+            "all_libraries_failed":   all_libraries_failed,
         }
 
     @staticmethod
@@ -346,4 +444,7 @@ class PathwaySkill:
             "gene_symbols":           (gene_symbols or [])[:20],
             "background_size":        None,
             "has_directional":        False,
+            "libraries_attempted":    0,
+            "libraries_failed":       0,
+            "all_libraries_failed":   False,
         }

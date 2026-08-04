@@ -22,12 +22,14 @@ No other changes are needed.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
-from core.state import BiomarkerState
+from core.io_utils import read_csv_safe
+from core.state import BiomarkerState, make_comparison_id
 from core.tracing import get_biomarker_metadata
 from skills.omics_registry import OmicsSkillRegistry
 from skills.proteomics_analysis import ProteomicsAnalysisSkill
@@ -92,6 +94,21 @@ class BiomarkerAgent(BaseAgent):
                 "No data found. Please upload your file before running analysis.",
             )
 
+        # ── Clear stale downstream artifacts from any previous analysis ───────
+        # Every new analysis run replaces the active session context. Pathway
+        # enrichment, plots, and biological interpretation from a prior run
+        # are NOT valid for this run's biomarker list — so they're cleared.
+        # If the user wants pathways/plots for this new analysis, they request
+        # those next and the corresponding agent will repopulate.
+        for stale_field in (
+            "pathways",
+            "enrichment_result_path",
+            "plot_paths",
+            "report_path",
+            "biological_interpretation",
+        ):
+            state.pop(stale_field, None)
+
         # ── Route to the correct omic skill ──────────────────────────────────
         # The canonical 2-sheet template is intensity-only proteomics; legacy
         # SpC / SILAC / pooled-MaxQuant routing has been removed. The agent
@@ -115,7 +132,17 @@ class BiomarkerAgent(BaseAgent):
             )
 
         # Determine supervised vs unsupervised mode
-        mode = "supervised" if (g1 and g2) else "unsupervised"
+        _overrides_early = state.get("analysis_params") or {}
+        _method_hint = _overrides_early.get("test_method") or state.get("test_method") or "auto"
+        # New scenario-coverage methods (dose-response, repeated-measures,
+        # clinical regression) don't use group1/group2_samples — they key off
+        # all_groups / clinical_outcome instead — but are still "supervised"
+        # analyses (they produce p-values / effect sizes, not CV ranking).
+        _new_method_flag = _method_hint in (
+            "dose_response", "repeated_measures",
+            "linear_regression", "logistic_regression", "cox_regression",
+        )
+        mode = "supervised" if (g1 and g2) or _new_method_flag else "unsupervised"
         state["analysis_mode"] = mode
         state["status"] = "analyzing"
 
@@ -128,18 +155,45 @@ class BiomarkerAgent(BaseAgent):
             g2_lbl = state.get("group2_label", "Group 2")
             n1, n2 = len(g1), len(g2)
             _req_method = _overrides.get("test_method") or state.get("test_method") or "auto"
+            # Mirror _resolve_test_method so the label matches what will actually run
+            if _req_method == "auto":
+                if min(n1, n2) <= 1:
+                    _effective_label_method = "fold_change_only"
+                elif min(n1, n2) <= 4:
+                    _effective_label_method = "limma"
+                else:
+                    _effective_label_method = "welch"
+            else:
+                _effective_label_method = _req_method
             _method_label = {
-                "limma":    "limma moderated t-test (eBayes)",
-                "paired_t": "paired t-test",
-                "anova":    "one-way ANOVA",
-                "welch":    "Welch t-test",
-            }.get(_req_method, "auto-selected test (limma for n≤4, Welch for n≥5)")
-            mode_label = (
-                f"differential expression analysis — **{g1_lbl}** (n={n1}) vs "
-                f"**{g2_lbl}** (n={n2}) — {_method_label}. "
-                f"Pipeline: log₂ transform → median normalisation → "
-                f"group-aware filter → half-min imputation → {_method_label} → BH FDR."
+                "limma":               "limma moderated t-test (eBayes)",
+                "paired_t":            "paired t-test",
+                "anova":               "one-way ANOVA + Tukey HSD post-hoc",
+                "welch":               "Welch t-test",
+                "fold_change_only":    "fold-change only (n=1, no statistical test)",
+                "dose_response":       "dose-response linear trend test",
+                "repeated_measures":   "repeated-measures ANOVA / mixed-effects model",
+                "linear_regression":   "linear regression vs. clinical outcome",
+                "logistic_regression": "logistic regression vs. clinical outcome (+ ROC AUC)",
+                "cox_regression":      "Cox proportional-hazards regression",
+            }.get(_effective_label_method, _effective_label_method)
+            _pipeline_suffix = (
+                "BH FDR." if _effective_label_method != "fold_change_only"
+                else "ranked by |log₂FC|."
             )
+            if _new_method_flag:
+                mode_label = (
+                    f"{_method_label} analysis. "
+                    f"Pipeline: log₂ transform → median normalisation → "
+                    f"group-aware filter → half-min imputation → {_method_label} → {_pipeline_suffix}"
+                )
+            else:
+                mode_label = (
+                    f"differential expression analysis — **{g1_lbl}** (n={n1}) vs "
+                    f"**{g2_lbl}** (n={n2}) — {_method_label}. "
+                    f"Pipeline: log₂ transform → median normalisation → "
+                    f"group-aware filter → half-min imputation → {_method_label} → {_pipeline_suffix}"
+                )
         else:
             mode_label = (
                 "unsupervised variability analysis (no group labels). "
@@ -175,8 +229,36 @@ class BiomarkerAgent(BaseAgent):
             or "auto"
         )
         _is_paired   = bool(state.get("is_paired") or _overrides.get("is_paired", False))
-        _all_groups  = state.get("all_groups") or _overrides.get("all_groups")
         _tmt_batches = state.get("tmt_batches")
+
+        # Only pass all_groups when the user explicitly requested ANOVA across 3+
+        # groups, or a group-based new-scenario method (dose-response /
+        # repeated-measures). For pairwise run_analysis (group1/group2 set),
+        # all_groups is inherited from ingestion-time label detection and must
+        # NOT be forwarded — the skill's is_anova condition fires on any
+        # all_groups with ≥2 entries, causing a spurious ANOVA attempt that
+        # fails when n=1 per group. A resolved pairwise ask this turn (g1 and
+        # g2 both set) takes precedence over a stale "anova" test_method left
+        # over from an earlier multi-group turn in the same session — without
+        # this, e.g. "compare BL6 heart and DMD heart" after an earlier
+        # all-groups ANOVA would still forward all 12 groups instead of the
+        # two just resolved.
+        _group_based_method = _test_method in ("anova", "dose_response", "repeated_measures")
+        _override_groups = _overrides.get("all_groups")
+        _resolved_pairwise = bool(g1 and g2)
+        if _override_groups:
+            _all_groups = _override_groups
+        elif _group_based_method and not _resolved_pairwise:
+            _all_groups = state.get("all_groups")
+        else:
+            _all_groups = None
+
+        # Dose-response (case 6): group name -> numeric dose level
+        _dose_levels = _overrides.get("dose_levels") or state.get("dose_levels")
+        # Time-course (case 7): sample column -> subject/animal ID
+        _subject_map = _overrides.get("subject_map") or state.get("subject_map")
+        # Clinical regression (case 10): sample column -> outcome value
+        _clinical_outcome = _overrides.get("clinical_outcome") or state.get("clinical_outcome")
 
         result = skill.execute(
             # Standard parameters
@@ -201,6 +283,10 @@ class BiomarkerAgent(BaseAgent):
             tmt_batches=_tmt_batches,
             # Pooled / no-replicates designs → fold-change-only ranking
             is_pooled_design=bool(state.get("is_pooled_design")),
+            # New scenario-coverage parameters (cases 6, 7, 10)
+            dose_levels=_dose_levels,
+            subject_map=_subject_map,
+            clinical_outcome=_clinical_outcome,
         )
 
         if result.get("error"):
@@ -244,13 +330,28 @@ class BiomarkerAgent(BaseAgent):
             state["dual_engine_qc"] = dual["qc"]
             state["r_results_path"] = dual["r_csv"]
         else:
-            state["top_biomarkers"] = result["top_biomarkers"]
-            state["top_proteins"]   = result["top_biomarkers"]
-            state["n_significant"]  = result["n_significant"]
-        state["excel_path"]     = result["excel_path"]
-        state["qc_summary"]     = result["qc_summary"]
+            state["top_biomarkers"] = result.get("top_biomarkers") or []
+            state["top_proteins"]   = state["top_biomarkers"]
+            state["n_significant"]  = result.get("n_significant") or 0
+        state["excel_path"]     = result.get("excel_path")
+        state["qc_summary"]     = result.get("qc_summary") or {}
         state["qc_passed"]      = True
         state["status"]         = "analysis_complete"
+
+        # Accumulate this comparison so cross-comparison queries (e.g. overlap)
+        # can access every prior run's biomarker list, not just the last one.
+        _cmp_key = (
+            f"{state.get('group1_label') or 'G1'}"
+            f"_vs_"
+            f"{state.get('group2_label') or 'G2'}"
+        )
+        _hist = dict(state.get("comparison_history") or {})
+        _hist[_cmp_key] = {
+            "top_biomarkers": state["top_biomarkers"],
+            "n_significant":  state["n_significant"],
+            "excel_path":     state["excel_path"],
+        }
+        state["comparison_history"] = _hist
 
         # ── Plotly visualisation suite (interactive HTML + PNG) ───────────────
         # The Python helper internally skips per-plot failures, so it's safe
@@ -258,15 +359,23 @@ class BiomarkerAgent(BaseAgent):
         # be dropped but PCA/heatmap/boxplots still produced.
         if mode == "supervised":
             try:
-                plot_paths = self._build_plots(
+                plot_suite = self._build_plots(
                     state=state, python_top=py_top,
                     dual=dual,
                     adj_pval_cutoff=adj_pval_cutoff,
                     log2fc_cutoff=log2fc_cutoff,
                 )
-                if plot_paths:
-                    state["plot_paths"] = plot_paths
-                    result["plot_paths"] = plot_paths
+                if plot_suite:
+                    flat_paths = [
+                        p for variants in plot_suite.values()
+                        for p in variants.values() if p
+                    ]
+                    # Extend existing paths; never overwrite plots from prior
+                    # agents (e.g. enrichment dotplot already in state).
+                    existing_plots = list(state.get("plot_paths") or [])
+                    merged = existing_plots + [p for p in flat_paths if p not in existing_plots]
+                    state["plot_paths"] = merged
+                    result["plot_paths"] = flat_paths
             except Exception as exc:
                 logger.warning("Plot generation failed: %s", exc)
 
@@ -300,6 +409,15 @@ class BiomarkerAgent(BaseAgent):
                 state["biological_interpretation"] = interpretation
         except Exception as exc:
             logger.warning("Domain expert interpretation failed: %s", exc)
+
+        # ── Snapshot this analysis into state["analyses"] history ──────────────
+        # Each call to BiomarkerAgent.run() appends one entry so multi-comparison
+        # sessions can recall a specific analysis later by comparison_id or
+        # by fuzzy "g1 vs g2" match. The legacy single-valued state fields
+        # (top_biomarkers, excel_path, plot_paths) keep mirroring the most
+        # recent entry for backward-compat with older code paths.
+        self._append_to_history(state, g1=g1, g2=g2, mode=mode,
+                                test_method=_test_method, result=result)
 
         logger.info(
             "Analysis complete | session=%s omic=%s significant=%d",
@@ -345,7 +463,7 @@ class BiomarkerAgent(BaseAgent):
 
         # Load the CSV the Python skill consumed (already cleaned by ingestion)
         try:
-            expr_df = pd.read_csv(state["data_path"], index_col=0)
+            expr_df = read_csv_safe(state["data_path"], index_col=0)
             expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
         except Exception as exc:
             logger.warning("Could not reload expression CSV for R: %s", exc)
@@ -399,7 +517,7 @@ class BiomarkerAgent(BaseAgent):
             inter_df = dual["intersected"]
         else:
             try:
-                expr_df = pd.read_csv(state["data_path"], index_col=0)
+                expr_df = read_csv_safe(state["data_path"], index_col=0)
                 expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
                 inter_df = None
             except Exception as exc:
@@ -433,6 +551,50 @@ class BiomarkerAgent(BaseAgent):
             log2fc_cutoff    = log2fc_cutoff,
         )
         return suite
+
+    # ── History management ────────────────────────────────────────────────────
+
+    def _append_to_history(
+        self,
+        state: BiomarkerState,
+        g1: list,
+        g2: list,
+        mode: str,
+        test_method: str,
+        result: Dict[str, Any],
+    ) -> None:
+        """Append a frozen snapshot of this analysis to state["analyses"].
+
+        If an entry with the same comparison_id already exists, it is replaced
+        rather than duplicated — so re-running the same comparison with new
+        thresholds updates in place instead of bloating the list.
+        """
+        g1_label = state.get("group1_label") or "Group1"
+        g2_label = state.get("group2_label") or "Group2"
+        cmp_id   = make_comparison_id(g1_label, g2_label)
+
+        entry: Dict[str, Any] = {
+            "comparison_id":   cmp_id,
+            "group1_label":    g1_label,
+            "group2_label":    g2_label,
+            "group1_samples":  list(g1),
+            "group2_samples":  list(g2),
+            "analysis_mode":   mode,
+            "test_method":     test_method,
+            "top_biomarkers":  list(state.get("top_biomarkers") or []),
+            "n_significant":   int(state.get("n_significant") or 0),
+            "excel_path":      state.get("excel_path"),
+            "plot_paths":      state.get("plot_paths") or {},
+            "qc_summary":      result.get("qc_summary") or {},
+            "analysis_summary": state.get("analysis_summary"),
+            "biological_interpretation": state.get("biological_interpretation"),
+            "timestamp":       datetime.now(timezone.utc).isoformat(),
+        }
+
+        history = list(state.get("analyses") or [])
+        history = [a for a in history if a.get("comparison_id") != cmp_id]
+        history.append(entry)
+        state["analyses"] = history
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -486,15 +648,46 @@ class BiomarkerAgent(BaseAgent):
         )
 
         # Describe the exact statistical method used
+        _actual_method = qc.get("test_method", "welch")
         if mode == "supervised":
-            method_str = (
-                f"**Method:** Welch two-sample t-test — {g1} vs {g2}. "
-                f"Pipeline: log₂ transform → median normalisation → group-aware missing filter "
-                f"→ half-min imputation → Welch t-test → Benjamini-Hochberg FDR. "
-                f"Significance thresholds: adj. p < {_adj_pval}{_overrides_note}, "
-                f"|log₂FC| ≥ {_log2fc}{_overrides_note}. "
-                f"Effect size: Cohen's d (pooled SD)."
-            )
+            _pipeline_steps = "log₂ transform → median normalisation → group-aware missing filter → half-min imputation"
+            if _actual_method == "fold_change_only":
+                method_str = (
+                    f"**Method:** Fold-change only (no statistical test) — {g1} vs {g2}. "
+                    f"n=1 per group: statistical testing is invalid with a single observation. "
+                    f"Pipeline: {_pipeline_steps} → log₂ fold-change ranking. "
+                    f"Proteins ranked by |log₂FC| ≥ {_log2fc}{_overrides_note}. "
+                    f"No p-values or FDR correction are reported."
+                )
+            elif _actual_method == "limma":
+                method_str = (
+                    f"**Method:** limma moderated t-test (eBayes empirical Bayes) — {g1} vs {g2}. "
+                    f"Pipeline: {_pipeline_steps} → limma eBayes → Benjamini-Hochberg FDR. "
+                    f"Significance thresholds: adj. p < {_adj_pval}{_overrides_note}, "
+                    f"|log₂FC| ≥ {_log2fc}{_overrides_note}. "
+                    f"Effect size: Cohen's d (pooled SD)."
+                )
+            elif _actual_method == "paired_t":
+                method_str = (
+                    f"**Method:** Paired t-test — {g1} vs {g2}. "
+                    f"Pipeline: {_pipeline_steps} → paired t-test → Benjamini-Hochberg FDR. "
+                    f"Significance thresholds: adj. p < {_adj_pval}{_overrides_note}, "
+                    f"|log₂FC| ≥ {_log2fc}{_overrides_note}."
+                )
+            elif _actual_method == "anova":
+                method_str = (
+                    f"**Method:** One-way ANOVA across groups. "
+                    f"Pipeline: {_pipeline_steps} → one-way ANOVA → Benjamini-Hochberg FDR. "
+                    f"Significance threshold: adj. p < {_adj_pval}{_overrides_note}."
+                )
+            else:  # welch (default)
+                method_str = (
+                    f"**Method:** Welch two-sample t-test — {g1} vs {g2}. "
+                    f"Pipeline: {_pipeline_steps} → Welch t-test → Benjamini-Hochberg FDR. "
+                    f"Significance thresholds: adj. p < {_adj_pval}{_overrides_note}, "
+                    f"|log₂FC| ≥ {_log2fc}{_overrides_note}. "
+                    f"Effect size: Cohen's d (pooled SD)."
+                )
         else:
             method_str = (
                 "**Method:** Unsupervised variability ranking (no group labels). "

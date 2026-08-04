@@ -19,7 +19,27 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
+API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
+
+# ── Posit Connect auth ───────────────────────────────────────────────────────
+# When the FastAPI is deployed on Posit Connect with "All users - login
+# required", we must authenticate every request with a Connect API key.
+# Set CONNECT_API_KEY in this Streamlit content's Vars panel.
+_CONNECT_API_KEY = os.getenv("CONNECT_API_KEY", "").strip()
+# Internal Connect servers often use a corporate CA that the Python image
+# does not trust. Allow opting out of TLS verification via env var.
+_VERIFY_SSL = os.getenv("API_VERIFY_SSL", "1").strip().lower() not in {"0", "false", "no"}
+if not _VERIFY_SSL:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+_session = requests.Session()
+_session.verify = _VERIFY_SSL
+if _CONNECT_API_KEY:
+    _session.headers.update({"Authorization": f"Key {_CONNECT_API_KEY}"})
+# Use _session explicitly for all API calls rather than monkey-patching the
+# global requests module. The monkey-patch was previously propagating our auth
+# header and verify=False into third-party libraries (gseapy, openai, etc.).
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -28,6 +48,40 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# ── Diagnostic panel (visible when ?debug=1 in the URL) ──────────────────────
+if st.query_params.get("debug") == "1":
+    st.subheader("🔧 Diagnostic")
+    st.write({
+        "API_BASE": API_BASE,
+        "CONNECT_API_KEY_set": bool(_CONNECT_API_KEY),
+        "CONNECT_API_KEY_len": len(_CONNECT_API_KEY),
+    })
+    try:
+        r = _session.get(f"{API_BASE}/docs", timeout=10)
+        st.write({"GET /docs status": r.status_code,
+                  "content_type": r.headers.get("content-type"),
+                  "first_200_chars": r.text[:200]})
+    except Exception as e:
+        st.error(f"Request to {API_BASE}/docs failed: {e!r}")
+    st.stop()
+
+# ── Loud banner if API_BASE_URL is misconfigured on Posit Connect ────────────
+_running_on_connect = bool(os.getenv("RSTUDIO_PRODUCT") or os.getenv("CONNECT_SERVER"))
+if API_BASE.startswith(("http://localhost", "http://127.0.0.1")) and _running_on_connect:
+    st.error(
+        "❌ `API_BASE_URL` is not configured on Posit Connect.\n\n"
+        f"Current value: `{API_BASE}` — this only works in local development.\n\n"
+        "**Fix:** Open this Streamlit content in Connect → **Vars** panel → add:\n"
+        "```\n"
+        "API_BASE_URL = https://rndconnect.solidbio.com/content/<your-fastapi-guid>\n"
+        "CONNECT_API_KEY = <a Connect API key>\n"
+        "```\n"
+        "Then click **Restart**."
+    )
+    st.stop()
+
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CSS  —  BioSpace Theme (chat-only)
@@ -206,21 +260,22 @@ st.markdown("""
 
 /* ── Chat input ── */
 [data-testid="stChatInput"] {
-    background: rgba(255,255,255,0.03) !important;
-    border: 1px solid rgba(255,255,255,0.08) !important;
+    background: #ffffff !important;
+    border: 1px solid rgba(255,255,255,0.18) !important;
     border-radius: 16px !important;
     transition: all 0.2s;
 }
 [data-testid="stChatInput"]:focus-within {
-    border-color: rgba(56,189,248,0.4) !important;
-    box-shadow: 0 0 0 3px rgba(56,189,248,0.07), 0 0 20px rgba(56,189,248,0.1) !important;
+    border-color: rgba(56,189,248,0.6) !important;
+    box-shadow: 0 0 0 3px rgba(56,189,248,0.15), 0 0 20px rgba(56,189,248,0.15) !important;
 }
 [data-testid="stChatInput"] textarea {
-    background: transparent !important;
-    color: #e2e8f0 !important;
+    background: #ffffff !important;
+    color: #0f172a !important;
     font-size: 0.94rem !important;
+    caret-color: #0f172a !important;
 }
-[data-testid="stChatInput"] textarea::placeholder { color: #475569 !important; }
+[data-testid="stChatInput"] textarea::placeholder { color: #64748b !important; }
 [data-testid="stChatInput"] button { color: #475569 !important; }
 [data-testid="stChatInput"] button:hover { color: #38bdf8 !important; }
 
@@ -372,6 +427,30 @@ st.markdown("""
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(56,189,248,0.3); }
+
+/* ── Thinking indicator (replaces st.spinner circle while a reply is loading) ── */
+.thinking-dots {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 2px;
+    color: #94a3b8;
+    font-style: italic;
+    font-size: 0.92rem;
+    padding: 6px 2px;
+    letter-spacing: 0.2px;
+}
+.thinking-dots span {
+    display: inline-block;
+    animation: thinking-bounce 1.4s ease-in-out infinite both;
+    opacity: 0.35;
+}
+.thinking-dots span:nth-child(1) { animation-delay: 0s;    }
+.thinking-dots span:nth-child(2) { animation-delay: 0.16s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.32s; }
+@keyframes thinking-bounce {
+    0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+    40%           { opacity: 1;   transform: translateY(-2px); }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -394,7 +473,7 @@ def _api_create_session(
     attempts = 3
     for i in range(attempts):
         try:
-            r = requests.post(
+            r = _session.post(
                 f"{API_BASE}/chat/session",
                 params=params,
                 timeout=20,
@@ -420,7 +499,7 @@ def _api_create_session(
 
 def _api_fetch_state(session_id: str) -> dict:
     try:
-        r = requests.get(f"{API_BASE}/results/{session_id}", timeout=10)
+        r = _session.get(f"{API_BASE}/results/{session_id}", timeout=10)
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -440,7 +519,7 @@ def _api_send_message(session_id: str, message: str) -> dict | None:
     if st.session_state.get("organism"):
         payload["organism"] = st.session_state["organism"]
     try:
-        r = requests.post(f"{API_BASE}/chat/", json=payload, timeout=300)
+        r = _session.post(f"{API_BASE}/chat/", json=payload, timeout=300)
         if r.status_code == 200:
             return r.json()
         st.session_state["api_error"] = f"API {r.status_code}: {r.text[:200]}"
@@ -462,7 +541,7 @@ def _api_upload_file(
             data["disease_program"] = st.session_state["disease_program"]
         if st.session_state.get("organism"):
             data["organism"] = st.session_state["organism"]
-        r = requests.post(
+        r = _session.post(
             f"{API_BASE}/upload/",
             files={"file": (filename, file_bytes, file_type)},
             data=data,
@@ -541,7 +620,7 @@ def _render_topbar(session_id: str | None, astate: dict) -> None:
             # Pipeline status strip — compact dots in the top bar
             data_done     = bool(astate.get("data_type"))
             analysis_done = astate.get("n_significant") is not None
-            enrich_done   = bool(astate.get("pathways"))
+            enrich_done   = bool(astate.get("enrichment_ran"))
             plots_done    = bool(astate.get("plot_paths"))
 
             def _dot(label: str, icon: str, done: bool) -> str:
@@ -564,6 +643,12 @@ def _render_topbar(session_id: str | None, astate: dict) -> None:
 
         # New conversation button — full row below
         if st.button("＋  New Conversation", key="new_conv"):
+            old_sid = st.session_state.get("session_id")
+            if old_sid:
+                try:
+                    _session.delete(f"{API_BASE}/sessions/{old_sid}", timeout=5)
+                except Exception:
+                    pass
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.rerun()
@@ -718,7 +803,7 @@ def _render_welcome() -> str | None:
 
 def _fetch_file(session_id: str, path: str) -> bytes | None:
     try:
-        r = requests.get(
+        r = _session.get(
             f"{API_BASE}/results/{session_id}/file",
             params={"path": path},
             timeout=20,
@@ -728,57 +813,103 @@ def _fetch_file(session_id: str, path: str) -> bytes | None:
         return None
 
 
-def _render_inline_plots(session_id: str, plot_paths: list[str]) -> None:
-    """Render PNG thumbnail grid inside a chat message bubble."""
-    if not plot_paths:
-        return
+def _normalize_plot_paths(plot_paths: list[str]) -> list[str]:
+    """Collapse PNG/HTML/JSON variants of the same plot into a stable stem path.
 
-    # Only PNG paths (skip any HTML paths that ended up in the list)
-    png_paths = [p for p in plot_paths if str(p).endswith(".png")]
-    if not png_paths:
+    The visualization skill writes three siblings (.png, .html, .json) per plot,
+    but on Posit Workbench / Linux containers without Chromium, kaleido PNG export
+    fails and `_save()` returns only the `.html` path. The renderers used to filter
+    on `.endswith('.png')` and dropped every HTML-only plot. We now keep one
+    "stem path" per plot and let downstream renderers probe each variant.
+    """
+    seen: set[str] = set()
+    stems: list[str] = []
+    for p in plot_paths:
+        sp = str(p)
+        # Use the .png path as the canonical stem — the API can resolve siblings.
+        if sp.endswith((".png", ".html", ".json")):
+            stem = sp.rsplit(".", 1)[0] + ".png"
+        else:
+            stem = sp
+        if stem in seen:
+            continue
+        seen.add(stem)
+        stems.append(stem)
+    return stems
+
+
+def _render_inline_plots(session_id: str, plot_paths: list[str]) -> None:
+    """Render plot thumbnails inside a chat message bubble.
+
+    Tries PNG first; if PNG is unavailable (e.g. kaleido failed in production),
+    falls back to rendering the interactive Plotly figure inline using the sibling
+    .json artifact so plots are never silently dropped.
+    """
+    stems = _normalize_plot_paths(plot_paths)
+    if not stems:
         return
 
     st.markdown(
         "<div style='margin:14px 0 8px;font-size:0.82rem;color:#475569;"
         "font-weight:600;letter-spacing:0.4px;text-transform:uppercase;'>"
-        f"📊 {len(png_paths)} plot{'s' if len(png_paths) != 1 else ''} generated</div>",
+        f"📊 {len(stems)} plot{'s' if len(stems) != 1 else ''} generated</div>",
         unsafe_allow_html=True,
     )
 
     cols_per_row = 2
-    rows = [png_paths[i:i + cols_per_row] for i in range(0, len(png_paths), cols_per_row)]
+    rows = [stems[i:i + cols_per_row] for i in range(0, len(stems), cols_per_row)]
 
     for row_paths in rows:
         cols = st.columns(len(row_paths))
         for col, path in zip(cols, row_paths):
             label = Path(path).stem.split("_", 1)[-1].replace("_", " ").title()
-            img_bytes = _fetch_file(session_id, path)
             with col:
-                # Defensive rendering: only call st.image when the bytes look like
-                # a real PNG (PNG magic = 89 50 4E 47). Empty / non-PNG payloads
-                # used to render as a stray "0" before this guard.
+                # 1) Try PNG (fast static thumbnail).
+                img_bytes = _fetch_file(session_id, path)
                 if img_bytes and len(img_bytes) > 8 and img_bytes[:4] == b"\x89PNG":
                     st.image(img_bytes, caption=label, use_container_width=True)
-                else:
-                    st.markdown(
-                        f"<div style='border:1px dashed rgba(255,255,255,0.1);"
-                        f"border-radius:10px;padding:24px 14px;text-align:center;"
-                        f"color:#64748b;font-size:0.78rem;'>"
-                        f"⚠ Could not load <b>{label}</b><br>"
-                        f"<code style='font-size:0.7rem;color:#94a3b8;'>{path}</code>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
+                    continue
+
+                # 2) Fall back to interactive Plotly via the sibling JSON.
+                json_path  = path.replace(".png", ".json")
+                json_bytes = _fetch_file(session_id, json_path)
+                if json_bytes:
+                    try:
+                        fig = _go.Figure(_json.loads(json_bytes.decode("utf-8")))
+                        st.markdown(
+                            f"<div style='font-size:0.82rem;font-weight:600;"
+                            f"color:#94a3b8;margin:0 0 4px;'>📊 {label}</div>",
+                            unsafe_allow_html=True,
+                        )
+                        st.plotly_chart(
+                            fig,
+                            use_container_width=True,
+                            key=f"inline_plotly_{Path(path).stem}",
+                        )
+                        continue
+                    except Exception:
+                        pass
+
+                # 3) Last resort: surface the failure instead of rendering a "0".
+                st.markdown(
+                    f"<div style='border:1px dashed rgba(255,255,255,0.1);"
+                    f"border-radius:10px;padding:24px 14px;text-align:center;"
+                    f"color:#64748b;font-size:0.78rem;'>"
+                    f"⚠ Could not load <b>{label}</b><br>"
+                    f"<code style='font-size:0.7rem;color:#94a3b8;'>{path}</code>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
 
 def _render_interactive_plots(session_id: str, plot_paths: list[str]) -> None:
     """Render interactive Plotly charts in a standalone expander OUTSIDE chat messages."""
-    png_paths = [p for p in plot_paths if str(p).endswith(".png")]
-    if not png_paths:
+    stems = _normalize_plot_paths(plot_paths)
+    if not stems:
         return
 
     with st.expander("🔬 Explore plots interactively  (zoom · hover · pan)", expanded=False):
-        for path in png_paths:
+        for path in stems:
             label = (
                 Path(path).stem
                 .split("_", 1)[-1]
@@ -806,17 +937,26 @@ def _render_interactive_plots(session_id: str, plot_paths: list[str]) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _render_quick_actions(session_id: str, astate: dict) -> str | None:
-    data_loaded   = bool(astate.get("data_type"))
-    analysis_done = bool(astate.get("excel_path"))
+    data_loaded      = bool(astate.get("data_type"))
+    analysis_done    = bool(astate.get("excel_path"))
+    enrichment_done  = bool(astate.get("enrichment_result_path"))
 
     if analysis_done:
-        actions = [
-            "Summarise results",
-            "Show top 10 biomarkers",
-            "Generate standard plots",
-            "Run pathway enrichment",
-            "Show analysis code",
-        ]
+        if enrichment_done:
+            actions = [
+                "Summarise results",
+                "Show top 10 biomarkers",
+                "Generate standard plots",
+                "Show analysis code",
+            ]
+        else:
+            actions = [
+                "Summarise results",
+                "Show top 10 biomarkers",
+                "Generate standard plots",
+                "Run pathway enrichment",
+                "Show analysis code",
+            ]
     elif data_loaded:
         actions = [
             "Run all comparisons",
@@ -826,22 +966,36 @@ def _render_quick_actions(session_id: str, astate: dict) -> str | None:
     else:
         return None
 
-    # Excel download — shown alongside quick actions when available
+    # Results download — shown alongside quick actions when available
     excel_path = astate.get("excel_path")
     if excel_path and session_id:
         dl_col, chips_col = st.columns([1, 4])
         with dl_col:
-            try:
-                r = requests.get(f"{API_BASE}/results/{session_id}/excel", timeout=20)
-                if r.status_code == 200:
-                    st.download_button(
-                        "⬇ Download Excel",
-                        data=r.content,
-                        file_name=f"biomarkers_{session_id[:8]}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-            except Exception:
-                pass
+            # Cache Excel bytes in session_state so we don't re-fetch on every
+            # Streamlit rerun (Streamlit reruns on every interaction).
+            cache_key = f"_excel_bytes_{excel_path}"
+            if cache_key not in st.session_state:
+                try:
+                    r = _session.get(f"{API_BASE}/results/{session_id}/excel", timeout=20)
+                    st.session_state[cache_key] = r.content if r.status_code == 200 else None
+                except Exception:
+                    st.session_state[cache_key] = None
+            excel_bytes = st.session_state.get(cache_key)
+            if excel_bytes:
+                if enrichment_done:
+                    dl_label = "⬇ Download Enrichment"
+                    dl_name  = f"enrichment_{session_id[:8]}.csv"
+                    dl_mime  = "text/csv"
+                else:
+                    dl_label = "⬇ Download Excel"
+                    dl_name  = f"biomarkers_{session_id[:8]}.xlsx"
+                    dl_mime  = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                st.download_button(
+                    dl_label,
+                    data=excel_bytes,
+                    file_name=dl_name,
+                    mime=dl_mime,
+                )
         with chips_col:
             cols = st.columns(len(actions))
             for col, action in zip(cols, actions):
@@ -952,8 +1106,14 @@ def _render_main() -> None:
 
         if user_input:
             st.session_state["messages"].append({"role": "user", "content": user_input})
-            with st.spinner(""):
-                resp = _api_send_message(session_id, user_input)
+            thinking = st.empty()
+            thinking.markdown(
+                "<div class='thinking-dots'>Thinking"
+                "<span>.</span><span>.</span><span>.</span></div>",
+                unsafe_allow_html=True,
+            )
+            resp = _api_send_message(session_id, user_input)
+            thinking.empty()
             if resp:
                 new_sid = resp.get("session_id")
                 if new_sid and new_sid != session_id:
@@ -964,10 +1124,22 @@ def _render_main() -> None:
                     new_astate = _api_fetch_state(session_id)
                 st.session_state["analysis_state"] = new_astate
 
-                # Detect whether this response generated new plots
+                # Detect whether this response generated new plots.
+                # Two triggers:
+                #   1. New PNGs appeared in plot_paths since the last turn, OR
+                #   2. The orchestrator routed this turn to an agent that
+                #      produces plots — in that case treat any existing plots
+                #      as fresh (file names can be deterministic, so set-delta
+                #      alone would miss legitimate re-renders).
                 old_plots = set(astate.get("plot_paths") or [])
                 new_plots = set(new_astate.get("plot_paths") or [])
-                has_plots = bool(new_plots - old_plots)   # True only when brand-new plots appear
+                intent    = ((resp.get("intent") if resp else None)
+                             or new_astate.get("intent") or "").lower()
+                plot_producing_turn = intent in {
+                    "run_analysis", "run_visualization", "run_full_pipeline",
+                    "run_enrichment",
+                }
+                has_plots = bool(new_plots - old_plots) or (plot_producing_turn and bool(new_plots))
 
                 # Clear has_plots from all previous messages so plots attach
                 # to exactly the message that produced them

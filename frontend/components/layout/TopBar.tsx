@@ -2,6 +2,7 @@
 
 import { Moon, PanelRight, PanelRightClose, Sun } from "lucide-react";
 
+import { DownloadButtons } from "@/components/chat/DownloadButtons";
 import { Button } from "@/components/ui/Button";
 import { useTheme } from "@/hooks/useTheme";
 import { useAppStore } from "@/lib/store";
@@ -30,7 +31,9 @@ export function TopBar() {
         </span>
       </div>
 
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-2">
+        <DownloadButtons />
+        <span className="hidden h-5 w-px bg-border sm:inline-block" aria-hidden />
         <Button
           variant="ghost" size="icon"
           aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}

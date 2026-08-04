@@ -400,7 +400,7 @@ class TestTruncate:
 class TestRunRouting:
 
     def _patch_decision(self, agent, action: str, **extra):
-        payload = {"action": action, "confidence": 0.95, "reason": "test", **extra}
+        payload = {"action": action, "confidence": 0.95, "reason": "test decision routing", **extra}
         mock_resp = MagicMock()
         mock_resp.choices[0].message.content = json.dumps(payload)
         mock_resp.usage.total_tokens = 30

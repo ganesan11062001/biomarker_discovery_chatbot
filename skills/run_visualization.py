@@ -45,6 +45,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from core.io_utils import read_csv_safe
+
 logger = logging.getLogger(__name__)
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
@@ -121,7 +123,7 @@ def _load_wide(data_path: str, cols: List[str]) -> Optional[pd.DataFrame]:
     """Load processed data CSV and return columns that exist."""
     if not data_path or not Path(data_path).exists():
         return None
-    df = pd.read_csv(data_path, index_col=0)
+    df = read_csv_safe(data_path, index_col=0)
     valid = [c for c in cols if c in df.columns]
     if not valid:
         return None
@@ -912,7 +914,7 @@ def plot_paired_lines(
         if len(group1_samples) != len(group2_samples):
             logger.info("Paired lines skipped — unequal group sizes")
             return ""
-        df_raw = pd.read_csv(data_path, index_col=0)
+        df_raw = read_csv_safe(data_path, index_col=0)
         g1 = [c for c in group1_samples if c in df_raw.columns]
         g2 = [c for c in group2_samples if c in df_raw.columns]
         if len(g1) < 1 or len(g2) < 1:
@@ -983,7 +985,7 @@ def plot_anova_multigroup(
     try:
         if not data_path or not Path(data_path).exists() or not all_groups:
             return ""
-        df_raw  = pd.read_csv(data_path, index_col=0)
+        df_raw  = read_csv_safe(data_path, index_col=0)
         proteins = [p.get("protein", "") for p in top_proteins[:top_n]
                     if p.get("protein", "") in df_raw.index]
         if not proteins:

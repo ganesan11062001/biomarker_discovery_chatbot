@@ -1,11 +1,12 @@
 "use client";
 
-import { FlaskConical, User } from "lucide-react";
+import { ExternalLink, FlaskConical, ImageIcon, User } from "lucide-react";
 
 import { Markdown } from "@/components/chat/Markdown";
 import { SkillBadge } from "@/components/chat/SkillBadge";
+import { useAppStore } from "@/lib/store";
 import { cn } from "@/lib/utils";
-import type { ChatMessage } from "@/types";
+import type { ChatMessage, PlotArtifact } from "@/types";
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -64,6 +65,9 @@ export function MessageBubble({ message }: MessageBubbleProps) {
               : <TypingIndicator />}
         </div>
 
+        {/* Inline plot grid (assistant only) */}
+        {!isUser && <InlinePlotGrid message={message} />}
+
         {/* Timestamp */}
         <div className={cn("mt-1 text-[10px] text-muted",
                             isUser ? "text-right" : "text-left")}>
@@ -74,12 +78,78 @@ export function MessageBubble({ message }: MessageBubbleProps) {
   );
 }
 
+/**
+ * Render plot artifacts attached to this message as a small thumbnail grid
+ * beneath the bubble. Clicking a thumbnail focuses it in the side panel and
+ * opens the panel if it isn't already visible. Static PNG / SVG plots show
+ * as `<img>` previews; HTML-only plots show an "Open interactive" placeholder.
+ */
+function InlinePlotGrid({ message }: { message: ChatMessage }) {
+  const plots = (message.artifacts ?? []).filter(
+    (a): a is PlotArtifact => a.kind === "plot",
+  );
+  const setPanelOpen = useAppStore((s) => s.setArtifactPanelOpen);
+  const focusArtifact = useAppStore((s) => s.focusArtifact);
+
+  if (plots.length === 0) return null;
+
+  const open = (id: string) => {
+    focusArtifact(id);
+    setPanelOpen(true);
+  };
+
+  return (
+    <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+      {plots.map((p) => (
+        <button
+          key={p.id}
+          type="button"
+          onClick={() => open(p.id)}
+          className="group flex flex-col overflow-hidden rounded-lg border border-border
+                     bg-surface text-left transition-colors hover:border-accent
+                     focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+          aria-label={`Open ${p.title || "plot"} in side panel`}
+        >
+          <div className="flex h-24 w-full items-center justify-center bg-white dark:bg-surface-2">
+            {p.imageUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={p.imageUrl}
+                alt={p.title || "Plot"}
+                className="max-h-full max-w-full object-contain"
+                loading="lazy"
+              />
+            ) : (
+              <div className="flex flex-col items-center gap-1 text-muted">
+                <ExternalLink className="h-4 w-4" />
+                <span className="text-[10px]">Interactive</span>
+              </div>
+            )}
+          </div>
+          <div className="flex items-center gap-1 border-t border-border px-2 py-1">
+            <ImageIcon className="h-3 w-3 text-accent" />
+            <span className="truncate text-[11px] text-foreground">
+              {p.title || "Plot"}
+            </span>
+          </div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function TypingIndicator() {
   return (
-    <span className="inline-flex items-center gap-1.5 text-muted">
-      <span className="h-1.5 w-1.5 animate-pulse-dot rounded-full bg-muted [animation-delay:-0.32s]"/>
-      <span className="h-1.5 w-1.5 animate-pulse-dot rounded-full bg-muted [animation-delay:-0.16s]"/>
-      <span className="h-1.5 w-1.5 animate-pulse-dot rounded-full bg-muted"/>
+    <span
+      className="inline-flex items-baseline gap-0.5 text-sm italic text-muted"
+      role="status"
+      aria-live="polite"
+      aria-label="Thinking"
+    >
+      <span>Thinking</span>
+      <span className="animate-pulse-dot [animation-delay:-0.32s]">.</span>
+      <span className="animate-pulse-dot [animation-delay:-0.16s]">.</span>
+      <span className="animate-pulse-dot">.</span>
     </span>
   );
 }
