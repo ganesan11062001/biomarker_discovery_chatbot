@@ -405,3 +405,41 @@ class TestPTMEnrichmentLibraries:
         )
         for lib in _PTM_LIBRARIES:
             assert lib not in captured_libs
+
+
+class TestPhosphositeGeneSymbolExtraction:
+    """
+    Real phosphosite identifiers (e.g. "GENE_S123") must resolve to the bare
+    gene symbol before submission to Enrichr, which only knows gene symbols —
+    otherwise every phosphosite silently fails to enrich (case 9: phospho).
+    """
+
+    def test_underscore_site_suffix_stripped(self):
+        from skills.run_enrichment import _extract_gene_symbols
+        assert _extract_gene_symbols(["EGFR_S123"]) == ["EGFR"]
+
+    def test_phospho_prefixed_site_suffix_stripped(self):
+        from skills.run_enrichment import _extract_gene_symbols
+        assert _extract_gene_symbols(["EGFR_pS123"]) == ["EGFR"]
+
+    def test_hyphen_site_suffix_stripped(self):
+        from skills.run_enrichment import _extract_gene_symbols
+        assert _extract_gene_symbols(["AKT1-T308"]) == ["AKT1"]
+
+    def test_parenthesized_site_suffix_stripped(self):
+        from skills.run_enrichment import _extract_gene_symbols
+        assert _extract_gene_symbols(["STAT3(Y705)"]) == ["STAT3"]
+
+    def test_normal_gene_symbols_ending_in_digits_untouched(self):
+        from skills.run_enrichment import _extract_gene_symbols
+        assert _extract_gene_symbols(["STAT3", "AKT1", "TP53", "CDK1"]) == [
+            "STAT3", "AKT1", "TP53", "CDK1",
+        ]
+
+    def test_uniprot_header_with_site_suffix_stripped(self):
+        from skills.run_enrichment import _extract_gene_symbols
+        assert _extract_gene_symbols(["sp|P12345|EGFR_HUMAN_S1068"]) == ["EGFR"]
+
+    def test_gn_tag_with_site_suffix_stripped(self):
+        from skills.run_enrichment import _extract_gene_symbols
+        assert _extract_gene_symbols(["Epidermal growth factor receptor GN=EGFR_Y1068 PE=1"]) == ["EGFR"]

@@ -61,6 +61,25 @@ _PTM_OMIC_TYPES = {"phosphoproteomics", "phospho", "ptm"}
 _GN_RE = re.compile(r'\bGN=(\w[\w\-]*)', re.IGNORECASE)
 # MaxQuant/FASTA: sp|ACCESSION|GENENAME_SPECIES
 _SP_RE = re.compile(r'(?:sp|tr)\|[A-Z0-9\-]+\|([A-Z0-9]+)_[A-Z]+', re.IGNORECASE)
+# Phosphosite suffix appended to a gene symbol by phospho-proteomics tools,
+# e.g. "GENE_S123", "GENE_pS123", "GENE-T45", "GENE(Y8)" — a bare gene symbol
+# is required to match Enrichr's gene-set libraries, so the site notation
+# must be stripped or every phosphosite silently fails to enrich. Requires an
+# explicit separator before the residue+position so real gene symbols ending
+# in digits (e.g. "STAT3", "AKT1") are never touched.
+_PHOSPHOSITE_SUFFIX_RE = re.compile(
+    r'^([A-Za-z][\w]*?)[_\-]p?(?:[STY]\d+[a-z]?)$|'
+    r'^([A-Za-z][\w]*?)\(p?(?:[STY]\d+[a-z]?)\)$',
+    re.IGNORECASE,
+)
+
+
+def _strip_phosphosite_suffix(symbol: str) -> str:
+    """Strip a trailing phosphosite suffix (e.g. "_S123") from a gene symbol."""
+    m = _PHOSPHOSITE_SUFFIX_RE.match(symbol)
+    if not m:
+        return symbol
+    return m.group(1) or m.group(2)
 
 
 # ── Blood / sample-prep contaminants ─────────────────────────────────────────
@@ -182,19 +201,19 @@ def _extract_gene_symbols(protein_names: List[str]) -> List[str]:
         # 1. GN= tag (UniProt description lines, highest confidence)
         m = _GN_RE.search(name_str)
         if m:
-            symbols.append(m.group(1))
+            symbols.append(_strip_phosphosite_suffix(m.group(1)))
             continue
 
         # 2. sp|ACCESSION|GENE_SPECIES (MaxQuant / FASTA header format)
         m = _SP_RE.search(first_entry)
         if m:
-            symbols.append(m.group(1))
+            symbols.append(_strip_phosphosite_suffix(m.group(1)))
             continue
 
         # 3. Fallback: part before " OS=" or after last "|"
         short = first_entry.split(" OS=")[0].split("|")[-1].strip()
         if 1 < len(short) <= 30 and not any(c in short for c in "=/\\;"):
-            symbols.append(short)
+            symbols.append(_strip_phosphosite_suffix(short))
 
     seen: set[str] = set()
     unique: list[str] = []
