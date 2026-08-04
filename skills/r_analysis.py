@@ -45,6 +45,17 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# ── LangSmith @traceable (graceful no-op if not installed) ───────────────────
+try:
+    from langsmith import traceable as _traceable
+    from langsmith.run_helpers import get_current_run_tree as _get_run_tree
+except ImportError:
+    def _traceable(**_kw):           # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap
+    def _get_run_tree():             # type: ignore[misc]
+        return None
+
 
 class RAnalysisError(RuntimeError):
     """Raised when the R subprocess fails or limma isn't available."""
@@ -126,6 +137,8 @@ class RAnalysisSkill:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    @_traceable(run_type="tool", name="skill.r_analysis.limma",
+                tags=["biomarker-discovery", "skill", "r-subprocess"])
     def run(
         self,
         expression_df:  pd.DataFrame,
@@ -136,6 +149,16 @@ class RAnalysisSkill:
         workdir:        Optional[str] = None,
     ) -> RLimmaResult:
         """Run limma on ``expression_df`` (rows = accessions, cols = samples)."""
+        rt = _get_run_tree()
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update({
+                    "n_group1": len(group1_samples),
+                    "n_group2": len(group2_samples),
+                    "n_proteins": len(expression_df),
+                })
+            except Exception:
+                pass
         g1 = [c for c in group1_samples if c in expression_df.columns]
         g2 = [c for c in group2_samples if c in expression_df.columns]
         if len(g1) < 2 or len(g2) < 2:
@@ -212,6 +235,13 @@ class RAnalysisSkill:
             "R/limma analysis complete | %d proteins | %d significant @ adj_p<%.3f, |log2FC|>=%.2f",
             len(df), int(sig.sum()), self.adj_pval_cutoff, self.log2fc_cutoff,
         )
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update({
+                    "n_significant": int(sig.sum()),
+                })
+            except Exception:
+                pass
         return RLimmaResult(
             results_df = df,
             r_script   = _R_SCRIPT_TEMPLATE,

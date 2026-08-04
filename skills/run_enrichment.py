@@ -25,6 +25,17 @@ from skills.protein_lookup import ProteinLookupSkill
 
 logger = logging.getLogger(__name__)
 
+# ── LangSmith @traceable (graceful no-op if not installed) ───────────────────
+try:
+    from langsmith import traceable as _traceable
+    from langsmith.run_helpers import get_current_run_tree as _get_run_tree
+except ImportError:
+    def _traceable(**_kw):           # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap
+    def _get_run_tree():             # type: ignore[misc]
+        return None
+
 _lookup_skill = ProteinLookupSkill()
 
 _LIBRARIES: dict[str, list[str]] = {
@@ -265,6 +276,8 @@ class PathwaySkill:
     - MaxQuant sp|...|GENE_SPECIES parsed correctly
     """
 
+    @_traceable(run_type="tool", name="skill.enrichment.execute",
+                tags=["biomarker-discovery", "skill", "enrichr"])
     def execute(
         self,
         protein_list: List[str],
@@ -278,6 +291,16 @@ class PathwaySkill:
         omic_type: str = "proteomics",
     ) -> dict:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+        rt = _get_run_tree()
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update({
+                    "organism": organism,
+                    "n_input_proteins": len(protein_list),
+                })
+            except Exception:
+                pass
 
         gene_symbols = _resolve_symbols(protein_list, organism, output_dir)
         logger.info(
@@ -405,6 +428,15 @@ class PathwaySkill:
             result["libraries_attempted"]   = n_attempted
             result["libraries_failed"]      = n_failed
             result["all_libraries_failed"]  = all_libraries_failed
+            if rt is not None:
+                try:
+                    rt.extra.setdefault("metadata", {}).update({
+                        "n_kegg_significant": 0,
+                        "n_go_significant":   0,
+                        "libraries_failed":   n_failed,
+                    })
+                except Exception:
+                    pass
             return result
 
         combined = (
@@ -432,6 +464,16 @@ class PathwaySkill:
 
         up_pathways   = [p for p in top_pathways if p["direction"] == "up"][:5]
         down_pathways = [p for p in top_pathways if p["direction"] == "down"][:5]
+
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update({
+                    "n_kegg_significant": n_kegg,
+                    "n_go_significant":   n_go,
+                    "libraries_failed":   n_failed,
+                })
+            except Exception:
+                pass
 
         return {
             "top_pathways":           top_pathways,

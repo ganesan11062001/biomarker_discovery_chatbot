@@ -38,10 +38,13 @@ logger   = logging.getLogger(__name__)
 # ── LangSmith @traceable (graceful no-op if not installed) ───────────────────
 try:
     from langsmith import traceable as _traceable
+    from langsmith.run_helpers import get_current_run_tree as _get_run_tree
 except ImportError:
     def _traceable(**_kw):           # type: ignore[misc]
         def _wrap(fn): return fn
         return _wrap
+    def _get_run_tree():             # type: ignore[misc]
+        return None
 
 
 _REVIEWER_SYSTEM_PROMPT = """\
@@ -174,6 +177,8 @@ class CodeReviewerAgent(BaseAgent):
         return state
 
 
+@_traceable(run_type="chain", name="code_reviewer.review_and_revise",
+            tags=["biomarker-discovery", "code_review"])
 def review_and_revise(
     *,
     generator,                 # callable: (extra_instruction: str|None) -> code:str
@@ -192,7 +197,22 @@ def review_and_revise(
 
     Returns an ExecutionRecord with the final code, result, error, and a
     structured history of every round (for tracing / debugging).
+
+    LangSmith span: code_reviewer.review_and_revise — each round's generate/
+    review/execute stages are recorded in the returned history and surfaced
+    as span metadata so revision loops are visible without opening every
+    nested LLM call.
     """
+    rt = _get_run_tree()
+    if rt is not None:
+        try:
+            rt.extra.setdefault("metadata", {}).update({
+                "user_question": user_question[:120],
+                "max_rounds":     max_rounds,
+            })
+        except Exception:
+            pass
+
     history: List[dict] = []
     last_code  = ""
     last_error: Optional[str] = None
@@ -257,18 +277,36 @@ def review_and_revise(
         if error is None:
             last_result = result
             last_error  = None
-            return ExecutionRecord(
+            record = ExecutionRecord(
                 code=code, result=result, error=None,
                 review=review, history=history, rounds_used=round_idx + 1,
             )
+            _update_review_metadata(rt, record)
+            return record
 
         last_error  = error
         last_result = result
 
-    return ExecutionRecord(
+    record = ExecutionRecord(
         code=last_code, result=last_result, error=last_error,
         review=last_review, history=history, rounds_used=max_rounds + 1,
     )
+    _update_review_metadata(rt, record)
+    return record
+
+
+def _update_review_metadata(rt, record: "ExecutionRecord") -> None:
+    """Attach final round-count/error summary to the active LangSmith span, if any."""
+    if rt is None:
+        return
+    try:
+        rt.extra.setdefault("metadata", {}).update({
+            "rounds_used": record.rounds_used,
+            "final_error": record.error,
+            "approved":    record.review.approved if record.review else None,
+        })
+    except Exception:
+        pass
 
 
 @dataclass

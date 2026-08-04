@@ -49,6 +49,17 @@ from core.io_utils import read_csv_safe
 
 logger = logging.getLogger(__name__)
 
+# ── LangSmith @traceable (graceful no-op if not installed) ───────────────────
+try:
+    from langsmith import traceable as _traceable
+    from langsmith.run_helpers import get_current_run_tree as _get_run_tree
+except ImportError:
+    def _traceable(**_kw):           # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap
+    def _get_run_tree():             # type: ignore[misc]
+        return None
+
 # ── Colour palette ─────────────────────────────────────────────────────────────
 _UP        = "#E74C3C"
 _DOWN      = "#2980B9"
@@ -1515,6 +1526,8 @@ class ProteomicsPlotSuite:
         dict with plot_paths (list), report_path (str), plots_run (list)
     """
 
+    @_traceable(run_type="tool", name="skill.visualization.execute",
+                tags=["biomarker-discovery", "skill", "plotly"])
     def execute(
         self,
         top_proteins: List[Dict[str, Any]],
@@ -1544,6 +1557,16 @@ class ProteomicsPlotSuite:
     ) -> Dict[str, Any]:
 
         Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+        rt = _get_run_tree()
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update({
+                    "analysis_mode": analysis_mode,
+                    "requested_plots": plot_types,
+                })
+            except Exception:
+                pass
 
         sample_columns  = sample_columns  or []
         group1_samples  = group1_samples  or []
@@ -1660,6 +1683,14 @@ class ProteomicsPlotSuite:
 
         logger.info("ProteomicsPlotSuite done: %d / %d plots generated",
                     len(plot_paths), len(to_run))
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update({
+                    "n_plots_generated": len(plot_paths),
+                    "n_plots_requested": len(to_run),
+                })
+            except Exception:
+                pass
         return {
             "plot_paths":  plot_paths,
             "report_path": report_path,

@@ -49,6 +49,17 @@ from openpyxl.utils import get_column_letter
 from core.io_utils import read_csv_safe
 from skills.base_skill import BaseOmicsSkill, OmicsAnalysisResult
 
+# ── LangSmith @traceable (graceful no-op if not installed) ───────────────────
+try:
+    from langsmith import traceable as _traceable
+    from langsmith.run_helpers import get_current_run_tree as _get_run_tree
+except ImportError:
+    def _traceable(**_kw):           # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap
+    def _get_run_tree():             # type: ignore[misc]
+        return None
+
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 _HEADER_FG  = "FFFFFF"
@@ -84,6 +95,8 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
     def omic_type(self) -> str:
         return "proteomics"
 
+    @_traceable(run_type="tool", name="skill.proteomics_analysis",
+                tags=["biomarker-discovery", "skill", "statistics"])
     def execute(  # type: ignore[override]
         self,
         data_path: str,
@@ -118,6 +131,16 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         clinical_outcome: Optional[Dict[str, Any]] = None,
         **_kwargs,
     ) -> Dict[str, Any]:
+        rt = _get_run_tree()
+        if rt is not None:
+            try:
+                rt.extra.setdefault("metadata", {}).update({
+                    "analysis_mode": analysis_mode,
+                    "test_method":   test_method,
+                    "n_samples":     len(sample_columns),
+                })
+            except Exception:
+                pass
         try:
             result = self._run(
                 data_path, sample_columns, group1_samples, group2_samples,
@@ -134,6 +157,13 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
                 clinical_outcome=clinical_outcome,
             )
             result["omic_type"] = self.omic_type
+            if rt is not None:
+                try:
+                    rt.extra.setdefault("metadata", {}).update({
+                        "n_significant": result.get("n_significant"),
+                    })
+                except Exception:
+                    pass
             return result
         except Exception as exc:
             logger.error("ProteomicsAnalysisSkill failed:\n%s", traceback.format_exc())
