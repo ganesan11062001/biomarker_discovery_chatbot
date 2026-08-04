@@ -65,6 +65,10 @@ app = FastAPI(
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
+    # Posit Connect proxies content under /content/<guid>/ and strips the
+    # prefix before forwarding. Setting root_path lets FastAPI build correct
+    # absolute URLs for /docs, OpenAPI, and redirects.
+    root_path=os.getenv("FASTAPI_ROOT_PATH", ""),
 )
 
 # CORS — allow Streamlit UI (localhost:8501) and local Next.js dev only.
