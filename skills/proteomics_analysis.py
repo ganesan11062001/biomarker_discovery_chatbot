@@ -1117,6 +1117,10 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             }
             for gn, v in zip(gnames, arrays):
                 row[f"mean_{gn}"] = round(float(v.mean()), 4)
+            for gn in gnames:
+                cols = grp[gn]
+                det = float(vm.loc[protein, cols].mean()) if protein in vm.index else 1.0
+                row[f"detection_{gn}"] = round(det, 3)
             rows.append(row)
 
         if not rows:
@@ -1124,16 +1128,7 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         df_res = pd.DataFrame(rows)
         _, adj_p, _, _ = multipletests(df_res["p_value"].values, method="fdr_bh")
         df_res["adj_p_value"] = adj_p
-
-        hi_pval    = min(0.01, adj_pval_cutoff / 5.0)
-        trend_pval = adj_pval_cutoff * 2.0
-        df_res["significance"] = "NS"
-        hi  = (df_res["adj_p_value"] < hi_pval)        & (df_res["max_log2fc"].abs() >= log2fc_cutoff)
-        sig = (df_res["adj_p_value"] < adj_pval_cutoff) & (df_res["max_log2fc"].abs() >= log2fc_cutoff)
-        trn = (df_res["adj_p_value"] < trend_pval)      & ~sig
-        df_res.loc[trn, "significance"] = "Trend"
-        df_res.loc[sig, "significance"] = "Significant"
-        df_res.loc[hi,  "significance"] = "Highly Significant"
+        df_res = self._add_significance(df_res, "max_log2fc", adj_pval_cutoff, log2fc_cutoff)
         df_res = df_res.sort_values("adj_p_value").reset_index(drop=True)
         df_res.insert(0, "rank", range(1, len(df_res) + 1))
 
@@ -1145,7 +1140,9 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         # real multiple-comparison-corrected pairwise result (case 5: TMT
         # multiplex, one-way ANOVA + Tukey post-hoc).
         df_res["tukey_significant_pairs"] = ""
-        sig_proteins = df_res.loc[df_res["significance"] != "NS", "protein"].tolist()
+        sig_proteins = df_res.loc[
+            ~df_res["significance"].isin(["NS", "Insufficient Data"]), "protein"
+        ].tolist()
         for protein in sig_proteins:
             values, labels = [], []
             for gname, cols in grp.items():
@@ -1599,6 +1596,7 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         fc_col: str,
         adj_pval_cutoff: float,
         log2fc_cutoff: float,
+        detection_cols: Optional[List[str]] = None,
     ) -> pd.DataFrame:
         hi_pval    = min(0.01, adj_pval_cutoff / 5.0)
         trend_pval = adj_pval_cutoff * 2.0
@@ -1609,6 +1607,22 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
         df.loc[trn, "significance"] = "Trend"
         df.loc[sig, "significance"] = "Significant"
         df.loc[hi,  "significance"] = "Highly Significant"
+
+        # A p-value computed for a group with zero genuine (non-imputed)
+        # measurements is manufactured entirely from imputed constants, not
+        # real variation (imputed values have ~zero within-group SD, which
+        # drives the test statistic to an artificially extreme value) — it
+        # must never be reported as significant, no matter how small it came
+        # out of the test.
+        detection_cols = detection_cols if detection_cols is not None else [
+            c for c in df.columns if c.startswith("detection_")
+        ]
+        if detection_cols:
+            no_data = (df[detection_cols] == 0).any(axis=1)
+            if no_data.any():
+                df.loc[no_data, "p_value"]      = np.nan
+                df.loc[no_data, "adj_p_value"]  = 1.0
+                df.loc[no_data, "significance"] = "Insufficient Data"
         return df
 
     # ── Code generation ───────────────────────────────────────────────────────
@@ -1772,10 +1786,15 @@ class ProteomicsAnalysisSkill(BaseOmicsSkill):
             a('df.loc[trn, "significance"]  = "Trend"')
             a('df.loc[sig, "significance"]  = "Significant"')
             a('df.loc[hi,  "significance"]  = "Highly Significant"')
+            a('# A p-value from a group with zero genuine measurements is manufactured')
+            a('# from imputed constants, not real variation — never trust it.')
+            a('no_data = (df[f"detection_{GROUP1_LABEL}"] == 0) | (df[f"detection_{GROUP2_LABEL}"] == 0)')
+            a('df.loc[no_data, "p_value"]      = np.nan')
+            a('df.loc[no_data, "adj_p_value"]  = 1.0')
+            a('df.loc[no_data, "significance"] = "Insufficient Data"')
             a('df = df.sort_values("adj_p_value").reset_index(drop=True)')
             a('df.insert(0, "rank", range(1, len(df) + 1))')
-            a('n_sig = ((df["adj_p_value"] < ADJ_PVAL_CUTOFF) &')
-            a('         (df["log2_fold_change"].abs() >= LOG2FC_CUTOFF)).sum()')
+            a('n_sig = df["significance"].isin(["Significant", "Highly Significant"]).sum()')
             a(f'print(f"Significant (adj.p<{adj_pval_cutoff}, |log2FC|>={log2fc_cutoff}): {{n_sig}}")')
         else:
             a('# ── 5. Unsupervised: CV / MAD / IQR ranking ─────────────────────────')

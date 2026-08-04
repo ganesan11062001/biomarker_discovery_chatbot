@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from skills.base_skill import BaseOmicsSkill, OmicsAnalysisResult
@@ -137,6 +139,73 @@ class TestProteomicsAnalysisSkillSupervised:
         assert top3_proteins & {"P001", "P002", "P003"}, (
             f"Expected spiked proteins in top 5, got {top3_proteins}"
         )
+
+
+# ── Imputation must never fabricate significance ──────────────────────────────
+
+class TestImputationSignificanceGuard:
+    """
+    A protein detected in every sample of one group but in none of the other
+    is imputed to a constant (half-minimum) in the all-missing group. That
+    constant has ~zero within-group variance, which can drive a t-test to an
+    artificially tiny p-value that reflects the imputation, not real biology.
+    Such rows must be flagged "Insufficient Data", never "Significant".
+    """
+
+    @pytest.fixture()
+    def zero_detection_csv(self, tmp_path: Path) -> Path:
+        rng = np.random.default_rng(seed=7)
+        proteins = [f"P{i:03d}" for i in range(1, 11)]
+        cols = ["D1", "D2", "D3", "C1", "C2", "C3"]
+        data = rng.normal(loc=10.0, scale=1.0, size=(10, 6))
+        df = pd.DataFrame(data, index=proteins, columns=cols)
+        # P001: fully detected in D1-D3, completely missing in C1-C3 —
+        # half-min imputation will fill C1-C3 with an identical constant.
+        df.loc["P001", ["C1", "C2", "C3"]] = np.nan
+        path = tmp_path / "zero_detection.csv"
+        df.to_csv(path)
+        return path
+
+    def test_zero_detection_group_never_significant(self, zero_detection_csv, tmp_path):
+        skill = ProteomicsAnalysisSkill()
+        result = skill.execute(
+            data_path=str(zero_detection_csv),
+            sample_columns=["D1", "D2", "D3", "C1", "C2", "C3"],
+            group1_samples=["D1", "D2", "D3"],
+            group2_samples=["C1", "C2", "C3"],
+            group1_label="Disease",
+            group2_label="Control",
+            analysis_mode="supervised",
+            output_dir=str(tmp_path),
+        )
+        assert result.get("error") is None
+        p001 = next(b for b in result["top_biomarkers"] if b["protein"] == "P001")
+        assert p001["significance"] == "Insufficient Data"
+        assert p001["adj_p_value"] == 1.0
+
+    def test_anova_zero_detection_group_never_significant(self, tmp_path):
+        rng = np.random.default_rng(seed=11)
+        proteins = [f"P{i:03d}" for i in range(1, 11)]
+        cols = ["A1", "A2", "A3", "B1", "B2", "B3", "C1", "C2", "C3"]
+        data = rng.normal(loc=10.0, scale=1.0, size=(10, 9))
+        df = pd.DataFrame(data, index=proteins, columns=cols)
+        df.loc["P001", ["C1", "C2", "C3"]] = np.nan
+        path = tmp_path / "anova_zero_detection.csv"
+        df.to_csv(path)
+
+        skill = ProteomicsAnalysisSkill()
+        result = skill.execute(
+            data_path=str(path),
+            sample_columns=cols,
+            analysis_mode="supervised",
+            test_method="anova",
+            all_groups={"A": ["A1", "A2", "A3"], "B": ["B1", "B2", "B3"], "C": ["C1", "C2", "C3"]},
+            output_dir=str(tmp_path),
+        )
+        assert result.get("error") is None
+        p001 = next((b for b in result["top_biomarkers"] if b["protein"] == "P001"), None)
+        if p001 is not None:
+            assert p001["significance"] == "Insufficient Data"
 
 
 # ── Unsupervised analysis ─────────────────────────────────────────────────────
