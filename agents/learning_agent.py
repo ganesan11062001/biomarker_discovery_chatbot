@@ -25,6 +25,7 @@ from pydantic import BaseModel, field_validator
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
 from core.state import BiomarkerState
+from core.token_utils import window_messages_by_tokens
 from core.tracing import get_trace_metadata
 
 settings = get_settings()
@@ -864,8 +865,17 @@ def _recent_messages(
     messages: list,
     n: int = 20,
     truncate_at: int = 600,
+    max_tokens: Optional[int] = None,
 ) -> list:
-    """Return the last n messages as plain dicts with content truncated."""
+    """
+    Return the last n messages as plain dicts with content truncated.
+
+    `max_tokens`, when given, is an additional safety net applied on top of
+    the existing n/truncate_at caps: it trims further from the oldest end of
+    the result if the actual token count (per core.token_utils) still
+    exceeds the budget. It never changes behavior when the n/truncate_at
+    caps already keep the result under budget, which is the common case.
+    """
     result = []
     for m in messages:
         if isinstance(m, dict):
@@ -879,7 +889,10 @@ def _recent_messages(
             continue
         if role in ("user", "assistant"):
             result.append({"role": role, "content": _truncate(content, truncate_at)})
-    return result[-n:]
+    result = result[-n:]
+    if max_tokens is not None:
+        result = window_messages_by_tokens(result, max_tokens)
+    return result
 
 
 class LearningAgent(BaseAgent):
@@ -1047,7 +1060,7 @@ class LearningAgent(BaseAgent):
                 )
 
         # Include last 5 conversation turns so the LLM knows what was recently discussed
-        recent = _recent_messages(state.get("messages") or [], n=5)
+        recent = _recent_messages(state.get("messages") or [], n=5, max_tokens=1000)
         if recent:
             ctx += "\nRECENT CONVERSATION:\n"
             for m in recent:
@@ -2796,7 +2809,7 @@ class LearningAgent(BaseAgent):
             )
 
         # Last 20 messages, with long content truncated to avoid token overflow
-        history = _recent_messages(state.get("messages") or [], n=20, truncate_at=600)
+        history = _recent_messages(state.get("messages") or [], n=20, truncate_at=600, max_tokens=4000)
 
         messages_for_llm = [
             {"role": "system", "content": _ANSWER_SYSTEM_PROMPT + "\n\n" + "\n".join(ctx)},

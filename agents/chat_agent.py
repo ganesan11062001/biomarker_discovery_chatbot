@@ -3,6 +3,7 @@ agents/chat_agent.py
 Entry point — uses LLM to understand user intent and routes to the right specialist.
 """
 from core.state import BiomarkerState
+from core.token_utils import window_messages_by_tokens
 from agents.base_agent import BaseAgent
 from config.settings import get_settings
 
@@ -115,12 +116,14 @@ class ChatAgent(BaseAgent):
                   "Never say data has not been uploaded if 'Data loaded: YES' is shown."
             )
 
-            # Cap history to last 10 turns to avoid token creep
+            # Cap history to last 10 turns to avoid token creep, with a
+            # token-budget safety net in case those 10 turns are unusually large
             history = [
                 {"role": m["role"], "content": m["content"]}
                 for m in (state.get("messages") or [])
                 if isinstance(m, dict) and m.get("role") in ("user", "assistant")
             ][-10:]
+            history = window_messages_by_tokens(history, max_tokens=3000)
 
             messages_for_llm = [
                 {"role": "system", "content": system_with_context},
