@@ -354,18 +354,23 @@ def get_short_name(protein_name: Optional[str]) -> str:
 
 
 def format_protein_row(
-    protein_name: str,
-    accession:    Optional[str],
-    value:        Any,
-    unit:         str = "",
+    name:      str,
+    accession: Optional[str],
+    value:     Any,
+    unit:      str = "",
 ) -> str:
     """BUG-4 FIX. Render a protein row as 'Gene (Accession) — Value Unit'.
 
     If gene symbol can't be parsed, fall back to the protein description.
+
+    Parameter is named `name` (not `protein_name`) to match the exact
+    signature documented in the query_data LLM prompt — the sandboxed
+    generated code calls this with keyword arguments, so a mismatched
+    parameter name raises an uncaught TypeError at execution time.
     """
-    gene = get_gene_symbol(protein_name)
+    gene = get_gene_symbol(name)
     if gene == "Unknown":
-        gene = get_short_name(protein_name) or "Unknown"
+        gene = get_short_name(name) or "Unknown"
     acc = accession or "?"
     val_str = f"{value} {unit}".strip() if unit else f"{value}"
     return f"{gene} ({acc}) — {val_str}"

@@ -139,7 +139,7 @@ class BiomarkerAgent(BaseAgent):
         # all_groups / clinical_outcome instead — but are still "supervised"
         # analyses (they produce p-values / effect sizes, not CV ranking).
         _new_method_flag = _method_hint in (
-            "dose_response", "repeated_measures",
+            "anova", "dose_response", "repeated_measures",
             "linear_regression", "logistic_regression", "cox_regression",
         )
         mode = "supervised" if (g1 and g2) or _new_method_flag else "unsupervised"

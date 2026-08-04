@@ -214,6 +214,16 @@ class TestGeneSymbolParsing:
         out = format_protein_row("miDys", "miDys", 19, "SpC")
         assert "miDys" in out and "19" in out
 
+    def test_format_protein_row_accepts_name_keyword(self):
+        # The query_data LLM prompt documents this signature as
+        # format_protein_row(name, accession, value, unit='') and calls it
+        # with keyword arguments — the first parameter must be literally
+        # named `name`, or the LLM-generated code raises an uncaught
+        # TypeError at execution time.
+        s = "Myosin-4 OS=Mus musculus GN=Myh4 PE=1 SV=2"
+        out = format_protein_row(name=s, accession="Q5SX39", value=4307, unit="SpC")
+        assert out == "Myh4 (Q5SX39) — 4307 SpC"
+
 
 # ── BUG 6 — Non-standard protein lookup ──────────────────────────────────────
 

@@ -1064,8 +1064,13 @@ class LearningAgent(BaseAgent):
         try:
             # json_mode=True: forces valid JSON output — no markdown fences,
             # no preamble — eliminating the most common structured-output failure.
+            # max_tokens must accommodate large per-sample maps the schema can
+            # require (subject_map for repeated-measures, clinical_outcome for
+            # large cohorts) — 600 was observed to truncate mid-string on a
+            # 20-sample subject_map and a 120-sample clinical_outcome, causing
+            # a JSON parse failure that silently fell back to 'answer'.
             raw = self._call_llm(
-                messages, max_tokens=600, temperature=0.0, json_mode=True
+                messages, max_tokens=2000, temperature=0.0, json_mode=True
             ).strip()
 
             # Validate + coerce with Pydantic (catches unknown actions, bad types)
@@ -3247,6 +3252,20 @@ class LearningAgent(BaseAgent):
                 })
                 state["status"] = "answered"
                 return state
+
+            # A group-based method (ANOVA / dose-response / repeated-measures)
+            # requested fresh this turn, with no explicit pairwise ask, must
+            # not be shadowed by a stale group1_samples/group2_samples pair
+            # left over from ingestion-time defaults (IngestionAgent always
+            # seeds these from the first two detected groups) or an earlier
+            # turn's comparison — biomarker_agent treats their presence as "a
+            # pairwise comparison was resolved this turn" and would otherwise
+            # silently collapse the multi-group request into a two-group test.
+            if not g1_label and not g2_label and decision.get("test_method") in (
+                "anova", "dose_response", "repeated_measures",
+            ):
+                state["group1_samples"] = []
+                state["group2_samples"] = []
 
             # Groups resolved (either from this turn or already in state) → run analysis
             return self._specialist("biomarker").run(state)
