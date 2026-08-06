@@ -5,25 +5,18 @@ Accepts a proteomics CSV or Excel file, runs DataLoadingSkill,
 and returns dataset metadata including detected sample columns.
 """
 import logging
-import uuid
-from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel
 
-from agents.ingestion_agent import IngestionAgent
 from config.settings import get_settings
-from core.session_manager import SessionManager
+from core.backend_service import BackendError
+from core.backend_service import upload_file as _upload_file
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 settings = get_settings()
-
-_ingestion_agent = IngestionAgent()
-
-_ALLOWED_EXT = {".csv", ".xlsx", ".xls"}
-_MAX_BYTES   = settings.max_file_size_mb * 1024 * 1024
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -60,96 +53,26 @@ async def upload_proteomics_file(
     Returns dataset shape and the list of detected sample columns
     so the client can present a group-assignment UI.
     """
-    suffix = Path(file.filename or "data.csv").suffix.lower()
-    if suffix not in _ALLOWED_EXT:
-        hint = ""
-        if suffix in (".txt", ".tsv"):
-            hint = " Rename to .csv if your file is tab/comma-separated."
-        elif suffix in (".ods", ".xlsm", ".xlsb"):
-            hint = " Please export as .xlsx from Excel/LibreOffice."
-        raise HTTPException(
-            400,
-            f"Unsupported file type '{suffix}'.{hint} Accepted formats: .csv, .xlsx, .xls.",
-        )
-
     # Reject oversized requests before reading the body into memory.
-    # Content-Length is advisory (clients can omit it) but provides an early
-    # cheap check; the hard size gate after read() catches the rest.
+    # Content-Length is advisory (clients can omit it) but the hard size
+    # gate inside upload_file() after read() catches the rest.
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > _MAX_BYTES:
+    max_bytes = settings.max_file_size_mb * 1024 * 1024
+    if content_length and int(content_length) > max_bytes:
         raise HTTPException(413, f"File exceeds {settings.max_file_size_mb} MB limit.")
 
     content = await file.read()
-    if len(content) > _MAX_BYTES:
-        raise HTTPException(413, f"File exceeds {settings.max_file_size_mb} MB limit.")
 
-    # Resolve or create session
-    if session_id:
-        try:
-            SessionManager.get_session(session_id)
-        except KeyError:
-            session_id = None
+    try:
+        result = _upload_file(
+            content,
+            file.filename or "data.csv",
+            session_id=session_id,
+            disease_program=disease_program,
+            organism=organism,
+        )
+    except BackendError as exc:
+        raise HTTPException(exc.status_code, exc.message)
 
-    if not session_id:
-        session_id = SessionManager.create_session(disease_program=disease_program)
-        logger.info("New session %s created for upload.", session_id)
+    return UploadResponse(**result)
 
-    # Persist raw file
-    file_id  = uuid.uuid4().hex
-    raw_dir  = Path(settings.data_raw_dir) / session_id
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = raw_dir / f"{file_id}{suffix}"
-    raw_path.write_bytes(content)
-    logger.info("Saved %s (%d bytes) → %s", file.filename, len(content), raw_path)
-
-    data_format = "excel" if suffix in (".xlsx", ".xls") else "csv"
-    SessionManager.update_session(
-        session_id,
-        {"file_id": file_id, "data_path": str(raw_path), "data_format": data_format},
-    )
-
-    # Run ingestion agent
-    state   = SessionManager.get_session(session_id)
-    updated = _ingestion_agent.run(state)
-    SessionManager.update_session(session_id, updated)
-
-    if updated.get("status") == "error":
-        raise HTTPException(422, updated.get("error_message", "Ingestion failed."))
-
-    # Pluck the last assistant message — IngestionAgent appended a rich,
-    # context-aware message; we surface it to the UI so it replaces the
-    # generic upload-success template.
-    msgs = updated.get("messages") or []
-    last_assistant_msg = next(
-        (m.get("content") for m in reversed(msgs)
-         if isinstance(m, dict) and m.get("role") == "assistant"),
-        None,
-    )
-
-    # Build a compact inferred_groups dict suitable for JSON serialisation
-    # (state's inferred_groups uses real DataFrames sometimes — keep dicts only).
-    g1_label = updated.get("group1_label")
-    g2_label = updated.get("group2_label")
-    inferred_groups: Optional[dict] = None
-    if g1_label and g2_label:
-        inferred_groups = {
-            g1_label: updated.get("group1_samples") or [],
-            g2_label: updated.get("group2_samples") or [],
-        }
-
-    return UploadResponse(
-        session_id       = session_id,
-        file_id          = file_id,
-        filename         = file.filename or raw_path.name,
-        data_type        = updated.get("data_type"),
-        data_format      = updated.get("data_format"),
-        n_proteins       = updated.get("n_proteins"),
-        n_samples        = updated.get("n_samples"),
-        sample_columns   = updated.get("sample_columns"),
-        metadata_columns = updated.get("metadata_columns"),
-        is_pooled_design = bool(updated.get("is_pooled_design", False)),
-        label_map        = updated.get("label_map"),
-        inferred_groups  = inferred_groups,
-        message          = last_assistant_msg,
-        status           = updated.get("status", "data_loaded"),
-    )

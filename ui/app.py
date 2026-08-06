@@ -1,45 +1,33 @@
 """
 ui/app.py  —  BiomarkerAI  (chat-only, no sidebar)
+
+Single-app deployment: this Streamlit UI calls the analysis pipeline
+directly in-process via core.backend_service, no separate FastAPI
+service or network hop required.
 """
 from __future__ import annotations
 
-import os
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
 import json as _json
 
 import plotly.graph_objects as _go
-import requests
 import streamlit as st
 
 _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
-
-# ── Posit Connect auth ───────────────────────────────────────────────────────
-# When the FastAPI is deployed on Posit Connect with "All users - login
-# required", we must authenticate every request with a Connect API key.
-# Set CONNECT_API_KEY in this Streamlit content's Vars panel.
-_CONNECT_API_KEY = os.getenv("CONNECT_API_KEY", "").strip()
-# Internal Connect servers often use a corporate CA that the Python image
-# does not trust. Allow opting out of TLS verification via env var.
-_VERIFY_SSL = os.getenv("API_VERIFY_SSL", "1").strip().lower() not in {"0", "false", "no"}
-if not _VERIFY_SSL:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-_session = requests.Session()
-_session.verify = _VERIFY_SSL
-if _CONNECT_API_KEY:
-    _session.headers.update({"Authorization": f"Key {_CONNECT_API_KEY}"})
-# Use _session explicitly for all API calls rather than monkey-patching the
-# global requests module. The monkey-patch was previously propagating our auth
-# header and verify=False into third-party libraries (gseapy, openai, etc.).
+from core.backend_service import BackendError  # noqa: E402
+from core.backend_service import create_session as _svc_create_session  # noqa: E402
+from core.backend_service import delete_session as _svc_delete_session  # noqa: E402
+from core.backend_service import get_analysis_state as _svc_get_analysis_state  # noqa: E402
+from core.backend_service import get_download_payload as _svc_get_download_payload  # noqa: E402
+from core.backend_service import resolve_output_path as _svc_resolve_output_path  # noqa: E402
+from core.backend_service import run_chat_turn as _svc_run_chat_turn  # noqa: E402
+from core.backend_service import upload_file as _svc_upload_file  # noqa: E402
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -49,37 +37,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ── Diagnostic panel (visible when ?debug=1 in the URL) ──────────────────────
-if st.query_params.get("debug") == "1":
-    st.subheader("🔧 Diagnostic")
-    st.write({
-        "API_BASE": API_BASE,
-        "CONNECT_API_KEY_set": bool(_CONNECT_API_KEY),
-        "CONNECT_API_KEY_len": len(_CONNECT_API_KEY),
-    })
-    try:
-        r = _session.get(f"{API_BASE}/docs", timeout=10)
-        st.write({"GET /docs status": r.status_code,
-                  "content_type": r.headers.get("content-type"),
-                  "first_200_chars": r.text[:200]})
-    except Exception as e:
-        st.error(f"Request to {API_BASE}/docs failed: {e!r}")
-    st.stop()
-
-# ── Loud banner if API_BASE_URL is misconfigured on Posit Connect ────────────
-_running_on_connect = bool(os.getenv("RSTUDIO_PRODUCT") or os.getenv("CONNECT_SERVER"))
-if API_BASE.startswith(("http://localhost", "http://127.0.0.1")) and _running_on_connect:
-    st.error(
-        "❌ `API_BASE_URL` is not configured on Posit Connect.\n\n"
-        f"Current value: `{API_BASE}` — this only works in local development.\n\n"
-        "**Fix:** Open this Streamlit content in Connect → **Vars** panel → add:\n"
-        "```\n"
-        "API_BASE_URL = https://rndconnect.solidbio.com/content/<your-fastapi-guid>\n"
-        "CONNECT_API_KEY = <a Connect API key>\n"
-        "```\n"
-        "Then click **Restart**."
-    )
-    st.stop()
 
 
 
@@ -463,101 +420,49 @@ def _api_create_session(
     disease_program: str | None = None,
     organism: str | None = None,
 ) -> str | None:
-    params: dict[str, str] = {}
-    if disease_program:
-        params["disease_program"] = disease_program
-    if organism:
-        params["organism"] = organism
-
-    # API can be briefly unavailable during reload/startup; retry quickly.
-    attempts = 3
-    for i in range(attempts):
-        try:
-            r = _session.post(
-                f"{API_BASE}/chat/session",
-                params=params,
-                timeout=20,
-            )
-            if r.status_code == 201:
-                return r.json().get("session_id")
-            st.session_state["api_error"] = f"API {r.status_code}: {r.text[:200]}"
-            return None
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-            if i < attempts - 1:
-                time.sleep(0.6 * (i + 1))
-                continue
-            st.session_state["api_error"] = (
-                "Cannot reach API session endpoint. "
-                "Please ensure backend is running on http://localhost:8000."
-            )
-            return None
-        except requests.exceptions.RequestException as exc:
-            st.session_state["api_error"] = f"Session creation failed: {exc}"
-            return None
-    return None
+    try:
+        return _svc_create_session(disease_program=disease_program, organism=organism)
+    except Exception as exc:
+        st.session_state["api_error"] = f"Session creation failed: {exc}"
+        return None
 
 
 def _api_fetch_state(session_id: str) -> dict:
     try:
-        r = _session.get(f"{API_BASE}/results/{session_id}", timeout=10)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return {}
+        return _svc_get_analysis_state(session_id)
+    except BackendError:
+        return {}
 
 
 def _api_send_message(session_id: str, message: str) -> dict | None:
     """Send a chat message. Groups come entirely from the LLM — not pre-set by the UI."""
-    payload: dict[str, Any] = {
-        "session_id":      session_id,
-        "message":         message,
-    }
-    # Only forward user-set values; never default to a fixed disease/organism
+    kwargs: dict[str, Any] = {}
     if st.session_state.get("disease_program"):
-        payload["disease_program"] = st.session_state["disease_program"]
+        kwargs["disease_program"] = st.session_state["disease_program"]
     if st.session_state.get("organism"):
-        payload["organism"] = st.session_state["organism"]
+        kwargs["organism"] = st.session_state["organism"]
     try:
-        r = _session.post(f"{API_BASE}/chat/", json=payload, timeout=300)
-        if r.status_code == 200:
-            return r.json()
-        st.session_state["api_error"] = f"API {r.status_code}: {r.text[:200]}"
-    except requests.exceptions.ConnectionError:
-        st.session_state["api_error"] = (
-            "Cannot reach API. Run: `uvicorn api.main:app --reload --port 8000`"
-        )
-    except requests.exceptions.Timeout:
-        st.session_state["api_error"] = "Request timed out — analysis may still be running."
+        return _svc_run_chat_turn(session_id, message, **kwargs)
+    except BackendError as exc:
+        st.session_state["api_error"] = exc.message
+    except Exception as exc:
+        st.session_state["api_error"] = f"Analysis pipeline error: {exc}"
     return None
 
 
 def _api_upload_file(
     file_bytes: bytes, filename: str, file_type: str, session_id: str,
 ) -> dict | None:
+    kwargs: dict[str, Any] = {}
+    if st.session_state.get("disease_program"):
+        kwargs["disease_program"] = st.session_state["disease_program"]
+    if st.session_state.get("organism"):
+        kwargs["organism"] = st.session_state["organism"]
     try:
-        data = {"session_id": session_id}
-        if st.session_state.get("disease_program"):
-            data["disease_program"] = st.session_state["disease_program"]
-        if st.session_state.get("organism"):
-            data["organism"] = st.session_state["organism"]
-        r = _session.post(
-            f"{API_BASE}/upload/",
-            files={"file": (filename, file_bytes, file_type)},
-            data=data,
-            timeout=120,
-        )
-    except requests.exceptions.ConnectionError:
-        st.error("Cannot reach the API server.")
+        return _svc_upload_file(file_bytes, filename, session_id=session_id, **kwargs)
+    except BackendError as exc:
+        st.error(f"Upload failed: {exc.message}")
         return None
-    if r.status_code in (200, 201):
-        return r.json()
-    try:
-        detail = r.json().get("detail", r.text)
-    except Exception:
-        detail = r.text
-    st.error(f"Upload failed ({r.status_code}): {detail}")
-    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -646,7 +551,7 @@ def _render_topbar(session_id: str | None, astate: dict) -> None:
             old_sid = st.session_state.get("session_id")
             if old_sid:
                 try:
-                    _session.delete(f"{API_BASE}/sessions/{old_sid}", timeout=5)
+                    _svc_delete_session(old_sid)
                 except Exception:
                     pass
             for key in list(st.session_state.keys()):
@@ -803,12 +708,8 @@ def _render_welcome() -> str | None:
 
 def _fetch_file(session_id: str, path: str) -> bytes | None:
     try:
-        r = _session.get(
-            f"{API_BASE}/results/{session_id}/file",
-            params={"path": path},
-            timeout=20,
-        )
-        return r.content if r.status_code == 200 else None
+        resolved = _svc_resolve_output_path(path)
+        return resolved.read_bytes()
     except Exception:
         return None
 
@@ -976,8 +877,8 @@ def _render_quick_actions(session_id: str, astate: dict) -> str | None:
             cache_key = f"_excel_bytes_{excel_path}"
             if cache_key not in st.session_state:
                 try:
-                    r = _session.get(f"{API_BASE}/results/{session_id}/excel", timeout=20)
-                    st.session_state[cache_key] = r.content if r.status_code == 200 else None
+                    payload = _svc_get_download_payload(session_id)
+                    st.session_state[cache_key] = payload["content"]
                 except Exception:
                     st.session_state[cache_key] = None
             excel_bytes = st.session_state.get(cache_key)

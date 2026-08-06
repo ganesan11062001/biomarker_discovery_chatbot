@@ -34,3 +34,19 @@ Thumbs.db
 
 # Portable local tooling (Node runtime, etc.)
 .tools/
+
+# Virtual environments
+.venv/
+.venv-py314-old/
+
+# Local certs / secrets
+.certs/
+
+# Nested legacy project copy (not the deployed app)
+biomarker-platform/
+
+# Debug/scratch files from local troubleshooting
+content_search.json
+describe*.json
+deploy_out.txt
+mine.txt

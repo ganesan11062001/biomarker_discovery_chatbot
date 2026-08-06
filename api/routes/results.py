@@ -6,22 +6,19 @@ GET  /results/{session_id}/file     – serve any generated output file
 """
 import logging
 import mimetypes
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from config.settings import get_settings
-from core.session_manager import SessionManager
+from core.backend_service import BackendError
+from core.backend_service import get_analysis_state as _get_analysis_state
+from core.backend_service import get_download_payload as _get_download_payload
+from core.backend_service import resolve_output_path as _resolve_output_path
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-settings = get_settings()
-
-# Resolve once at import so path-traversal checks are CWD-independent.
-_OUTPUT_BASE: Path = Path(settings.output_dir).resolve()
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -93,79 +90,23 @@ class AnalysisStateResponse(BaseModel):
 def get_analysis_state(session_id: str):
     """Return the current analysis state for a session."""
     try:
-        state = SessionManager.get_session(session_id)
-    except KeyError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session '{session_id}' not found.",
-        )
-
-    # Collect plot paths from BiomarkerAgent (inside qc_summary) + VisualizationAgent
-    qc = state.get("qc_summary") or {}
-    all_plots = list(state.get("plot_paths") or [])
-    for p in (qc.get("plot_paths") or []):
-        if p and p not in all_plots:
-            all_plots.append(p)
-
-    return AnalysisStateResponse(
-        session_id=session_id,
-        disease_program=state.get("disease_program"),
-        data_type=state.get("data_type"),
-        data_format=state.get("data_format"),
-        n_proteins=state.get("n_proteins"),
-        n_samples=state.get("n_samples"),
-        omic_type=state.get("omic_type"),
-        sample_columns=state.get("sample_columns"),
-        metadata_columns=state.get("metadata_columns"),
-        group1_label=state.get("group1_label"),
-        group2_label=state.get("group2_label"),
-        group1_samples=state.get("group1_samples"),
-        group2_samples=state.get("group2_samples"),
-        analysis_mode=state.get("analysis_mode"),
-        qc_passed=state.get("qc_passed"),
-        qc_summary=qc,
-        n_significant=state.get("n_significant"),
-        top_biomarkers=state.get("top_biomarkers"),
-        excel_path=state.get("excel_path"),
-        analysis_summary=state.get("analysis_summary"),
-        plot_paths=all_plots or None,
-        pathways=state.get("pathways"),
-        enrichment_result_path=state.get("enrichment_result_path"),
-        status=state.get("status"),
-        error_message=state.get("error_message"),
-    )
+        return AnalysisStateResponse(**_get_analysis_state(session_id))
+    except BackendError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
 
 @router.get("/{session_id}/excel")
 def download_excel(session_id: str):
     """Download the latest results file (enrichment CSV if available, else biomarker Excel)."""
     try:
-        state = SessionManager.get_session(session_id)
-    except KeyError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session '{session_id}' not found.",
-        )
+        payload = _get_download_payload(session_id)
+    except BackendError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
-    enrichment_path = state.get("enrichment_result_path")
-    if enrichment_path and Path(enrichment_path).exists():
-        return FileResponse(
-            path=enrichment_path,
-            media_type="text/csv",
-            filename=f"enrichment_{session_id[:8]}.csv",
-        )
-
-    excel_path = state.get("excel_path")
-    if not excel_path or not Path(excel_path).exists():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No Excel file available. Run the analysis first.",
-        )
-
-    return FileResponse(
-        path=excel_path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=f"biomarkers_{session_id[:8]}.xlsx",
+    return Response(
+        content=payload["content"],
+        media_type=payload["mime"],
+        headers={"Content-Disposition": f'attachment; filename="{payload["filename"]}"'},
     )
 
 
@@ -175,27 +116,10 @@ def download_output_file(
     path: str = Query(..., description="Relative path inside outputs/"),
 ):
     """Serve any generated output file (plots, CSVs, etc.)."""
-    candidate = Path(path)
-    if candidate.is_absolute():
-        # Absolute path — still validated against _OUTPUT_BASE below
-        pass
-    elif candidate.parts and candidate.parts[0] == "outputs":
-        # Stored paths typically include the "outputs/" prefix; strip it and
-        # re-anchor under the resolved output base.
-        candidate = _OUTPUT_BASE.joinpath(*candidate.parts[1:])
-    else:
-        candidate = _OUTPUT_BASE / candidate
-
-    # Security: resolved path must be inside the configured output directory.
-    # Use the pre-resolved _OUTPUT_BASE so this is independent of CWD.
     try:
-        resolved = candidate.resolve()
-        resolved.relative_to(_OUTPUT_BASE)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Access denied.")
-
-    if not resolved.exists():
-        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+        resolved = _resolve_output_path(path)
+    except BackendError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
     media_type, _ = mimetypes.guess_type(str(resolved))
     return FileResponse(path=str(resolved), media_type=media_type or "application/octet-stream")

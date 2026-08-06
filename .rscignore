@@ -1,5 +1,6 @@
 .git/
 .venv/
+.venv-py314-old/
 .vscode/
 .tools/
 .claude/
@@ -14,3 +15,7 @@ outputs/
 logs/
 frontend/
 node_modules/
+biomarker-platform/
+tests/
+claude
+.certs/

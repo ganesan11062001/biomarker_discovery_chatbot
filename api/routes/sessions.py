@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from core.backend_service import BackendError
+from core.backend_service import delete_session as _delete_session
 from core.session_manager import SessionManager
 
 router = APIRouter()
@@ -181,8 +183,6 @@ def get_session(session_id: str):
 def delete_session(session_id: str):
     """Delete a session and its disk checkpoint. Called by the UI on 'New Conversation'."""
     try:
-        SessionManager.get_session(session_id)
-    except KeyError:
-        raise HTTPException(404, f"Session {session_id!r} not found")
-    SessionManager.delete_session(session_id)
-    logger.info("Session %s deleted by client.", session_id)
+        _delete_session(session_id)
+    except BackendError as exc:
+        raise HTTPException(exc.status_code, exc.message)
