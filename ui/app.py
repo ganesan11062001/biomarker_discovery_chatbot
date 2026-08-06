@@ -7,11 +7,11 @@ service or network hop required.
 """
 from __future__ import annotations
 
+import json as _json
+import logging
 import sys
 from pathlib import Path
 from typing import Any
-
-import json as _json
 
 import plotly.graph_objects as _go
 import streamlit as st
@@ -462,6 +462,10 @@ def _api_upload_file(
         return _svc_upload_file(file_bytes, filename, session_id=session_id, **kwargs)
     except BackendError as exc:
         st.error(f"Upload failed: {exc.message}")
+        return None
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Upload failed for %s", filename)
+        st.error(f"Upload failed: {exc}")
         return None
 
 
@@ -1048,9 +1052,14 @@ def _render_main() -> None:
                     for m in st.session_state["messages"]:
                         m.pop("has_plots", None)
 
+                new_msgs = resp.get("new_assistant_messages") or []
+                assistant_content = (
+                    "\n\n---\n\n".join(m["content"] for m in new_msgs if m.get("content"))
+                    if new_msgs else "Analysis complete."
+                )
                 st.session_state["messages"].append({
                     "role":      "assistant",
-                    "content":   resp["response"],
+                    "content":   assistant_content,
                     "has_plots": has_plots,
                 })
             st.rerun()
