@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import mimetypes
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -185,10 +186,30 @@ def _flatten_plot_paths(plot_paths: Any) -> List[str]:
     return out
 
 
-def _humanise_plot_title(path: str) -> str:
-    stem = Path(path).stem
-    stem = stem.replace("plot_", "").replace("_plot", "")
-    return stem.replace("_", " ").strip().title() or "Plot"
+_HEX_ID_RE = re.compile(r"^[0-9a-fA-F]{8,}$")
+_PLOT_TITLE_STOPWORDS = {"biomarkers", "biomarker", "pooled", "plot"}
+
+
+def humanise_plot_title(path: str) -> str:
+    """Turn a generated-plot filename into a readable title.
+
+    Plot stems can carry a lot of non-descriptive baggage — the upload's
+    file-id hex, the literal word "pooled", and a date/time stamp — e.g.
+    ``biomarkers_70cf1386839f4f61a6aaef96748f1508_pooled_20260806_162616_anova_multigroup``.
+    Naively keeping everything after the first underscore leaves the hex id
+    and timestamp in the title, so instead we drop tokens that are purely
+    numeric, look like a hex id, or are known filler words, keeping only the
+    descriptive remainder (e.g. "Anova Multigroup").
+    """
+    tokens = [t for t in Path(path).stem.split("_") if t]
+    kept = [
+        t for t in tokens
+        if t.lower() not in _PLOT_TITLE_STOPWORDS
+        and not t.isdigit()
+        and not _HEX_ID_RE.match(t)
+    ]
+    label = " ".join(kept or tokens).replace("_", " ").strip().title()
+    return label or "Plot"
 
 
 def build_plot_artifacts(session_id: str, paths: List[str]) -> List[Dict[str, Any]]:
@@ -217,7 +238,7 @@ def build_plot_artifacts(session_id: str, paths: List[str]) -> List[Dict[str, An
             by_stem[stem_key] = {
                 "id": f"plot-{session_id[:8]}-{stem_key}",
                 "kind": "plot",
-                "title": _humanise_plot_title(raw),
+                "title": humanise_plot_title(raw),
                 "createdAt": now,
             }
         entry = by_stem[stem_key]

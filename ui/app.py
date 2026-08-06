@@ -25,6 +25,7 @@ from core.backend_service import create_session as _svc_create_session  # noqa: 
 from core.backend_service import delete_session as _svc_delete_session  # noqa: E402
 from core.backend_service import get_analysis_state as _svc_get_analysis_state  # noqa: E402
 from core.backend_service import get_download_payload as _svc_get_download_payload  # noqa: E402
+from core.backend_service import humanise_plot_title as _svc_humanise_plot_title  # noqa: E402
 from core.backend_service import resolve_output_path as _svc_resolve_output_path  # noqa: E402
 from core.backend_service import run_chat_turn as _svc_run_chat_turn  # noqa: E402
 from core.backend_service import upload_file as _svc_upload_file  # noqa: E402
@@ -767,7 +768,7 @@ def _render_inline_plots(session_id: str, plot_paths: list[str]) -> None:
     for row_paths in rows:
         cols = st.columns(len(row_paths))
         for col, path in zip(cols, row_paths):
-            label = Path(path).stem.split("_", 1)[-1].replace("_", " ").title()
+            label = _svc_humanise_plot_title(path)
             with col:
                 # 1) Try PNG (fast static thumbnail).
                 img_bytes = _fetch_file(session_id, path)
@@ -815,12 +816,7 @@ def _render_interactive_plots(session_id: str, plot_paths: list[str]) -> None:
 
     with st.expander("🔬 Explore plots interactively  (zoom · hover · pan)", expanded=False):
         for path in stems:
-            label = (
-                Path(path).stem
-                .split("_", 1)[-1]
-                .replace("_", " ")
-                .title()
-            )
+            label = _svc_humanise_plot_title(path)
             json_path = path.replace(".png", ".json")
             json_bytes = _fetch_file(session_id, json_path)
             if not json_bytes:

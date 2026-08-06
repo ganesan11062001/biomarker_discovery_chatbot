@@ -51,10 +51,15 @@ _COLOURS = {
 
 
 def _save_fig(fig: go.Figure, out_dir: Path, name: str) -> Dict[str, str]:
-    """Write fig as both interactive HTML and static PNG. Return paths."""
+    """Write fig as JSON (Streamlit-native), interactive HTML, and static PNG."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / f"{name}.json"
     html_path = out_dir / f"{name}.html"
     png_path  = out_dir / f"{name}.png"
+    try:
+        json_path.write_text(fig.to_json(), encoding="utf-8")
+    except Exception as exc:
+        logger.debug("JSON export skipped for %s: %s", name, exc)
     fig.write_html(str(html_path), include_plotlyjs="cdn", full_html=False)
     try:
         fig.write_image(str(png_path), width=1200, height=800, scale=2)
