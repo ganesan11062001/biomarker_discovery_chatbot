@@ -1,22 +1,33 @@
 # BiomarkerAI — Proteomics Multi-Agent Platform
 
 A conversational AI system for biomarker discovery from proteomics data.
-Built on **LangGraph**, **FastAPI**, **Streamlit**, and **Azure OpenAI**.
+Built on **LangGraph**, **Streamlit**, and **Azure OpenAI**.
 Observability powered by **LangSmith**.
+
+Deployed to production as a **single Streamlit app** on Posit Connect — see
+[DEPLOYMENT.md](DEPLOYMENT.md) for the live app URL and redeploy steps.
 
 ---
 
 ## Architecture
 
+`ui/app.py` calls the business logic in `core/backend_service.py` **directly,
+in-process** — there is no HTTP hop between the UI and the agent workflow.
+A FastAPI layer (`api/routes/*.py`) still exists as a thin, optional wrapper
+around the same `backend_service` functions, kept for anyone who needs a
+standalone REST API, but it is **not** part of the deployed app.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Streamlit UI  (localhost:8501)                             │
+│  Streamlit UI  (ui/app.py)                                   │
 │  Upload file · Chat · View plots · Download Excel           │
 └────────────────────────┬────────────────────────────────────┘
-                         │ HTTP
+                         │ in-process function calls
 ┌────────────────────────▼────────────────────────────────────┐
-│  FastAPI Backend  (localhost:8000)                          │
-│  POST /upload/   POST /chat/   GET /results/{session_id}    │
+│  core/backend_service.py                                     │
+│  create_session · upload_file · run_chat_turn · get_*        │
+│  (api/routes/*.py wraps these same functions over HTTP —      │
+│   optional, not used by the deployed app)                     │
 └────────────────────────┬────────────────────────────────────┘
                          │ LangGraph invoke()
 ┌────────────────────────▼────────────────────────────────────┐
@@ -117,14 +128,15 @@ make dirs
 ### 4. Run
 
 ```bash
-# Terminal 1 — API backend
-make api
-
-# Terminal 2 — UI
 make ui
 ```
 
-Open **http://localhost:8501**
+Open **http://localhost:8501** — this single command is enough; the UI calls
+`core/backend_service.py` in-process, no separate API server needed.
+
+`make api` still works if you want the optional standalone FastAPI layer
+(`api/routes/*.py`) for external HTTP callers, but it is independent of the
+Streamlit app and not required to use the chatbot.
 
 ---
 
@@ -246,7 +258,7 @@ Request specific plots in chat: *"show me a volcano plot"*, *"give me PCA and he
 │   ├── ingestion_agent.py      File parsing, column detection, QC
 │   ├── learning_agent.py       Orchestrator — DecisionSchema, routing, grounding
 │   └── visualization_agent.py  Plot generation + LLM summary
-├── api/
+├── api/                        Optional standalone REST layer (not used by ui/app.py)
 │   ├── main.py                 FastAPI app, CORS, lifespan
 │   └── routes/
 │       ├── chat.py             POST /chat/  POST /chat/session
@@ -255,6 +267,9 @@ Request specific plots in chat: *"show me a volcano plot"*, *"give me PCA and he
 ├── config/
 │   └── settings.py             Pydantic settings (env-var backed)
 ├── core/
+│   ├── backend_service.py      Business logic called directly by ui/app.py (create_session,
+│   │                             upload_file, run_chat_turn, get_analysis_state, ...) — also
+│   │                             reused by api/routes/*.py for the optional HTTP layer
 │   ├── langgraph_workflow.py   StateGraph (single-node, LearningAgent)
 │   ├── session_manager.py      Thread-safe in-memory session store
 │   ├── state.py                BiomarkerState TypedDict
@@ -268,16 +283,18 @@ Request specific plots in chat: *"show me a volcano plot"*, *"give me PCA and he
 │   ├── protein_lookup.py       ProteinLookupSkill (UniProt REST)
 │   ├── proteomics_analysis.py  ProteomicsAnalysisSkill (t-test + BH FDR)
 │   ├── run_enrichment.py       PathwaySkill (gseapy / Enrichr)
-│   └── run_visualization.py    ProteomicsPlotSuite (11 plot types)
+│   ├── run_visualization.py    ProteomicsPlotSuite (on-demand plots, e.g. waterfall, ANOVA)
+│   └── plotly_visuals.py       Auto-generated post-analysis suite (volcano, PCA, heatmap, boxplots)
 ├── tests/
 │   ├── conftest.py
 │   ├── test_agents/
 │   ├── test_integration/
 │   └── test_tracing.py
 ├── ui/
-│   └── app.py                  Streamlit application
+│   └── app.py                  Streamlit application — the deployed entrypoint
 ├── .env.example
 ├── DEPLOYMENT.md
+├── manifest.json                Posit Connect deployment manifest
 ├── Makefile
 └── requirements.txt
 ```
