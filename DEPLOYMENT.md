@@ -1,5 +1,11 @@
 # Deployment Guide
 
+**Production** runs as a single Streamlit app (`ui/app.py`) on **Posit Connect** —
+see [Production Deployment — Posit Connect](#production-deployment--posit-connect-current)
+for the live app URL and the exact redeploy runbook. Everything below
+"Alternative Deployment Options" describes deployment models that are **not**
+currently used but are kept for reference.
+
 ---
 
 ## Local Development
@@ -7,7 +13,7 @@
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/ganesan11062001/biomarker_discovery_chatbot.git
+git clone https://github.com/PredictiveScience/biomarker_discovery_chatbot.git
 cd biomarker_discovery_chatbot
 make install
 ```
@@ -73,19 +79,76 @@ make dirs
 make test
 ```
 
-### 6. Start services
+### 6. Start the app
 
 ```bash
-# Terminal 1
-make api       # FastAPI on http://localhost:8000
-
-# Terminal 2
-make ui        # Streamlit on http://localhost:8501
+make ui        # Streamlit on http://localhost:8501 — this is the whole app
 ```
+
+`make api` (FastAPI on http://localhost:8000) is optional — only needed if you
+want a standalone HTTP layer on top of the same `core/backend_service.py`
+logic. The Streamlit app does not call it and does not need it running.
 
 ---
 
-## Production Deployment
+## Production Deployment — Posit Connect (current)
+
+The deployed app is a single Posit Connect content item running `ui/app.py`
+directly (no separate API service). Connect server: `https://rndconnect.solidbio.com`.
+
+| | |
+|---|---|
+| Content GUID | `66ebc07d-a20e-4715-9fcb-0b20582b731b` |
+| Direct URL | https://rndconnect.solidbio.com/content/66ebc07d-a20e-4715-9fcb-0b20582b731b/ |
+| Dashboard | https://rndconnect.solidbio.com/connect/#/apps/66ebc07d-a20e-4715-9fcb-0b20582b731b |
+| App mode | `python-streamlit`, entrypoint `ui/app.py` (see `manifest.json`) |
+| rsconnect server nickname | `solidbio-rnd` |
+
+### Redeploying
+
+```powershell
+.venv\Scripts\rsconnect.exe deploy manifest --name solidbio-rnd --app-id 66ebc07d-a20e-4715-9fcb-0b20582b731b manifest.json
+```
+
+- **Regenerate `manifest.json` first** if dependencies or the file list changed:
+  `rsconnect write-manifest streamlit -e ui/app.py -x ".venv" -x ".git" -x "__pycache__" -x "outputs" -x "data" .`
+  then verify `.env` is **not** in the resulting file list before deploying —
+  it must never be bundled (secrets), and it's excluded from git entirely.
+- **PowerShell exit code 1 is a known false alarm.** rsconnect writes its
+  (verbose but successful) log to stderr, which PowerShell wraps as a
+  `NativeCommandError`. Always check the actual log text for
+  `Deployment completed successfully.` rather than trusting the exit code.
+- **Environment variables are never bundled** — `AZURE_OPENAI_*`,
+  `LANGSMITH_*`, etc. must be set once via the content's **Settings → Vars**
+  panel in the Connect dashboard, not via a `.env` file on the server.
+- **Git-backed content cannot be redeployed by bundle upload.** If a content
+  item is configured to auto-deploy from a linked git repo/branch, manual
+  `rsconnect deploy manifest` fails with *"Uploading a content bundle is not
+  allowed for this application since it is managed by git."* The current
+  content (`66ebc07d-...`) is a plain bundle-deployed item, not git-backed —
+  this only applies if that changes in the future.
+- **No Chromium in the Connect container** — `kaleido` (static PNG plot
+  export) always fails there. This is expected; the app falls back to the
+  interactive Plotly (`.json`) rendering path. Every plot-saving code path
+  must write a `.json` sidecar (not just `.png`/`.html`) or it will fail to
+  render in production — see `skills/run_visualization.py`'s `_save()` and
+  `skills/plotly_visuals.py`'s `_save_fig()`.
+
+### Orphaned content items
+
+Two older content items predate the single-app consolidation and are no
+longer updated: the original git-backed Streamlit app
+(`bc427f95-f0be-4e52-a971-6e5335ad1eeb`) and a standalone FastAPI deployment
+(`4047059f-eaf9-47e6-9b88-99d15ab14579`). Decide whether to archive/delete
+them in the Connect dashboard once you're confident nothing still points at
+them.
+
+---
+
+## Alternative Deployment Options
+
+The options below deploy the optional FastAPI + Streamlit two-service split
+instead of the single consolidated app, and are not currently in use.
 
 ### Option A — Single server (systemd)
 
@@ -237,7 +300,7 @@ az webapp config appsettings set \
 az webapp deployment source config \
   --name biomarker-api \
   --resource-group <rg> \
-  --repo-url https://github.com/ganesan11062001/biomarker_discovery_chatbot \
+  --repo-url https://github.com/PredictiveScience/biomarker_discovery_chatbot \
   --branch main --manual-integration
 ```
 
@@ -363,3 +426,7 @@ The 16 available plot types are:
 | Analysis returns no proteins | All proteins filtered by missing-value threshold | Lower `MISSING_VALUE_THRESHOLD` in `.env` (default 0.5) |
 | Upload rejected | Wrong file extension | Accepted: `.csv`, `.xlsx`, `.xls` — rename `.txt`/`.tsv` to `.csv` |
 | File exceeds size limit | File > `MAX_FILE_SIZE_MB` | Increase `MAX_FILE_SIZE_MB` in `.env` (default 200 MB) |
+| `rsconnect deploy` fails: "Uploading a content bundle is not allowed for this application since it is managed by git" | Target content item is git-backed | Push to its linked branch instead, or deploy to a different (bundle-managed) content item |
+| `rsconnect deploy` command exits 1 but shows "Deployment completed successfully" | PowerShell wraps rsconnect's stderr log as a `NativeCommandError` | Benign — check the log text, not the exit code |
+| App works locally but errors on Azure OpenAI / LangSmith calls after a Connect deploy | Env vars not set on the content item | Set them in Connect's **Settings → Vars** — they're intentionally excluded from the bundle |
+| A specific plot type never renders in prod (PNG and interactive both fail) | Its save helper never wrote a `.json` sidecar | Kaleido/PNG always fails in the Connect container (no Chromium) — every plot function must fall back to a `.json` export for `st.plotly_chart()`, not just `.png`/`.html` |
