@@ -1,0 +1,48 @@
+flowchart TB
+    User(["User's Browser"])
+
+    subgraph Connect["Posit Connect — production (single content item)"]
+        UI["Streamlit UI<br/>ui/app.py<br/>Upload · Chat · Plots · Excel download"]
+        BS["core/backend_service.py<br/>create_session · upload_file · run_chat_turn · get_analysis_state · get_download_payload"]
+        UI -- "in-process function calls<br/>(no HTTP hop)" --> BS
+    end
+
+    subgraph Optional["Optional / not deployed"]
+        API["FastAPI routes<br/>api/routes/chat.py, upload.py, results.py, sessions.py"]
+    end
+    API -. "thin wrapper around<br/>the same backend_service fns" .-> BS
+
+    BS --> WF["core/langgraph_workflow.py<br/>LangGraph StateGraph"]
+    WF --> LA["LearningAgent — orchestrator<br/>(sole LangGraph node)"]
+
+    LA -- "_make_decision()<br/>json_mode + confidence gate" --> LLMDEC["Azure OpenAI<br/>DecisionSchema JSON"]
+
+    LA -->|action: answer| ANS["_answer()<br/>grounded chat"]
+    LA -->|action: run_analysis| BA["BiomarkerAgent"]
+    LA -->|action: run_enrichment| EA["EnrichmentAgent"]
+    LA -->|action: run_visualization| VA["VisualizationAgent"]
+    LA -->|action: query_database| PL["ProteinLookupSkill<br/>(UniProt REST)"]
+    LA -->|action: show_code / modify_code| CODE["stored analysis_code<br/>/ LLM rewrite"]
+
+    IA["IngestionAgent<br/>file parsing, column detection,<br/>pooled vs replicate design"] --> BA
+
+    BA --> SK1["skills/pooled_fold_change.py<br/>skills/proteomics_analysis.py<br/>(Welch / limma / ANOVA / etc.)"]
+    EA --> SK2["skills/run_enrichment.py<br/>gseapy → Enrichr (KEGG, GO, Reactome...)"]
+    VA --> SK3["skills/run_visualization.py<br/>skills/plotly_visuals.py<br/>volcano, PCA, heatmap, boxplot..."]
+
+    SK1 --> XL["Excel report<br/>outputs/*.xlsx"]
+    SK3 --> PLOTS["Plot artifacts<br/>.json + .html + .png<br/>(.json required — no Chromium/kaleido on Connect)"]
+
+    BA --> SM["SessionManager<br/>in-memory BiomarkerState per session"]
+    EA --> SM
+    VA --> SM
+    LA --> SM
+
+    LA -.-> LS["LangSmith<br/>wrap_openai() + @traceable spans<br/>full trace tree per turn"]
+
+    User -- HTTPS --> UI
+    UI --> XL
+    UI --> PLOTS
+
+    style Connect fill:#e8f4ea,stroke:#2e7d32
+    style Optional fill:#f5f5f5,stroke:#999,stroke-dasharray: 5 5
