@@ -50,3 +50,7 @@ content_search.json
 describe*.json
 deploy_out.txt
 mine.txt
+
+# Proprietary experimental data and internal docs — kept locally, not in git
+tests/test_data/
+docs/
